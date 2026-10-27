@@ -4805,7 +4805,13 @@ async def purge_stale_invoice_data():
             f"""SELECT id FROM topups
                WHERE created_at < ?
                  AND status IN ('expired','rejected','cancelled')
-                 AND (status!='expired' OR {timed_payment_sql()})""",
+                 AND (status!='expired' OR {timed_payment_sql()})
+                 AND NOT EXISTS (
+                     SELECT 1 FROM otp_payments op WHERE op.topup_id=topups.id
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM sosmed_payments sp WHERE sp.topup_id=topups.id
+                 )""",
             (cutoff,)
         ).fetchall()
     ]
