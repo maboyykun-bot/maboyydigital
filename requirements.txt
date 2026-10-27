@@ -1,0 +1,6 @@
+aiogram==3.22.0
+python-dotenv==1.1.1
+aiohttp==3.12.15
+pycryptodome==3.23.0
+Pillow==11.3.0
+qrcode==8.2
