@@ -446,7 +446,7 @@ class Gateway:
 
     async def check_connection(self,actor,*,my_pg_reference=None):
         self.require_owner(actor)
-        mode='gateway' if my_pg_reference is None else 'my_pg'
+        mode=self.settings()['mode'] if my_pg_reference is None else 'my_pg'
         try:
             if not self.configured():raise GatewayError('CONFIG')
             if mode=='gateway':
@@ -459,6 +459,7 @@ class Gateway:
                               'endpoint':self.api.endpoint_label(self.api.path('gateway','status',actual['reference']))}
                 else:evidence=await self.api.connection_evidence()
             else:
+                if not my_pg_reference:raise GatewayError('NOT_READY')
                 data=await self.api.status(reference(my_pg_reference),'my_pg')
                 if data.get('order_id')!=my_pg_reference or str(data.get('status','')).upper() not in {'PENDING','PAID','SUCCESS','EXPIRED'}:
                     raise GatewayError('SCHEMA')
@@ -490,9 +491,10 @@ class Gateway:
             if value and self.settings()['mode']=='my_pg' and not self.verified('my_pg'):raise GatewayError('NOT_READY')
         elif key=='mode':
             if value not in {'gateway','my_pg'}:raise GatewayError('INPUT')
-            if value=='my_pg' and not self.verified(value):raise GatewayError('NOT_READY')
         else:raise GatewayError('INPUT')
         with self.connection(True) as conn:
+            if key=='mode':
+                conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',('enabled',encoded(False),time.time()))
             if key=='enabled' and value:
                 conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',
                              ('account_fingerprint',encoded(self.fingerprint()),time.time()))
@@ -1167,6 +1169,8 @@ class Gateway:
         api_status='Terakhir terverifikasi' if verified else (
             ('Gagal membuat QRIS (' if proof.get('source')=='invoice_create_error' else 'Pemeriksaan gagal (')+str(proof['error'])+')'
             if proof.get('error') else 'Menunggu invoice pertama')
+        if proof.get('error')=='NETWORK' and int(proof.get('http_status') or 0)>=500:
+            api_status='Layanan API mengembalikan HTTP '+str(proof['http_status'])+'; pembuatan QRIS belum dapat dipastikan'
         problems=self.config.problems()
         webhook=self.config.webhook_url if not any('KLIKQRIS_WEBHOOK_URL' in issue for issue in self.config.issues) else 'Perlu diperbaiki di Railway Variables.'
         text=('👑 <b>PENGATURAN QRIS OTOMATIS</b>\n\nProvider: KlikQRIS\n'
@@ -1179,6 +1183,8 @@ class Gateway:
               f"Konfigurasi: {'Tersedia' if self.configured() else 'Perlu diperbaiki'}\n"
               f"Sandbox: {'ON; saldo/produk nyata diblokir' if self.config.sandbox else 'OFF'}\n\n"
               'Webhook: '+html.escape(webhook or 'Atur URL webhook pada dashboard; polling tetap tersedia.')+'\n')
+        if proof.get('error')=='NETWORK' and int(proof.get('http_status') or 0)>=500:
+            text+='\n⚠️ Nonaktifkan pembelian baru sementara. Periksa transaksi pending sebelum membuat invoice pengganti. HTTP 5xx dapat berasal dari gateway atau perantara jaringan; bukan bukti API key salah.\n'
         if problems:text+='\n⚠️ '+html.escape('\n'.join(problems))+'\n'
         if proof.get('endpoint'):
             text+='Pemeriksaan: '+html.escape(str(proof['endpoint']))+'\n'
@@ -1328,8 +1334,9 @@ def register(router,gateway):
                 gateway.change(call.from_user.id,'mode',value)
                 await gateway.owner_panel(call)
             elif action=='my_pg_input':
+                gateway.change(call.from_user.id,'mode','my_pg')
                 await state.set_state(AutoQRISAdminState.merchant_reference)
-                await host.safe_edit_or_answer(call,'Hubungkan merchant MY PG di dashboard terlebih dahulu. Kirim satu ID transaksi MY PG yang sudah ada untuk pemeriksaan API. Jangan kirim API Key, token sesi atau cookie. Mode tidak berubah sebelum pemeriksaan berhasil.',reply_markup=gateway.owner_keyboard([[('⬅️ Batal','menu',None)]]))
+                await host.safe_edit_or_answer(call,'Hubungkan merchant MY PG di dashboard terlebih dahulu. Kirim satu ID transaksi MY PG yang sudah ada untuk pemeriksaan API. Jangan kirim API Key, token sesi atau cookie. Mode MY PG dipilih dan pembelian baru dinonaktifkan. Verifikasi diperlukan sebelum aktivasi.',reply_markup=gateway.owner_keyboard([[('⬅️ Batal','menu',None)]]))
             elif action in {'history','pending'}:
                 if value is None or not re.fullmatch(r'[0-9]{1,6}',value):raise GatewayError('INPUT')
                 await gateway.owner_list(call,pending=action=='pending',page=int(value))
@@ -1356,6 +1363,8 @@ def register(router,gateway):
             gateway.change(message.from_user.id,'mode','my_pg')
             await state.clear()
             await message.answer('MY PG berhasil diperiksa melalui transaksi existing. Mode dipilih; aktifkan pengajuan dari panel QRIS Otomatis bila diperlukan.',reply_markup=gateway.owner_keyboard([[('⚙️ QRIS Otomatis','menu',None)]]))
-        except (GatewayError,sqlite3.Error):
-            await message.answer('MY PG belum dapat diverifikasi. Periksa merchant terhubung dan ID transaksi yang benar, atau kembali ke gateway biasa.',reply_markup=gateway.owner_keyboard([[('⬅️ Kembali','menu',None)]]))
+        except (GatewayError,sqlite3.Error) as exc:
+            code=exc.code if isinstance(exc,GatewayError) else 'STORAGE'
+            status=exc.http_status if isinstance(exc,GatewayError) else 0
+            await message.answer('Kode: '+html.escape(str(code))+' • HTTP: '+str(status or '-')+'\nMY PG belum dapat diverifikasi. Periksa merchant terhubung dan ID transaksi yang benar, atau kembali ke gateway biasa.',reply_markup=gateway.owner_keyboard([[('⬅️ Kembali','menu',None)]]))
     return gateway
