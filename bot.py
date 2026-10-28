@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.30"
+BOT_VERSION = "17.32"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -24068,7 +24068,7 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             return await reject_checkout_voucher(call,state,variant_id,exc)
         except klikqris_gateway.GatewayError as exc:
             KLIKQRIS_GATEWAY.record_checkout_failure(exc)
-            text='Stok tidak mencukupi.' if exc.code=='STOCK' else 'QRIS Otomatis belum dapat diproses. Cek status atau hubungi owner.'
+            text=klikqris_gateway.buyer_error(exc)
             return await safe_callback_notice(call,text,show_alert=True)
         except sqlite3.Error as exc:
             KLIKQRIS_GATEWAY.record_checkout_failure(exc)
@@ -36666,7 +36666,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.30"
+EXPECTED_SOURCE_VERSION = "17.32"
 
 
 def source_integrity_self_test():

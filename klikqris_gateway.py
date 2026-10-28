@@ -44,6 +44,7 @@ MAX_AMOUNT = 10**12
 WIB = ZoneInfo('Asia/Jakarta')
 QR_LIMIT = 2*1024*1024
 BODY_LIMIT = 4*1024*1024
+SUCCESS_RECEIPT_TTL = 3600
 FINAL = {'SETTLED','SETTLED_BALANCE','FAILED','SANDBOX_PAID'}
 
 
@@ -107,6 +108,13 @@ class GatewayError(Exception):
         self.public='QRIS Otomatis belum dapat diproses. Cek status atau hubungi owner.'
 
 
+def buyer_error(exc):
+    if getattr(exc,'code','')=='STOCK':return 'Stok tidak mencukupi.'
+    if getattr(exc,'code','')=='ACCOUNT_CHANGED':return 'Invoice lama perlu diperiksa owner setelah pengaturan pembayaran berubah. Tagihan baru belum dibuat agar tidak ganda.'
+    if getattr(exc,'code','')=='BUSY':return 'Invoice sedang diproses. Tunggu lalu Cek Status; jangan membuat tagihan pengganti.'
+    return 'QRIS Otomatis belum dapat diproses. Cek status atau hubungi owner.'
+
+
 @dataclass
 class Config:
     key: str = ''
@@ -120,6 +128,7 @@ class Config:
     error: str = ''
     issues: tuple = ()
     normalized: tuple = ()
+    previous_key: str = ''
 
     def problems(self):
         problems=[]
@@ -138,9 +147,11 @@ class Config:
             if changed:normalized.append(name)
             return value
         c.key=read('KLIKQRIS_API_KEY')
+        c.previous_key=read('KLIKQRIS_PREVIOUS_API_KEY')
         c.merchant=read('KLIKQRIS_MERCHANT_ID')
-        if c.key and (len(c.key)>4096 or any(x in c.key for x in '\r\n')):
-            issues.append('KLIKQRIS_API_KEY harus satu nilai tanpa baris baru.')
+        for value,name in [(c.key,'KLIKQRIS_API_KEY'),(c.previous_key,'KLIKQRIS_PREVIOUS_API_KEY')]:
+            if value and (len(value)>4096 or any(x in value for x in '\r\n')):
+                issues.append(name+' harus satu nilai tanpa baris baru.')
         try:
             if c.merchant:reference(c.merchant)
         except GatewayError:issues.append('KLIKQRIS_MERCHANT_ID tidak valid; isi Merchant ID saja.')
@@ -357,6 +368,7 @@ class Gateway:
         self.api=Client(self.config)
         self.bot=None
         self.task=None
+        self.cleanup_task=None
         self.delivery_locks={}
 
     @contextmanager
@@ -379,18 +391,75 @@ class Gateway:
     def require_owner(self,user):
         if not self.host.is_owner(user):raise GatewayError('FORBIDDEN')
 
-    def fingerprint(self):
-        return hashlib.sha256(encoded({'merchant':self.config.merchant,'key':self.config.key,'sandbox':self.config.sandbox}).encode()).hexdigest()
+    def fingerprint(self,key=None):
+        return hashlib.sha256(encoded({'merchant':self.config.merchant,'key':self.config.key if key is None else key,'sandbox':self.config.sandbox}).encode()).hexdigest()
 
     def crypt(self,value,*,decrypt=False):
-        key=hmac.new(str(self.host.BOT_TOKEN).encode(),('maboyy-klikqris-v1|'+self.config.key+'|'+self.config.merchant).encode(),hashlib.sha256).digest()
+        def key_for(api_key):
+            return hmac.new(str(self.host.BOT_TOKEN).encode(),('maboyy-klikqris-v1|'+api_key+'|'+self.config.merchant).encode(),hashlib.sha256).digest()
         if decrypt:
             if not isinstance(value,bytes) or len(value)<28:raise GatewayError('STORAGE')
-            try:return AES.new(key,AES.MODE_GCM,nonce=value[:12]).decrypt_and_verify(value[28:],value[12:28])
-            except ValueError:raise GatewayError('STORAGE') from None
-        cipher=AES.new(key,AES.MODE_GCM,nonce=secrets.token_bytes(12))
+            # The previous key is a local decryption selector, never an HTTP credential.
+            keys=[self.config.key]
+            if self.config.previous_key and self.config.previous_key not in keys:keys.append(self.config.previous_key)
+            for api_key in keys:
+                try:return AES.new(key_for(api_key),AES.MODE_GCM,nonce=value[:12]).decrypt_and_verify(value[28:],value[12:28])
+                except ValueError:continue
+            raise GatewayError('STORAGE') from None
+        cipher=AES.new(key_for(self.config.key),AES.MODE_GCM,nonce=secrets.token_bytes(12))
         data,tag=cipher.encrypt_and_digest(value)
         return cipher.nonce+tag+data
+
+    def can_recover_account(self,row):
+        return (not self.config.sandbox and not row['sandbox'] and bool(self.config.previous_key)
+                and row['fingerprint']==self.fingerprint(self.config.previous_key))
+
+    def rebind_unsent_draft(self,ident):
+        # NEW is committed before the request lease. No row that has crossed
+        # REQUESTING (including CREATE_UNKNOWN) can take this no-network path.
+        if not self.ready():raise GatewayError('NOT_READY')
+        with self.connection(True) as conn:
+            row=dict(conn.execute('SELECT * FROM klikqris_transactions WHERE id=?',(ident,)).fetchone())
+            if (row['state']!='NEW' or any(row[key] for key in
+                    ('signature','qr_image','total_amount','provider_status','expires_at',
+                     'checked_at','api_verified_at','verified_total','lease_owner','lease_until'))):return False
+            conn.execute('''UPDATE klikqris_transactions SET fingerprint=?,mode=?,sandbox=0,error=''
+                WHERE id=? AND state='NEW' AND fingerprint=?''',
+                (self.fingerprint(),self.settings()['mode'],ident,row['fingerprint']))
+            self.audit(conn,0,'draft_account_updated',ident,'before_create')
+        return True
+
+    async def recover_account(self,row):
+        if not self.can_recover_account(row):raise GatewayError('ACCOUNT_CHANGED')
+        if row['lease_until']>time.time():raise GatewayError('BUSY')
+        # Authenticate with the new key, but compare against the ORIGINAL
+        # encrypted signature and expected amount/reference before rebinding.
+        data=await self.api.status(row['reference'],row['mode'])
+        _,status,_=self.validate(row,data,create=not bool(row['signature']))
+        if row['state']=='PAID_VERIFIED' and status not in {'PAID','SUCCESS'}:raise GatewayError('MISMATCH')
+        signature=self.crypt(data['signature'].encode())
+        image=self.crypt(self.crypt(row['qr_image'],decrypt=True)) if row['qr_image'] else None
+        with self.connection(True) as conn:
+            current=dict(conn.execute('SELECT * FROM klikqris_transactions WHERE id=?',(row['id'],)).fetchone())
+            if current['fingerprint']==self.fingerprint():return current,data
+            if current['fingerprint']!=row['fingerprint']:raise GatewayError('ACCOUNT_CHANGED')
+            if current['lease_until']>time.time():raise GatewayError('BUSY')
+            if current['state']=='PAID_VERIFIED' and status not in {'PAID','SUCCESS'}:raise GatewayError('MISMATCH')
+            conn.execute('''UPDATE klikqris_transactions SET fingerprint=?,signature=?,qr_image=?
+                WHERE id=? AND fingerprint=?''',(self.fingerprint(),signature,image,row['id'],row['fingerprint']))
+            self.audit(conn,0,'account_key_reconciled',row['id'],'status_signature_amount_verified')
+            self.save_api_evidence(conn,row['mode'],verified=True,source='account_key_reconciled',
+                                   http_status=200,endpoint=self.api.endpoint_label(self.api.path(row['mode'],'status',row['reference'])))
+            current=self.transaction_after(conn,row['id'])
+        return current,data
+
+    async def resume(self,ident):
+        row=self.transaction(ident)
+        if (row['fingerprint']!=self.fingerprint() or row['sandbox'] or
+                (row['state']=='NEW' and row['mode']!=self.settings()['mode'])):
+            if self.rebind_unsent_draft(ident):return await self.issue(ident)
+            return await self.refresh(ident)
+        return await self.issue(ident)
 
     def settings(self):
         defaults={'enabled':self.config.enabled,'mode':self.config.mode}
@@ -482,8 +551,11 @@ class Gateway:
         try:
             if not self.configured():raise GatewayError('CONFIG')
             if mode=='gateway':
-                actual=self.one('''SELECT * FROM klikqris_transactions WHERE mode='gateway' AND fingerprint=?
-                    AND signature IS NOT NULL ORDER BY created_at DESC LIMIT 1''',(self.fingerprint(),))
+                previous=self.fingerprint(self.config.previous_key) if self.config.previous_key else self.fingerprint()
+                actual=self.one('''SELECT * FROM klikqris_transactions WHERE mode='gateway' AND sandbox=0
+                    AND fingerprint IN (?,?) AND signature IS NOT NULL
+                    ORDER BY (fingerprint=?) DESC,created_at DESC LIMIT 1''',
+                    (self.fingerprint(),previous,self.fingerprint()))
                 if actual:
                     data=await self.api.status(actual['reference'],'gateway')
                     self.validate(actual,data)
@@ -580,8 +652,15 @@ class Gateway:
             conn.execute('''INSERT OR IGNORE INTO klikqris_payment_messages
                 (transaction_id,chat_id,message_id,created_at) VALUES(?,?,?,?)''',
                 (ident,row['user_id'],message_id,time.time()))
+            if row['state'] in {'SETTLED','SETTLED_BALANCE'}:
+                source,entity=self.receipt_key(row)
+                conn.execute("UPDATE payment_receipts SET status='ARCHIVING',next_retry_at=0 WHERE source=? AND entity_id=? AND user_id=? AND status='ARCHIVED'",(source,str(entity),row['user_id']))
 
     def remember_callback_message(self,call,row):
+        if row['state'] in {'SETTLED','SETTLED_BALANCE'}:
+            source,entity=self.receipt_key(row)
+            receipt=self.one('SELECT status FROM payment_receipts WHERE source=? AND entity_id=?',(source,str(entity)))
+            if receipt and receipt['status'] in {'ARCHIVING','ARCHIVED'}:return
         message=getattr(call,'message',None)
         body=getattr(message,'caption',None) or getattr(message,'text',None) or ''
         invoice=self.host.topup_invoice(row['entity_id']) if row['purpose']=='topup' else self.host.invoice(row['entity_id'])
@@ -602,7 +681,7 @@ class Gateway:
         if not self.receipt_payment_confirmed(row):return
         source,entity=self.receipt_key(row)
         receipt=self.one('SELECT * FROM payment_receipts WHERE source=? AND entity_id=?',(source,str(entity)))
-        if not receipt or receipt['status'] not in {'SENT','LEGACY','UNKNOWN'}:return
+        if not receipt or receipt['status'] not in {'SENT','LEGACY','UNKNOWN','ARCHIVED'}:return
         with self.connection() as conn:
             messages=[dict(r) for r in conn.execute('''SELECT * FROM klikqris_payment_messages
                 WHERE transaction_id=? AND kind='QR' AND next_retry_at<=?''',(ident,time.time()))]
@@ -629,6 +708,80 @@ class Gateway:
                 conn.execute('''UPDATE klikqris_payment_messages SET kind=?,attempts=attempts+1,next_retry_at=?
                     WHERE transaction_id=? AND message_id=? AND kind='QR' ''',
                     ('REMOVED' if deleted else 'QR',0 if deleted else time.time()+min(3600,10*2**min(message['attempts'],8)),ident,message['message_id']))
+
+    async def cleanup_success_receipts(self,bot,*,now=None):
+        """Retire only acknowledged successful automatic QRIS photos, never money."""
+        if bot is None:return
+        now=time.time() if now is None else now
+        cutoff=now-SUCCESS_RECEIPT_TTL
+        with self.connection() as conn:
+            jobs=[dict(row) for row in conn.execute('''SELECT t.id,r.source,r.entity_id FROM payment_receipts r
+                JOIN klikqris_transactions t ON t.user_id=r.user_id AND
+                  ((r.source=t.purpose AND r.entity_id=CAST(t.entity_id AS TEXT) AND t.state='SETTLED') OR
+                   (r.source='qris_review' AND r.entity_id=t.id AND t.state='SETTLED_BALANCE'))
+                WHERE t.sandbox=0 AND t.api_verified_at>0 AND t.verified_total=t.total_amount
+                  AND r.status IN ('SENT','ARCHIVING') AND r.sent_at>0 AND r.sent_at<=?
+                  AND r.next_retry_at<=? AND r.lease_until<=?
+                ORDER BY r.sent_at LIMIT 10''',(cutoff,now,now))]
+        for job in jobs:
+            row=self.transaction(job['id'])
+            if not self.receipt_payment_confirmed(row):continue
+            token=secrets.token_hex(12)
+            with self.connection(True) as conn:
+                changed=conn.execute('''UPDATE payment_receipts SET status='ARCHIVING',lease_token=?,lease_until=?,
+                    snapshot_json='{}',caption_hash='',error_code='QRIS_RETENTION'
+                    WHERE source=? AND entity_id=? AND user_id=? AND status IN ('SENT','ARCHIVING')
+                      AND sent_at>0 AND sent_at<=? AND next_retry_at<=? AND lease_until<=?''',
+                    (token,now+300,job['source'],job['entity_id'],row['user_id'],cutoff,now,now)).rowcount
+                if not changed:continue
+                receipt=dict(conn.execute('SELECT * FROM payment_receipts WHERE source=? AND entity_id=?',
+                                          (job['source'],job['entity_id'])).fetchone())
+                # Free the obsolete QR BLOB even if Telegram is temporarily unavailable.
+                # Keep signatures, references, native transactions and outbox tombstones.
+                conn.execute('UPDATE klikqris_transactions SET qr_image=NULL WHERE id=?',(row['id'],))
+                if isinstance(receipt['message_id'],int) and receipt['message_id']>0:
+                    conn.execute('''INSERT OR IGNORE INTO klikqris_payment_messages
+                        (transaction_id,chat_id,message_id,kind,created_at) VALUES(?,?,?,'INVOICE',?)''',
+                        (row['id'],row['user_id'],receipt['message_id'],receipt['sent_at']))
+                messages=[dict(item) for item in conn.execute('''SELECT * FROM klikqris_payment_messages
+                    WHERE transaction_id=? AND chat_id=? AND kind IN ('QR','INVOICE') AND next_retry_at<=?
+                    ORDER BY message_id LIMIT 20''',(row['id'],row['user_id'],now))]
+            try:
+                for message in messages:
+                    try:
+                        try:
+                            await asyncio.wait_for(bot.delete_message(chat_id=row['user_id'],message_id=message['message_id']),timeout=10)
+                        except TelegramBadRequest as exc:
+                            if 'message to delete not found' not in str(exc).lower():raise
+                    except asyncio.CancelledError:raise
+                    except Exception as exc:
+                        delay=max(float(getattr(exc,'retry_after',0) or 0),min(3600,10*2**min(message['attempts'],8)))
+                        with self.connection(True) as conn:
+                            conn.execute('''UPDATE klikqris_payment_messages SET attempts=attempts+1,next_retry_at=?
+                                WHERE transaction_id=? AND chat_id=? AND message_id=? AND kind IN ('QR','INVOICE')''',
+                                (now+delay,row['id'],row['user_id'],message['message_id']))
+                        if isinstance(exc,TelegramRetryAfter):break
+                    else:
+                        with self.connection(True) as conn:
+                            conn.execute('''UPDATE klikqris_payment_messages SET kind='REMOVED',next_retry_at=0
+                                WHERE transaction_id=? AND chat_id=? AND message_id=?''',
+                                (row['id'],row['user_id'],message['message_id']))
+                with self.connection(True) as conn:
+                    pending=conn.execute('''SELECT COUNT(*) n,MIN(next_retry_at) due FROM klikqris_payment_messages
+                        WHERE transaction_id=? AND chat_id=? AND kind IN ('QR','INVOICE')''',(row['id'],row['user_id'])).fetchone()
+                    if not pending['n']:
+                        conn.execute('''UPDATE payment_receipts SET status='ARCHIVED',message_id=NULL,next_retry_at=0,
+                            lease_token=NULL,lease_until=0 WHERE source=? AND entity_id=? AND lease_token=?''',
+                            (job['source'],job['entity_id'],token))
+                    else:
+                        conn.execute('''UPDATE payment_receipts SET next_retry_at=?,lease_token=NULL,lease_until=0
+                            WHERE source=? AND entity_id=? AND lease_token=?''',
+                            (max(now+5,pending['due'] or 0),job['source'],job['entity_id'],token))
+            except BaseException:
+                with self.connection(True) as conn:
+                    conn.execute('''UPDATE payment_receipts SET lease_token=NULL,lease_until=0,next_retry_at=?
+                        WHERE source=? AND entity_id=? AND lease_token=?''',(now+10,job['source'],job['entity_id'],token))
+                raise
 
     async def deliver_receipt_photo(self,bot,receipt,photo,caption):
         row=self.receipt_transaction(receipt['source'],receipt['entity_id'])
@@ -734,24 +887,25 @@ class Gateway:
         if row['fingerprint']!=self.fingerprint() or row['sandbox'] or self.config.sandbox:raise GatewayError('ACCOUNT_CHANGED')
         token=secrets.token_hex(12)
         with self.connection(True) as conn:
-            changed=conn.execute("UPDATE klikqris_transactions SET state='REQUESTING',lease_owner=?,lease_until=? WHERE id=? AND state='NEW'",
-                                 (token,time.time()+self.config.timeout+30,ident)).rowcount
+            changed=conn.execute("UPDATE klikqris_transactions SET state='REQUESTING',lease_owner=?,lease_until=? WHERE id=? AND state='NEW' AND fingerprint=? AND mode=? AND sandbox=?",
+                                 (token,time.time()+self.config.timeout+30,ident,row['fingerprint'],row['mode'],row['sandbox'])).rowcount
         if not changed:return self.transaction(ident)
         try:
             data=await self.api.create(row['reference'],row['amount'],row['mode'])
             total,status,until=self.validate(row,data,create=True)
             with self.connection(True) as conn:
-                conn.execute('''UPDATE klikqris_transactions SET total_amount=?,signature=?,
+                changed=conn.execute('''UPDATE klikqris_transactions SET total_amount=?,signature=?,
                     state=CASE WHEN state='CANCELLED_LOCAL' THEN state ELSE 'PENDING' END,provider_status=?,
-                    expires_at=?,next_poll_at=?,error='',lease_owner=NULL,lease_until=0 WHERE id=? AND lease_owner=?''',
-                    (total,self.crypt(data['signature'].encode()),status,until,time.time()+self.config.poll_seconds,ident,token))
+                    expires_at=?,next_poll_at=?,error='',lease_owner=NULL,lease_until=0 WHERE id=? AND lease_owner=? AND fingerprint=?''',
+                    (total,self.crypt(data['signature'].encode()),status,until,time.time()+self.config.poll_seconds,ident,token,row['fingerprint'])).rowcount
+                if not changed:return self.transaction_after(conn,ident)
                 self.save_invoice(conn,row,total,until)
                 self.save_api_evidence(conn,row['mode'],verified=True,source='invoice_created',http_status=200,
                                        endpoint=self.api.endpoint_label(self.api.path(row['mode'],'create')))
             try:
                 image=await self.api.image(data)
                 with self.connection(True) as conn:
-                    conn.execute('UPDATE klikqris_transactions SET qr_image=? WHERE id=?',(self.crypt(image),ident))
+                    conn.execute("UPDATE klikqris_transactions SET qr_image=? WHERE id=? AND fingerprint=? AND state='PENDING'",(self.crypt(image),ident,row['fingerprint']))
             except (GatewayError,ValueError) as exc:
                 with self.connection(True) as conn:
                     conn.execute("UPDATE klikqris_transactions SET error='IMAGE' WHERE id=?",(ident,))
@@ -782,10 +936,12 @@ class Gateway:
     async def refresh(self,ident):
         row=self.transaction(ident)
         if row['state'] in FINAL:return row
-        if row['fingerprint']!=self.fingerprint():raise GatewayError('ACCOUNT_CHANGED')
+        if row['state']=='REQUESTING' and row['lease_until']>time.time():return row
+        recovered=None
+        if row['fingerprint']!=self.fingerprint():row,recovered=await self.recover_account(row)
         if row['state']=='PAID_VERIFIED':return await self.settle(ident)
         try:
-            data=await self.api.status(row['reference'],row['mode'])
+            data=recovered if recovered is not None else await self.api.status(row['reference'],row['mode'])
             total,status,until=self.validate(row,data)
             with self.connection(True) as conn:
                 current=conn.execute('SELECT * FROM klikqris_transactions WHERE id=?',(ident,)).fetchone()
@@ -810,7 +966,7 @@ class Gateway:
             if status=='PENDING' and not row['qr_image']:
                 try:
                     image=await self.api.image(data)
-                    with self.connection(True) as conn:conn.execute('UPDATE klikqris_transactions SET qr_image=? WHERE id=?',(self.crypt(image),ident))
+                    with self.connection(True) as conn:conn.execute("UPDATE klikqris_transactions SET qr_image=? WHERE id=? AND state='PENDING'",(self.crypt(image),ident))
                 except (GatewayError,ValueError):pass
             if status in {'SUCCESS','PAID'} and not row['sandbox'] and not self.config.sandbox:
                 return await self.settle(ident)
@@ -929,7 +1085,7 @@ class Gateway:
             ref=reference(data.get('order_id'))
             row=self.one('SELECT * FROM klikqris_transactions WHERE reference=?',(ref,))
             if not row:return web.json_response({'ok':False},status=404)
-            if row['fingerprint']!=self.fingerprint():raise GatewayError('AUTH')
+            if row['fingerprint']!=self.fingerprint() and not self.can_recover_account(row):raise GatewayError('AUTH')
             supplied=data.get('signature')
             if not row['signature']:return web.json_response({'ok':False,'retry':True},status=503)
             if not isinstance(supplied,str) or not 1<=len(supplied)<=2048 or not hmac.compare_digest(supplied.encode(),self.crypt(row['signature'],decrypt=True)):
@@ -1011,20 +1167,32 @@ class Gateway:
 
     async def start(self,bot):
         self.bot=bot
-        if self.task is not None and not self.task.done():return []
-        async def run():
-            while True:
-                try:await self.poll_once()
-                except asyncio.CancelledError:raise
-                except Exception:pass
-                await asyncio.sleep(max(5,min(self.config.poll_seconds,30)))
-        self.task=asyncio.create_task(run(),name='klikqris_payments')
-        return [self.task]
+        jobs=[]
+        if self.task is None or self.task.done():
+            async def run():
+                while True:
+                    try:await self.poll_once()
+                    except asyncio.CancelledError:raise
+                    except Exception:pass
+                    await asyncio.sleep(max(5,min(self.config.poll_seconds,30)))
+            self.task=asyncio.create_task(run(),name='klikqris_payments')
+            jobs.append(self.task)
+        if self.cleanup_task is None or self.cleanup_task.done():
+            async def clean():
+                while True:
+                    try:await self.cleanup_success_receipts(bot)
+                    except asyncio.CancelledError:raise
+                    except Exception as exc:logging.warning('QRIS invoice cleanup deferred type=%s',type(exc).__name__)
+                    await asyncio.sleep(30)
+            self.cleanup_task=asyncio.create_task(clean(),name='klikqris_invoice_cleanup')
+            jobs.append(self.cleanup_task)
+        return jobs
 
     async def close(self):
-        if self.task is not None and not self.task.done():
-            self.task.cancel();await asyncio.gather(self.task,return_exceptions=True)
-        self.task=None
+        tasks=[task for task in (self.task,self.cleanup_task) if task is not None]
+        for task in tasks:task.cancel()
+        if tasks:await asyncio.gather(*tasks,return_exceptions=True)
+        self.task=self.cleanup_task=None
         await self.api.close()
 
     async def buyer_guard(self,call):
@@ -1055,15 +1223,13 @@ class Gateway:
                         payment_method,status,created_at,updated_at,expires_at) VALUES(?,?,?,0,?,?,'pending',?,?,'')''',
                         (call.from_user.id,call.from_user.username or '',amount,amount,METHOD,stamp,stamp)).lastrowid
                     tx=self.reserve(conn,'topup',ident,call.from_user.id,amount)
-            await self.issue(tx['id'])
+            await self.resume(tx['id'])
             if state is not None:await state.clear()
             await self.show_payment(call,tx['id'])
 
     async def checkout(self,call,bot,state,variant_id,qty):
         await self.buyer_guard(call)
         qty=money(qty,positive=True)
-        allowed,_=self.host.anti_abuse_checkout(call.from_user.id,METHOD)
-        if not allowed:raise GatewayError('LIMIT')
         data=await state.get_data()
         note=self.host.get_checkout_note_from_state(data)
         with self.connection() as conn:
@@ -1076,12 +1242,20 @@ class Gateway:
             # is created until its required account data has been collected.
             await self.host.require_family_checkout_gmail(call,state,family_product,variant_id,qty,data)
             return
+        lookup_sql='''SELECT t.* FROM klikqris_transactions t JOIN orders o ON o.id=t.entity_id
+            WHERE t.purpose='order' AND t.user_id=? AND o.variant_id=? AND o.qty=?
+            AND (o.status='pending' OR t.state IN ('REQUESTING','CREATE_UNKNOWN','CANCELLED_LOCAL'))
+            AND o.payment_status!='paid' AND t.state IN ('NEW','REQUESTING','CREATE_UNKNOWN','PENDING','PAID_VERIFIED','CANCELLED_LOCAL')
+            ORDER BY t.created_at DESC LIMIT 1'''
+        lookup_args=(call.from_user.id,variant_id,qty)
         async with self.host.purchase_lock(call.from_user.id):
+            if not self.one(lookup_sql,lookup_args):
+                # The guard can write security events; keep it outside BEGIN
+                # IMMEDIATE and apply it only when creating a new native order.
+                allowed,_=self.host.anti_abuse_checkout(call.from_user.id,METHOD)
+                if not allowed:raise GatewayError('LIMIT')
             with self.connection(True) as conn:
-                row=conn.execute('''SELECT t.* FROM klikqris_transactions t JOIN orders o ON o.id=t.entity_id
-                    WHERE t.purpose='order' AND t.user_id=? AND o.variant_id=? AND o.qty=?
-                    AND (o.status='pending' OR t.state IN ('REQUESTING','CREATE_UNKNOWN','CANCELLED_LOCAL')) AND o.payment_status!='paid' AND t.state IN ('NEW','REQUESTING','CREATE_UNKNOWN','PENDING','PAID_VERIFIED','CANCELLED_LOCAL')
-                    ORDER BY t.created_at DESC LIMIT 1''',(call.from_user.id,variant_id,qty)).fetchone()
+                row=conn.execute(lookup_sql,lookup_args).fetchone()
                 if row:tx=dict(row)
                 else:
                     variant=conn.execute('SELECT * FROM product_variants WHERE id=?',(variant_id,)).fetchone()
@@ -1104,7 +1278,7 @@ class Gateway:
                         (call.from_user.id,call.from_user.username or '',product['id'],variant_id,qty,unit,subtotal,METHOD,note,amount,
                          datetime.now().isoformat(timespec='seconds'),voucher,discount)).lastrowid
                     tx=self.reserve(conn,'order',ident,call.from_user.id,amount)
-            await self.issue(tx['id'])
+            await self.resume(tx['id'])
             await state.clear()
             await self.show_payment(call,tx['id'])
 
@@ -1150,6 +1324,11 @@ class Gateway:
         if admin:return await self.owner_detail(call,ident)
         if row['state'] in {'SETTLED','SETTLED_BALANCE'}:
             source,entity=self.receipt_key(row)
+            receipt=self.one('SELECT status FROM payment_receipts WHERE source=? AND entity_id=?',(source,str(entity)))
+            if receipt and receipt['status'] in {'ARCHIVING','ARCHIVED'}:
+                note='Foto invoice sudah dihapus otomatis setelah 1 jam.' if receipt['status']=='ARCHIVED' else 'Invoice sudah melewati 1 jam; pembersihan otomatis sedang dicoba.'
+                await self.host.safe_edit_or_answer(call,self.status_text(row)+'\n'+note+' Riwayat pembayaran tetap tersedia.',reply_markup=self.user_keyboard(row),parse_mode='HTML')
+                return
             await self.host.payment_receipts.notify(self.host,call.bot,source,entity)
             await self.retire_paid_messages(call.bot,ident)
             return
@@ -1260,6 +1439,12 @@ class Gateway:
                     diagnostic=json.loads(diagnostic['value'])
                     text+='\nTahap: '+html.escape(str(diagnostic['stage']))+' • Kode: '+html.escape(str(diagnostic['code']))+' • HTTP: '+str(diagnostic['http_status'] or '-')+'\nID: '+html.escape(diagnostic['correlation_id'])+'\nWaktu: '+self.host.payment_receipts.format_wib(diagnostic['checked_at'],compact=True)+'\n'
                 except (ValueError,TypeError,KeyError):pass
+        blocked=self.one('''SELECT COUNT(*) n FROM klikqris_transactions WHERE fingerprint!=?
+            AND state IN ('NEW','REQUESTING','CREATE_UNKNOWN','PENDING','PAID_VERIFIED','CANCELLED_LOCAL')''',(self.fingerprint(),))['n']
+        if blocked:
+            text+='\nKonfigurasi lama: '+str(blocked)+' transaksi belum final. Draft NEW yang belum dikirim dipulihkan saat checkout dibuka.\n'
+            text+=('Key pemulihan tersedia; gunakan Rekonsiliasi untuk memeriksa invoice lama dengan API key baru.\n' if self.config.previous_key else
+                   'Jika hanya API key berubah, isi KLIKQRIS_PREVIOUS_API_KEY di secrets hosting untuk invoice yang sudah dikirim, lalu Rekonsiliasi. Jangan hapus transaksi atau membuat invoice pengganti.\n')
         if self.config.normalized:
             text+='\nℹ️ Format nilai environment dibaca otomatis; cukup isi nilainya saja.\n'
         if note:text+='\n'+html.escape(note)+'\n'
@@ -1297,6 +1482,8 @@ class Gateway:
         text=self.status_text(row)+'\n\nProvider: KlikQRIS\nRef: '+html.escape(row['reference'])+'\nMode: '+row['mode']+'\nUser: '+str(row['user_id'])+'\nKode: '+html.escape(row['error'] or '-')
         source,entity=self.receipt_key(row)
         receipt=self.one('SELECT status FROM payment_receipts WHERE source=? AND entity_id=?',(source,str(entity)))
+        if receipt and receipt['status'] in {'ARCHIVING','ARCHIVED'}:
+            text+='\n\nInvoice foto sudah melewati masa simpan 1 jam dan dijadwalkan untuk dihapus otomatis. Riwayat dan pembayaran tetap tersimpan.'
         if receipt and receipt['status']=='UNKNOWN':
             text+='\n\nPengiriman invoice belum dapat dipastikan. Periksa chat penerima; gambar tidak dikirim ulang otomatis agar tidak ganda. Saldo dan pembayaran tidak diulang.'
         controls=[[('🔄 Rekonsiliasi Status','check',ident)]]
@@ -1329,10 +1516,12 @@ def register(router,gateway):
                'DNS':'Resolusi DNS gagal.', 'TLS':'Verifikasi TLS gagal.', 'TIMEOUT':'Request timeout; cek status invoice sebelum mencoba ulang.',
                'JSON_INVALID':'Respons API bukan JSON valid.',
                'MISMATCH':'Referensi atau nominal tidak sesuai; saldo/produk belum diproses.',
-               'ACCOUNT_CHANGED':'Akun API berbeda dari transaksi tersimpan; rekonsiliasi menggunakan akun semula.',
+               'ACCOUNT_CHANGED':'Invoice memakai konfigurasi akun lama. Jika hanya API key berubah, isi KLIKQRIS_PREVIOUS_API_KEY melalui secrets hosting, lalu Rekonsiliasi. Jangan membuat invoice pengganti.',
+               'BUSY':'Invoice masih diproses. Tunggu lalu Cek Status; jangan membuat tagihan pengganti.',
                'STOCK':'Stok tidak mencukupi.', 'RATE_LIMIT':'Terlalu banyak permintaan. Tunggu sebelum mencoba kembali.',
                'FORBIDDEN':'Akses ditolak.'}
-        text=codes.get(getattr(exc,'code',''),'Pembayaran belum dapat diproses; data transaksi tetap disimpan untuk pemeriksaan.') if owner else ('Stok tidak mencukupi.' if getattr(exc,'code','')=='STOCK' else 'QRIS Otomatis belum dapat diproses. Cek status atau hubungi owner.')
+        text=codes.get(getattr(exc,'code',''),'Pembayaran belum dapat diproses; data transaksi tetap disimpan untuk pemeriksaan.') if owner else buyer_error(exc)
+        if not owner:gateway.record_checkout_failure(exc)
         if owner and getattr(exc,'code','')=='NOT_FOUND' and str(getattr(call,'data','') or '').split(':')[2:3] in [['connect'],['toggle'],['mode']]:
             text='Pemeriksaan koneksi mengembalikan HTTP 404. Ini bukan pencarian transaksi user; koneksi belum terverifikasi.'
         if owner and getattr(exc,'code','')!='FORBIDDEN' and host.is_owner(call.from_user.id) and call.message and str(call.message.chat.type)=='private' and call.message.chat.id==call.from_user.id:
