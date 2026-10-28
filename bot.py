@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.29"
+BOT_VERSION = "17.30"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -7926,7 +7926,17 @@ async def transaction_self_test():
     except Exception as exc:
         checks.append(("Demo Isolation",False,str(exc)[:100]))
 
-    # Payment config
+    # Payment config (read-only; no probe invoice)
+    auto_ready = KLIKQRIS_GATEWAY.ready()
+    try:
+        gateway_settings=KLIKQRIS_GATEWAY.settings()
+        checks.append(("KlikQRIS", not gateway_settings["enabled"] or auto_ready,
+                       "izin invoice aktif; autentikasi terpisah" if auto_ready else "nonaktif / belum siap"))
+        gateway_verified=KLIKQRIS_GATEWAY.verified(gateway_settings["mode"])
+        checks.append(("KlikQRIS API", not gateway_settings["enabled"] or gateway_verified,
+                       "terakhir terverifikasi" if gateway_verified else "belum terverifikasi; tidak membuat invoice uji"))
+    except sqlite3.Error:
+        checks.append(("KlikQRIS", False, "SQLITE: pengaturan belum dapat dibaca"))
     qris_ready = bool(get_setting("qris_file_id",""))
     bank_ready = bank_transfer_ready()
 
@@ -7942,8 +7952,8 @@ async def transaction_self_test():
     ))
     checks.append((
         "Pembayaran",
-        bool(qris_ready or bank_ready),
-        "ready" if (qris_ready or bank_ready) else "QRIS & rekening belum dikonfigurasi"
+        bool(qris_ready or bank_ready or auto_ready),
+        "ready" if (qris_ready or bank_ready or auto_ready) else "Belum ada metode pembayaran siap"
     ))
 
     return checks
@@ -24057,9 +24067,11 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
         except VoucherCheckoutError as exc:
             return await reject_checkout_voucher(call,state,variant_id,exc)
         except klikqris_gateway.GatewayError as exc:
+            KLIKQRIS_GATEWAY.record_checkout_failure(exc)
             text='Stok tidak mencukupi.' if exc.code=='STOCK' else 'QRIS Otomatis belum dapat diproses. Cek status atau hubungi owner.'
             return await safe_callback_notice(call,text,show_alert=True)
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            KLIKQRIS_GATEWAY.record_checkout_failure(exc)
             return await safe_callback_notice(call,'Pembayaran belum dapat diproses; periksa status sebelum mencoba kembali.',show_alert=True)
     if not shopeepay_ready():
         return await call.answer(
@@ -36654,7 +36666,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.29"
+EXPECTED_SOURCE_VERSION = "17.30"
 
 
 def source_integrity_self_test():

@@ -1,6 +1,28 @@
-# MaboyyDigital v17.29
+# MaboyyDigital v17.30
 
 Paket ringkas: **16 file**, langsung di root ZIP. Upload seluruh isinya ke root repository GitHub.
+
+## Pembaruan v17.30: perbaikan KlikQRIS Gateway
+
+Paket `MaboyyDigital_v17.30.zip` memuat source lengkap beserta patch KlikQRIS.
+Versi launcher dan bot sama-sama **17.30**; schema tetap **207** dan dependensi
+tidak berubah. Gunakan `KLIKQRIS_MODE=gateway`; tidak ada aktivasi produksi otomatis.
+
+Diagnosis Cek Koneksi dan pembuatan invoice dipisahkan. History HTTP 404 tetap
+menjadi pemeriksaan gagal, bukan bukti autentikasi atau riwayat kosong. Error HTTP,
+DNS/TLS, timeout, JSON/schema, SQLite, gambar QR dan Telegram dapat dibedakan.
+Klik berulang serta create yang belum pasti tetap menggunakan transaksi tersimpan;
+signature, nominal, referensi dan akun tetap divalidasi sebelum pembayaran diproses.
+
+Tes mock/database sementara dan panduan review, pemasangan serta rollback tersedia
+di paket pendamping `MaboyyDigital_v17.30_QA.zip`. Tidak ada database, `.env` aktif
+atau kredensial produksi di kedua ZIP. `.env.example` tetap disertakan sebagai template.
+
+**Status rilis:** diuji lokal; belum push GitHub/deploy atau tes transaksi live.
+HTTP 503 live dan persistensi `/data/shop.db` belum terverifikasi. Verifikasi volume
+`/data`, path database dan stok secara read-only sebelum mengaktifkan produksi.
+Untuk pembaruan berikutnya, naikkan versi pada nama paket, `main.py` dan dua
+konstanta versi `bot.py` secara konsisten; jangan hanya mengganti nama ZIP.
 
 ## Pembaruan v17.29: API Bot untuk mitra
 
@@ -374,7 +396,7 @@ digunakan; tampilan owner dibatasi ke chat privat. User tidak mendapat tombol ad
 
 Menu rating memakai pesan yang sama saat user mencoba berpindah fitur. Setelah
 rating tersimpan, menu terbuka kembali. Tidak ada file runtime atau Variables baru
-untuk fitur rating; gunakan seluruh 16 file rilis v17.29 yang konsisten.
+untuk fitur rating; gunakan seluruh 16 file rilis v17.30 yang konsisten.
 
 ## Jalankan
 
@@ -553,8 +575,8 @@ File pendukung: `requirements.txt`, `README.md`, `.env.example`, `.gitignore`,
 `.python-version`, `railway.json`.
 
 Tes, fixture bot lama, log, database, arsip backup, dan dokumentasi panjang
-tersedia di paket lengkap/backup terpisah. Kode runtime sama dengan rilis
-v17.29; hasil verifikasi dan backup tersedia dalam laporan rilis terpisah.
+tersedia di paket lengkap/backup terpisah. Kode runtime pada paket ini adalah rilis
+v17.30; tes dan hasil verifikasi lokal tersedia di paket QA pendamping.
 
 Backup penuh: `python project_backup.py --help`. Simpan arsip dan kunci di luar
 project, terpisah dan privat; sertakan volume/DB yang benar-benar tersedia.
@@ -562,7 +584,7 @@ Restore ke lokasi baru dahulu; jangan menimpa database produksi dengan snapshot 
 Jangan upload `.env` asli, database, session, backup privat, atau kunci ke GitHub.
 
 
-Footer toko pada v17.29: **Maboyy Digital • Since 2020**.
+Footer toko pada v17.30: **Maboyy Digital • Since 2020**.
 Perubahan footer mempertahankan tombol dan alur pembayaran existing.
 
 ## Refill Sosmed
