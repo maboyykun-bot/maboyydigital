@@ -1,4 +1,4 @@
-# MaboyyDigital v17.33
+# MaboyyDigital v17.34
 
 Bot Telegram untuk produk digital, saldo, OTP, Sosmed dan API mitra.
 Command: `/start`, `/otp`, `/sosmed`, `/tools`, `/owner`, `/ping`.
@@ -47,7 +47,7 @@ History HTTP 404 bukan bukti autentikasi berhasil atau riwayat kosong.
 Jika create timeout/5xx, cek status atau rekonsiliasi sebelum mencoba lagi.
 Aktifkan hanya setelah persistensi `/data/shop.db` dan stok terverifikasi.
 
-## Update v17.33
+## Update v17.34
 
 Untuk proyek existing, timpa `main.py`, `bot.py`, `klikqris_gateway.py` dan
 `README.md` dari paket ini. Launcher dan bot harus memakai versi yang sama.
@@ -62,23 +62,26 @@ pembayaran lain mengikuti alur existing. Pembersihan berlanjut setelah restart,
 dengan retry jika Telegram gagal. Ruang SQLite yang dibersihkan dipakai ulang;
 ukuran file database tidak selalu langsung mengecil.
 
-Rilis ini memperbaiki rekonsiliasi HTTP 404 setelah API key berubah, serta
-merekonsiliasi invoice lama tanpa membuat tagihan baru. Untuk invoice yang sudah
-dikirim, isi `KLIKQRIS_PREVIOUS_API_KEY` dengan key lama melalui secrets hosting;
-key ini membuka signature/QR dan dapat membaca status invoice asal lewat GET.
-Create selalu memakai key baru. Jika kedua pembacaan tetap 404, invoice tetap
-belum pasti dan tidak dibuat ulang. Checkout menampilkan status rekonsiliasi.
-Lalu gunakan **QRIS Otomatis → Rekonsiliasi → Cek Koneksi**. Jangan kirim key di chat.
-Jika key lama hilang, invoice yang sudah terkirim perlu rekonsiliasi penyedia;
+Semua request KlikQRIS sekarang hanya memakai `KLIKQRIS_API_KEY` aktif.
+Fallback HTTP dengan key lama dihapus karena key yang dicabut mendapat 401.
+`KLIKQRIS_PREVIOUS_API_KEY` hanya membuka signature/QR terenkripsi secara lokal;
+nilainya tetap berguna untuk dekripsi meski sudah tidak diterima provider.
+Tidak ada variabel baru. Pertahankan nilai lama untuk data yang masih terenkripsi.
+
+Gunakan **QRIS Otomatis → Rekonsiliasi → Cek Koneksi**. Jika key aktif tetap
+mendapat 404 untuk CREATE_UNKNOWN/REQUESTING lama, hasil create perlu dikonfirmasi
+KlikQRIS. Pesanan yang sama tidak dibuat ulang. Pembelian baru yang berbeda tetap
+mengikuti alur existing dengan key aktif; patch tidak membuat invoice otomatis.
+Jika key lama hilang, pemulihan signature lama memerlukan bantuan penyedia;
 validasi signature tetap diwajibkan. Draft NEW tidak memerlukan key lama.
 Schema tetap **207**; dependensi dan fitur pembayaran manual tetap dipertahankan.
 
 ## Pengujian dan panduan
 
-**79 tes mock/database sementara lulus.** Belum push GitHub, deploy atau tes
+**83 tes mock/database sementara lulus.** Belum push GitHub, deploy atau tes
 pembayaran live; HTTP 503 live belum terverifikasi. Persistensi volume dikonfirmasi pengguna;
 akses console hosting tidak tersedia di sesi perbaikan.
 
-Paket `MaboyyDigital_v17.33_QA.zip` memuat tes, patch, checksum dan panduan
-pemasangan/rollback (`docs/KLIKQRIS_V17_33.md`). Riwayat fitur lengkap tersedia
+Paket `MaboyyDigital_v17.34_QA.zip` memuat tes, patch, checksum dan panduan
+pemasangan/rollback (`docs/KLIKQRIS_V17_34.md`). Riwayat fitur lengkap tersedia
 di `docs/RIWAYAT_RILIS.md` pada paket QA. Paket QA tidak diperlukan untuk startup.

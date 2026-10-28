@@ -111,7 +111,7 @@ class GatewayError(Exception):
 
 def buyer_error(exc):
     if getattr(exc,'code','')=='STOCK':return 'Stok tidak mencukupi.'
-    if getattr(exc,'code','')=='AUTH' and getattr(exc,'credential','current')=='previous':return 'Pemeriksaan invoice lama ditolak. Hubungi owner; tagihan pengganti belum dibuat.'
+    if getattr(exc,'code','')=='AUTH':return 'API pembayaran menolak kredensial aktif. Hubungi owner; tagihan pengganti belum dibuat.'
     if getattr(exc,'code','')=='ACCOUNT_CHANGED':return 'Invoice lama perlu diperiksa owner setelah pengaturan pembayaran berubah. Tagihan baru belum dibuat agar tidak ganda.'
     if getattr(exc,'code','') in {'NOT_FOUND','ENDPOINT_NOT_FOUND'}:return 'Invoice lama masih diperiksa. Tagihan baru belum dibuat; gunakan Cek Status atau hubungi owner.'
     if getattr(exc,'code','')=='BUSY':return 'Invoice sedang diproses. Tunggu lalu Cek Status; jangan membuat tagihan pengganti.'
@@ -252,9 +252,8 @@ class Client:
 
     async def request(self,verb,path,body=None,*,credential='current'):
         if self.config.error or not self.config.key or not self.config.merchant:raise GatewayError('CONFIG')
-        if credential not in {'current','previous'}:raise GatewayError('CONFIG')
-        if credential=='previous' and (verb!='GET' or '/status/' not in path or not self.config.previous_key):raise GatewayError('CONFIG')
-        api_key=self.config.previous_key if credential=='previous' else self.config.key
+        # Revoked API keys remain useful for local decryption, never for HTTP.
+        if credential!='current':raise GatewayError('CONFIG')
         if self.cooldown_until>time.time():raise GatewayError('RATE_LIMIT',retry_after=int(self.cooldown_until-time.time())+1)
         if not re.fullmatch(r'/(?:sandbox/)?qris(?:v2)?/(?:create|history|status/[A-Za-z0-9_/-]+)',path):raise GatewayError('CONFIG')
         write=verb=='POST'
@@ -262,7 +261,7 @@ class Client:
         try:
             if self.session is None or self.session.closed:
                 self.session=aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.config.timeout),trust_env=True)
-            headers={'x-api-key':api_key,'id_merchant':self.config.merchant,'Accept':'application/json'}
+            headers={'x-api-key':self.config.key,'id_merchant':self.config.merchant,'Accept':'application/json'}
             options={'headers':headers,'allow_redirects':False}
             if body is not None:options['json']=body
             async with self.session.request(verb,'https://klikqris.com/api'+path,**options) as response:
@@ -315,10 +314,6 @@ class Client:
 
     async def status(self,ref,mode):
         return await self.request('GET',self.path(mode,'status',ref))
-
-    async def previous_status(self,ref,mode):
-        # An original credential may only read an already reserved reference.
-        return await self.request('GET',self.path(mode,'status',ref),credential='previous')
 
     async def history(self):
         result=await self.request('GET',self.path('gateway','history'))
@@ -451,17 +446,7 @@ class Gateway:
     async def read_status(self,row):
         try:return await self.api.status(row['reference'],row['mode']),'current'
         except GatewayError as exc:
-            self.status_error_context(exc,row,'current')
-            if exc.code!='NOT_FOUND' and not (exc.code=='ENDPOINT_NOT_FOUND' and exc.http_status==404):raise
-            allowed=self.can_recover_account(row)
-            if not allowed and self.config.previous_key and row['fingerprint']==self.fingerprint():
-                origin=self.one('SELECT value FROM klikqris_settings WHERE key=?',('status_account_'+row['id'],))
-                try:allowed=bool(origin and json.loads(origin['value'])==self.fingerprint(self.config.previous_key))
-                except (ValueError,TypeError):allowed=False
-            if not allowed:raise
-            try:return await self.api.previous_status(row['reference'],row['mode']),'previous'
-            except GatewayError as previous:
-                raise self.status_error_context(previous,row,'previous') from None
+            raise self.status_error_context(exc,row,'current')
 
     def save_status_diagnostic(self,conn,row,*,code,http_status,credential,correlation_id='',transaction_missing=False):
         detail={'stage':'status_reconciliation','code':code,'http_status':http_status,
@@ -474,7 +459,7 @@ class Gateway:
     async def recover_account(self,row):
         if not self.can_recover_account(row):raise GatewayError('ACCOUNT_CHANGED')
         if row['lease_until']>time.time():raise GatewayError('BUSY')
-        # Read with the authorized key, then compare against the ORIGINAL
+        # Read with the active API key, then compare against the ORIGINAL
         # encrypted signature and expected amount/reference before rebinding.
         data,credential=await self.read_status(row)
         try:_,status,_=self.validate(row,data,create=not bool(row['signature']))
@@ -493,12 +478,8 @@ class Gateway:
             conn.execute('''UPDATE klikqris_transactions SET fingerprint=?,signature=?,qr_image=?
                 WHERE id=? AND fingerprint=?''',(self.fingerprint(),signature,image,row['id'],row['fingerprint']))
             self.audit(conn,0,'account_key_reconciled',row['id'],'status_signature_amount_verified')
-            if credential=='current':
-                self.save_api_evidence(conn,row['mode'],verified=True,source='account_key_reconciled',
-                                       http_status=200,endpoint=self.api.endpoint_label(self.api.path(row['mode'],'status',row['reference'])))
-            else:
-                conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',
-                             ('status_account_'+row['id'],encoded(row['fingerprint']),time.time()))
+            self.save_api_evidence(conn,row['mode'],verified=True,source='account_key_reconciled',
+                                   http_status=200,endpoint=self.api.endpoint_label(self.api.path(row['mode'],'status',row['reference'])))
             self.save_status_diagnostic(conn,row,code='OK',http_status=200,credential=credential)
             current=self.transaction_after(conn,row['id'])
         return current,data,credential
@@ -630,7 +611,7 @@ class Gateway:
                 if actual:
                     data,credential=await self.read_status(actual)
                     self.validate(actual,data)
-                    evidence={'verified':credential=='current','source':'existing_gateway_order' if credential=='current' else 'original_account_status','http_status':200,
+                    evidence={'verified':True,'source':'existing_gateway_order','http_status':200,
                               'endpoint':self.api.endpoint_label(self.api.path('gateway','status',actual['reference']))}
                 else:evidence=await self.api.connection_evidence()
             else:
@@ -1505,7 +1486,7 @@ class Gateway:
         if not verified and settings['mode']=='gateway' and not problems and not proof.get('error'):
             text+='API akan diverifikasi saat invoice pembayaran dibuat. Saldo masuk setelah pembayaran sah.\n'
         if proof.get('source')=='original_account_status':
-            text+='Invoice lama terverifikasi melalui key asal; pemeriksaan ini belum memverifikasi key baru.\n'
+            text+='Pemeriksaan lama memakai key asal. Ulangi Cek Koneksi untuk memeriksa key aktif.\n'
         if verified and proof.get('source') in {'invoice_created','existing_gateway_order'}:
             text+='Verifikasi API memakai invoice nyata.\n'
         saved=self.one('SELECT value FROM klikqris_settings WHERE key=?',('invoice_'+settings['mode'],))
@@ -1536,8 +1517,8 @@ class Gateway:
             AND state IN ('NEW','REQUESTING','CREATE_UNKNOWN','PENDING','PAID_VERIFIED','CANCELLED_LOCAL')''',(self.fingerprint(),))['n']
         if blocked:
             text+='\nKonfigurasi lama: '+str(blocked)+' transaksi belum final. Draft NEW yang belum dikirim dipulihkan saat checkout dibuka.\n'
-            text+=('Key asal tersedia; Rekonsiliasi dapat membaca status invoice pada akun asal secara read-only.\n' if self.config.previous_key else
-                   'Jika hanya API key berubah, isi KLIKQRIS_PREVIOUS_API_KEY di secrets hosting untuk invoice yang sudah dikirim, lalu Rekonsiliasi. Jangan hapus transaksi atau membuat invoice pengganti.\n')
+            text+='Semua request API memakai key aktif. Key lama hanya untuk membuka data terenkripsi secara lokal.\n'
+            text+='Jika status referensi lama tetap 404, minta KlikQRIS memeriksa hasil create asli; jangan reset transaksi atau membuat pengganti.\n'
         if self.config.normalized:
             text+='\nℹ️ Format nilai environment dibaca otomatis; cukup isi nilainya saja.\n'
         if note:text+='\n'+html.escape(note)+'\n'
@@ -1618,7 +1599,7 @@ def register(router,gateway):
                'DNS':'Resolusi DNS gagal.', 'TLS':'Verifikasi TLS gagal.', 'TIMEOUT':'Request timeout; cek status invoice sebelum mencoba ulang.',
                'JSON_INVALID':'Respons API bukan JSON valid.',
                'MISMATCH':'Referensi atau nominal tidak sesuai; saldo/produk belum diproses.',
-               'ACCOUNT_CHANGED':'Invoice memakai konfigurasi akun lama. Jika hanya API key berubah, isi KLIKQRIS_PREVIOUS_API_KEY melalui secrets hosting, lalu Rekonsiliasi. Jangan membuat invoice pengganti.',
+               'ACCOUNT_CHANGED':'Invoice memakai konfigurasi lama. API hanya memakai key aktif; key lama hanya membuka signature/QR tersimpan secara lokal. Rekonsiliasi atau periksa referensi dengan KlikQRIS, tanpa invoice pengganti.',
                'BUSY':'Invoice masih diproses. Tunggu lalu Cek Status; jangan membuat tagihan pengganti.',
                'STOCK':'Stok tidak mencukupi.', 'RATE_LIMIT':'Terlalu banyak permintaan. Tunggu sebelum mencoba kembali.',
                'FORBIDDEN':'Akses ditolak.'}
