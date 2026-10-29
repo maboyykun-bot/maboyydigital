@@ -38,7 +38,7 @@ from types import SimpleNamespace
 from otp_smscode import TEXT_MENU_ACTIONS
 
 LABEL = '⚡ QRIS Otomatis'
-ADAPTER_VERSION = '17.36'
+ADAPTER_VERSION = '17.37'
 METHOD = 'KLIKQRIS_AUTO'
 PREFIX = 'aqris:'
 MAX_AMOUNT = 10**12
@@ -452,11 +452,27 @@ class Gateway:
     def reset_check_idle(self,conn,rows):
         now=time.time()
         for row in rows:
-            if row['lease_until']>now or row['delivery_until']>now or row['state'] in {'PAID_VERIFIED','REVIEW'}:
-                raise GatewayError('BUSY')
+            if row['lease_until']>now:raise GatewayError('RESET_REQUEST_ACTIVE')
+            if row['delivery_until']>now:raise GatewayError('RESET_DELIVERY_ACTIVE')
+            if row['state']=='PAID_VERIFIED':raise GatewayError('RESET_PAYMENT_PENDING')
+            if row['state']=='REVIEW':raise GatewayError('RESET_PAYMENT_REVIEW')
             if conn.execute('''SELECT 1 FROM payment_receipts WHERE lease_until>? AND user_id=?
                 AND ((source=? AND entity_id=?) OR (source='qris_review' AND entity_id=?))''',
-                (now,row['user_id'],row['purpose'],str(row['entity_id']),row['id'])).fetchone():raise GatewayError('BUSY')
+                (now,row['user_id'],row['purpose'],str(row['entity_id']),row['id'])).fetchone():raise GatewayError('RESET_RECEIPT_ACTIVE')
+
+    def record_reset_failure(self,exc,stage):
+        # This diagnosis must not replace create/connection evidence or contain
+        # exception text, transaction references, credentials or customer data.
+        detail={'stage':stage,'code':exc.code if isinstance(exc,GatewayError) else 'SQLITE',
+                'http_status':0,'checked_at':time.time(),
+                'correlation_id':getattr(exc,'correlation_id','') or secrets.token_hex(8)}
+        logging.warning('KlikQRIS stage=%s code=%s correlation_id=%s',stage,detail['code'],detail['correlation_id'])
+        try:
+            with self.connection(True) as conn:
+                conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',
+                    ('diagnostic_history_reset',encoded(detail),time.time()))
+        except sqlite3.Error:pass
+        return detail
 
     def prepare_history_reset(self,actor):
         self.require_owner(actor)
@@ -494,7 +510,8 @@ class Gateway:
                                     (row['entity_id'],row['user_id'],METHOD)).fetchone()
                 if native:
                     paid=native['status']=='completed' if row['purpose']=='topup' else native['payment_status']=='paid'
-                    if native['status']=='processing' or (paid and row['state'] not in {'SETTLED','SETTLED_BALANCE'}):raise GatewayError('BUSY')
+                    if native['status']=='processing':raise GatewayError('RESET_NATIVE_PROCESSING')
+                    if paid and row['state'] not in {'SETTLED','SETTLED_BALANCE'}:raise GatewayError('RESET_NATIVE_PAID')
                     if not paid:
                         if row['purpose']=='order':
                             self.host.release_order_reservation(conn,native)
@@ -502,7 +519,7 @@ class Gateway:
                                          (row['entity_id'],))
                         else:
                             credited=conn.execute("SELECT 1 FROM wallet_ledger WHERE user_id=? AND type='TOPUP' AND reference=?",(row['user_id'],self.host.topup_invoice(row['entity_id']))).fetchone()
-                            if credited:raise GatewayError('BUSY')
+                            if credited:raise GatewayError('RESET_LEDGER_EXISTS')
                             conn.execute("UPDATE topups SET status='cancelled',updated_at=? WHERE id=? AND status='pending'",(stamp,row['entity_id']))
                 conn.execute('INSERT INTO klikqris_settings VALUES(?,?,?)',('archived_'+row['id'],encoded({
                     'reset':token,'actor':actor,'archived_at':now,'previous_state':row['state'],'provider_cancelled':False}),now))
@@ -512,7 +529,7 @@ class Gateway:
                 conn.execute("UPDATE klikqris_payment_messages SET kind='RESET',next_retry_at=0 WHERE transaction_id=? AND kind='QR'",(row['id'],))
                 for prefix in ('status_diagnostic_','status_account_'):
                     conn.execute('DELETE FROM klikqris_settings WHERE key=?',(prefix+row['id'],))
-            conn.execute("DELETE FROM klikqris_settings WHERE key IN ('account_fingerprint','verified_gateway','verified_my_pg','connection_gateway','connection_my_pg','invoice_gateway','invoice_my_pg','checkout_diagnostic','diagnostic_image','diagnostic_telegram')")
+            conn.execute("DELETE FROM klikqris_settings WHERE key IN ('account_fingerprint','verified_gateway','verified_my_pg','connection_gateway','connection_my_pg','invoice_gateway','invoice_my_pg','checkout_diagnostic','diagnostic_image','diagnostic_telegram','diagnostic_history_reset')")
             for key,value in [('enabled',False),('mode','gateway')]:
                 conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',(key,encoded(value),now))
             result={'count':len(rows),'open':plan['open'],'archived_at':now}
@@ -1643,6 +1660,14 @@ class Gateway:
         text+='Database: '+html.escape(str(self.host.DB_PATH))+'\n'
         reset=self.last_reset_result()
         text+=('Reset tersimpan: '+self.host.payment_receipts.format_wib(reset['archived_at'],compact=True)+' • '+str(reset['count'])+' riwayat ditutup.\n' if reset else 'Reset tersimpan: belum ada konfirmasi berhasil pada database ini.\n')
+        failed_reset=self.one("SELECT value FROM klikqris_settings WHERE key='diagnostic_history_reset'")
+        if failed_reset:
+            try:
+                detail=json.loads(failed_reset['value'])
+                text+='\nReset gagal terakhir: '+html.escape(str(detail['code']))+'\n'
+                text+='Tahap: '+html.escape(str(detail['stage']))+' • HTTP: -\n'
+                text+='Waktu: '+self.host.payment_receipts.format_wib(detail['checked_at'],compact=True)+' • ID: '+html.escape(str(detail['correlation_id']))+'\n'
+            except (ValueError,TypeError,KeyError):pass
         if proof.get('error') in {'NETWORK','UPSTREAM'} and int(proof.get('http_status') or 0)>=500:
             text+='\n⚠️ Nonaktifkan pembelian baru sementara. Periksa transaksi pending sebelum membuat invoice pengganti. HTTP 5xx dapat berasal dari gateway atau perantara jaringan; bukan bukti API key salah.\n'
         if problems:text+='\n⚠️ '+html.escape('\n'.join(problems))+'\n'
@@ -1720,6 +1745,7 @@ class Gateway:
         if page:nav.append(('⬅️ Sebelumnya',action,page-1))
         if (page+1)*6<count:nav.append(('Berikutnya ➡️',action,page+1))
         if nav:controls.append(nav)
+        controls.append([('🧹 Reset Riwayat QRIS','reset_preview',None)])
         controls.append([('⬅️ Kembali','menu',None)])
         await self.host.safe_edit_or_answer(call,text,reply_markup=self.owner_keyboard(controls),parse_mode='HTML')
 
@@ -1754,9 +1780,12 @@ class Gateway:
                 text+='\n\nPemeriksaan referensi ini: '+html.escape(str(detail['code']))+' • HTTP: '+str(detail['http_status'] or '-')
                 text+='\nAkun: '+('asal' if detail.get('credential')=='previous' else 'aktif')+' • Tahap: status_reconciliation'
                 text+='\nWaktu: '+self.host.payment_receipts.format_wib(detail['checked_at'],compact=True)+' • ID: '+html.escape(detail['correlation_id'])
-                if detail['code'] in {'NOT_FOUND','ENDPOINT_NOT_FOUND'}:text+='\n404 belum membuktikan create sebelumnya tidak terjadi; tidak ada POST pengganti.'
+                if detail['code'] in {'NOT_FOUND','ENDPOINT_NOT_FOUND'}:
+                    text+='\n404 belum membuktikan create sebelumnya tidak terjadi; tidak ada POST pengganti.'
+                    text+='\nRekonsiliasi Status hanya membaca invoice ini. Untuk penutupan lokal, buka Reset Riwayat QRIS dan baca pratinjaunya.'
             except (ValueError,TypeError,KeyError):pass
         controls=[[('🔄 Rekonsiliasi Status','check',ident)]]
+        if not self.history_archived(ident):controls.append([('🧹 Reset Riwayat QRIS','reset_preview',None)])
         if row['state']=='REVIEW':
             if confirm_credit:
                 text+='\n\nPindahkan '+self.host.rupiah(row['amount'])+' ke wallet user tersebut? Order lama tetap dibatalkan; produk tidak dikirim. Penyesuaian/biaya QRIS tidak dikreditkan.'
@@ -1769,7 +1798,7 @@ class Gateway:
 def register(router,gateway):
     host=gateway.host
 
-    async def failure(call,exc,*,owner=False):
+    async def failure(call,exc,*,owner=False,reset=None):
         codes={'CONFIG':'Periksa environment hosting yang ditandai pada panel KlikQRIS.',
                'AUTH':'Autentikasi ditolak. Periksa API Key/Merchant ID dan izin akun.',
                'NOT_READY':'Lengkapi konfigurasi dan matikan sandbox. Gateway biasa memakai Aktifkan KlikQRIS; MY PG memerlukan verifikasi merchant terhubung.',
@@ -1789,16 +1818,29 @@ def register(router,gateway):
                'ACCOUNT_CHANGED':'Invoice memakai konfigurasi lama. API hanya memakai key aktif; key lama hanya membuka signature/QR tersimpan secara lokal. Rekonsiliasi atau periksa referensi dengan KlikQRIS, tanpa invoice pengganti.',
                'BUSY':'Invoice masih diproses. Tunggu lalu Cek Status; jangan membuat tagihan pengganti.',
                'RESET_CHANGED':'Data atau konfigurasi berubah, atau konfirmasi kedaluwarsa. Buka ulang Reset Riwayat QRIS; belum ada data ditutup.',
+               'RESET_REQUEST_ACTIVE':'Reset tertahan karena request pembayaran masih berjalan. Tunggu selesai, lalu buka ulang pratinjau reset.',
+               'RESET_DELIVERY_ACTIVE':'Reset tertahan karena pengiriman produk masih berjalan. Tunggu pengiriman selesai sebelum reset.',
+               'RESET_RECEIPT_ACTIVE':'Reset tertahan karena pengiriman atau pembersihan invoice masih berjalan. Tunggu lalu buka ulang reset.',
+               'RESET_PAYMENT_PENDING':'Reset tertahan karena pembayaran sah belum selesai diproses. Periksa Transaksi Pending terlebih dahulu.',
+               'RESET_PAYMENT_REVIEW':'Reset tertahan karena pembayaran perlu pemeriksaan owner. Selesaikan pemeriksaan sebelum reset.',
+               'RESET_NATIVE_PROCESSING':'Reset tertahan karena pesanan masih diproses. Periksa pesanan dan pengirimannya sebelum reset.',
+               'RESET_NATIVE_PAID':'Reset tertahan karena pesanan tercatat lunas tetapi status gateway belum selaras. Perlu pemeriksaan owner.',
+               'RESET_LEDGER_EXISTS':'Reset tertahan karena saldo sudah tercatat masuk. Perlu pemeriksaan penanda pembayaran oleh owner.',
+               'SQLITE':'Operasi database gagal. Periksa storage dan log hosting memakai ID diagnosis; reset belum disimpan.',
                'STOCK':'Stok tidak mencukupi.', 'RATE_LIMIT':'Terlalu banyak permintaan. Tunggu sebelum mencoba kembali.',
                'FORBIDDEN':'Akses ditolak.'}
         text=codes.get(getattr(exc,'code',''),'Pembayaran belum dapat diproses; data transaksi tetap disimpan untuk pemeriksaan.') if owner else buyer_error(exc)
+        reset_label=''
+        if reset:
+            reset_label='Kode: '+reset['code']+' • ID: '+reset['correlation_id']
+            text=codes.get(reset['code'],text)+'\n'+reset_label
         if not owner:gateway.record_checkout_failure(exc)
         if owner and getattr(exc,'code','')=='NOT_FOUND' and str(getattr(call,'data','') or '').split(':')[2:3] in [['connect'],['toggle'],['mode']]:
             text='Pemeriksaan koneksi mengembalikan HTTP 404. Ini bukan pencarian transaksi user; koneksi belum terverifikasi.'
         if owner and getattr(exc,'code','')!='FORBIDDEN' and host.is_owner(call.from_user.id) and call.message and str(call.message.chat.type)=='private' and call.message.chat.id==call.from_user.id:
             try:await gateway.owner_panel(call,note='❌ '+text)
             except sqlite3.Error:
-                await host.safe_edit_or_answer(call,'⚠️ Pengaturan KlikQRIS belum dapat dibaca dari database. Coba kembali; transaksi tersimpan tetap dipertahankan.',reply_markup=gateway.owner_keyboard([[('⬅️ Kembali','back',None)]]))
+                await host.safe_edit_or_answer(call,'⚠️ Pengaturan KlikQRIS belum dapat dibaca dari database. Coba kembali; transaksi tersimpan tetap dipertahankan.'+('\n'+reset_label if reset_label else ''),reply_markup=gateway.owner_keyboard([[('⬅️ Kembali','back',None)]]))
         await host.safe_callback_notice(call,text[:190],show_alert=True)
 
     @router.callback_query(F.data=='owner:auto_qris')
@@ -1822,7 +1864,7 @@ def register(router,gateway):
 
     @router.callback_query(F.data.startswith(PREFIX))
     async def callback(call,state):
-        owner=False
+        owner=False;reset_action=''
         try:
             if not call.message or str(call.message.chat.type)!='private' or call.message.chat.id!=call.from_user.id:raise GatewayError('FORBIDDEN')
             parts=str(call.data or '').split(':')
@@ -1831,6 +1873,7 @@ def register(router,gateway):
             owner=scope=='a'
             if owner:gateway.require_owner(call.from_user.id)
             elif scope!='u':raise GatewayError('INPUT')
+            if owner and action in {'reset_preview','reset_commit'}:reset_action=action
             gateway.bot=call.bot
             ok,_=host.persistent_rate_limit(call.from_user.id,'autoqris_callback',limit=20,window_seconds=60)
             if not ok:raise GatewayError('RATE_LIMIT')
@@ -1846,8 +1889,11 @@ def register(router,gateway):
             if action=='menu':await gateway.owner_panel(call)
             elif action=='reset_preview':await gateway.owner_reset_preview(call)
             elif action=='reset_commit':
+                previous=gateway.last_reset_result()
                 result=gateway.apply_history_reset(call.from_user.id,value)
-                await gateway.owner_panel(call,note=str(result['count'])+' riwayat QRIS ditutup. QRIS dijeda; pilih Aktifkan saat siap memakai key aktif. Invoice provider tidak dibatalkan otomatis.')
+                note=('Konfirmasi ini sudah pernah disimpan; tidak ada reset baru. Riwayat setelah reset tersebut tetap ada. Buka Reset Riwayat QRIS untuk pratinjau baru.'
+                      if result==previous else str(result['count'])+' riwayat QRIS ditutup. QRIS dijeda; pilih Aktifkan saat siap memakai key aktif. Invoice provider tidak dibatalkan otomatis.')
+                await gateway.owner_panel(call,note=note)
             elif action=='connect':
                 if gateway.settings()['mode']=='my_pg':
                     await state.set_state(AutoQRISAdminState.merchant_reference)
@@ -1884,7 +1930,9 @@ def register(router,gateway):
             elif action=='back':
                 await host.safe_edit_or_answer(call,'💳 Pengaturan Pembayaran',reply_markup=host.qris_settings_menu())
             else:raise GatewayError('INPUT')
-        except (GatewayError,sqlite3.Error) as exc:await failure(call,exc,owner=owner)
+        except (GatewayError,sqlite3.Error) as exc:
+            detail=gateway.record_reset_failure(exc,reset_action) if reset_action else None
+            await failure(call,exc,owner=owner,reset=detail)
 
     @router.message(AutoQRISAdminState.merchant_reference,F.text & ~F.text.startswith('/') & ~F.text.in_(TEXT_MENU_ACTIONS))
     async def merchant_reference_input(message,state):
