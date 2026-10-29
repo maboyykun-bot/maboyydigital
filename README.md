@@ -1,4 +1,4 @@
-# MaboyyDigital v17.34
+# MaboyyDigital v17.35
 
 Bot Telegram untuk produk digital, saldo, OTP, Sosmed dan API mitra.
 Command: `/start`, `/otp`, `/sosmed`, `/tools`, `/owner`, `/ping`.
@@ -47,7 +47,7 @@ History HTTP 404 bukan bukti autentikasi berhasil atau riwayat kosong.
 Jika create timeout/5xx, cek status atau rekonsiliasi sebelum mencoba lagi.
 Aktifkan hanya setelah persistensi `/data/shop.db` dan stok terverifikasi.
 
-## Update v17.34
+## Update v17.35
 
 Untuk proyek existing, timpa `main.py`, `bot.py`, `klikqris_gateway.py` dan
 `README.md` dari paket ini. Launcher dan bot harus memakai versi yang sama.
@@ -62,26 +62,32 @@ pembayaran lain mengikuti alur existing. Pembersihan berlanjut setelah restart,
 dengan retry jika Telegram gagal. Ruang SQLite yang dibersihkan dipakai ulang;
 ukuran file database tidak selalu langsung mengecil.
 
-Semua request KlikQRIS sekarang hanya memakai `KLIKQRIS_API_KEY` aktif.
-Fallback HTTP dengan key lama dihapus karena key yang dicabut mendapat 401.
-`KLIKQRIS_PREVIOUS_API_KEY` hanya membuka signature/QR terenkripsi secara lokal;
-nilainya tetap berguna untuk dekripsi meski sudah tidak diterima provider.
-Tidak ada variabel baru. Pertahankan nilai lama untuk data yang masih terenkripsi.
+Semua request memakai `KLIKQRIS_API_KEY` aktif. Tidak ada variabel baru.
+Reset dan pembelian baru tidak memerlukan key lama. Untuk memulai ulang:
 
-Gunakan **QRIS Otomatis → Rekonsiliasi → Cek Koneksi**. Jika key aktif tetap
-mendapat 404 untuk CREATE_UNKNOWN/REQUESTING lama, hasil create perlu dikonfirmasi
-KlikQRIS. Pesanan yang sama tidak dibuat ulang. Pembelian baru yang berbeda tetap
-mengikuti alur existing dengan key aktif; patch tidak membuat invoice otomatis.
-Jika key lama hilang, pemulihan signature lama memerlukan bantuan penyedia;
-validasi signature tetap diwajibkan. Draft NEW tidak memerlukan key lama.
+1. Buka `/owner` → QRIS Otomatis → **Reset Riwayat QRIS**.
+2. Baca jumlah transaksi dan akibatnya, lalu pilih **Tutup & kosongkan riwayat**.
+3. Reset menjeda QRIS. Pilih **Aktifkan KlikQRIS** saat siap, lalu buka checkout baru.
+
+Reset mengosongkan daftar QRIS, membersihkan QR sementara, serta menutup pesanan
+QRIS yang belum dibayar dan melepas reservasi stoknya. Saldo, pesanan lunas,
+signature dan penanda anti pembayaran ganda tetap disimpan. Tidak menghapus DB.
+**Reset tidak membatalkan invoice di KlikQRIS.** QR lama mungkin masih dapat
+dibayar; pembayaran terlambat memerlukan pemeriksaan owner. Jangan bayar QR lama.
+Reset tidak membuat invoice; default retry timeout/5xx tetap tidak diulang.
+
+`KLIKQRIS_PREVIOUS_API_KEY` boleh dihapus dari Secrets setelah reset jika key
+lama memang hilang. Kompatibilitas dekripsi lokal untuk data lama tetap ada,
+tanpa memakai key lama untuk HTTP. Cek Koneksi hanya GET; setelah daftar kosong,
+history 404 tetap belum terverifikasi sampai ada bukti API yang sah.
 Schema tetap **207**; dependensi dan fitur pembayaran manual tetap dipertahankan.
 
 ## Pengujian dan panduan
 
-**83 tes mock/database sementara lulus.** Belum push GitHub, deploy atau tes
+**101 tes mock/database sementara lulus.** Belum push GitHub, deploy atau tes
 pembayaran live; HTTP 503 live belum terverifikasi. Persistensi volume dikonfirmasi pengguna;
 akses console hosting tidak tersedia di sesi perbaikan.
 
-Paket `MaboyyDigital_v17.34_QA.zip` memuat tes, patch, checksum dan panduan
-pemasangan/rollback (`docs/KLIKQRIS_V17_34.md`). Riwayat fitur lengkap tersedia
+Paket `MaboyyDigital_v17.35_QA.zip` memuat tes, patch, checksum dan panduan
+pemasangan/rollback (`docs/KLIKQRIS_V17_35.md`). Riwayat fitur lengkap tersedia
 di `docs/RIWAYAT_RILIS.md` pada paket QA. Paket QA tidak diperlukan untuk startup.
