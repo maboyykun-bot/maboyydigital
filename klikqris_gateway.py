@@ -38,6 +38,7 @@ from types import SimpleNamespace
 from otp_smscode import TEXT_MENU_ACTIONS
 
 LABEL = '⚡ QRIS Otomatis'
+ADAPTER_VERSION = '17.36'
 METHOD = 'KLIKQRIS_AUTO'
 PREFIX = 'aqris:'
 MAX_AMOUNT = 10**12
@@ -340,23 +341,28 @@ class Client:
         inline=data.get('qris_image')
         if isinstance(inline,str) and inline.startswith(('data:image/png;base64,','data:image/jpeg;base64,','data:image/webp;base64,')):
             try:return self.image_valid(base64.b64decode(inline.split(',',1)[1],validate=True))
-            except (ValueError,TypeError):raise GatewayError('IMAGE') from None
+            except (GatewayError,ValueError,TypeError):pass  # Try the documented official URL, never create again.
         url=data.get('qris_url')
         if not isinstance(url,str):raise GatewayError('IMAGE')
-        parsed=urlparse(url)
-        if parsed.scheme!='https' or parsed.hostname!='klikqris.com' or parsed.port not in {None,443} or not parsed.path.startswith('/storage/') or parsed.username or parsed.password or parsed.fragment:
-            raise GatewayError('IMAGE')
+        try:
+            parsed=urlparse(url)
+            if parsed.scheme!='https' or parsed.hostname!='klikqris.com' or parsed.port not in {None,443} or not parsed.path.startswith('/storage/') or parsed.username or parsed.password or parsed.fragment:
+                raise GatewayError('IMAGE')
+        except ValueError:raise GatewayError('IMAGE') from None
         if self.session is None or self.session.closed:
             self.session=aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.config.timeout),trust_env=True)
         try:
             async with self.session.request('GET',url,allow_redirects=False) as response:
-                if response.status!=200:raise GatewayError('IMAGE')
+                if response.status!=200:raise GatewayError('IMAGE',http_status=response.status,endpoint='GET /storage/{qris_image}')
                 raw=bytearray()
                 async for chunk in response.content.iter_chunked(65536):
                     raw.extend(chunk)
                     if len(raw)>QR_LIMIT:raise GatewayError('IMAGE')
                 return self.image_valid(bytes(raw))
-        except (aiohttp.ClientError,asyncio.TimeoutError):raise GatewayError('IMAGE') from None
+        except aiohttp.ClientSSLError:raise GatewayError('TLS',endpoint='GET /storage/{qris_image}') from None
+        except aiohttp.ClientConnectorDNSError:raise GatewayError('DNS',endpoint='GET /storage/{qris_image}') from None
+        except asyncio.TimeoutError:raise GatewayError('TIMEOUT',endpoint='GET /storage/{qris_image}') from None
+        except aiohttp.ClientError:raise GatewayError('NETWORK',endpoint='GET /storage/{qris_image}') from None
 
     async def close(self):
         if self.session is not None and not self.session.closed:await self.session.close()
@@ -424,6 +430,16 @@ class Gateway:
             return conn.execute('SELECT 1 FROM klikqris_settings WHERE key=?',('archived_'+ident,)).fetchone() is not None
         return bool(self.one('SELECT 1 FROM klikqris_settings WHERE key=?',('archived_'+ident,)))
 
+    def last_reset_result(self,conn=None):
+        for key in ('history_reset_completed','history_reset_plan'):
+            row=conn.execute('SELECT value FROM klikqris_settings WHERE key=?',(key,)).fetchone() if conn is not None else self.one('SELECT value FROM klikqris_settings WHERE key=?',(key,))
+            try:
+                value=json.loads(row['value']) if row else {}
+                result=value.get('result',value)
+                if isinstance(result,dict) and result.get('archived_at') and isinstance(result.get('count'),int):return result
+            except (ValueError,TypeError,AttributeError):pass
+        return {}
+
     def reset_snapshot(self,conn):
         cutoff=conn.execute('SELECT COALESCE(MAX(rowid),0) FROM klikqris_transactions').fetchone()[0]
         rows=[dict(row) for row in conn.execute('''SELECT id,purpose,entity_id,user_id,state,fingerprint,
@@ -449,6 +465,8 @@ class Gateway:
         with self.connection(True) as conn:
             cutoff,rows,digest=self.reset_snapshot(conn)
             self.reset_check_idle(conn,rows)
+            previous=self.last_reset_result(conn)
+            if previous:conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',('history_reset_completed',encoded(previous),time.time()))
             plan={'token':secrets.token_hex(8),'actor':actor,'fingerprint':self.fingerprint(),
                   'cutoff':cutoff,'digest':digest,'count':len(rows),
                   'open':sum(row['state'] in {'NEW','REQUESTING','CREATE_UNKNOWN','PENDING','CANCELLED_LOCAL'} for row in rows),
@@ -498,6 +516,7 @@ class Gateway:
             for key,value in [('enabled',False),('mode','gateway')]:
                 conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',(key,encoded(value),now))
             result={'count':len(rows),'open':plan['open'],'archived_at':now}
+            conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',('history_reset_completed',encoded(result),now))
             plan['result']=result
             conn.execute("UPDATE klikqris_settings SET value=?,updated_at=? WHERE key='history_reset_plan'",(encoded(plan),now))
             self.audit(conn,actor,'history_reset',detail=encoded({'count':len(rows),'open':plan['open'],'reset':token}))
@@ -685,14 +704,16 @@ class Gateway:
     def save_stage_diagnostic(self,conn,stage,code,exc=None):
         detail={'stage':stage,'code':code,'http_status':getattr(exc,'http_status',0),
                 'correlation_id':getattr(exc,'correlation_id','') or secrets.token_hex(8),
-                'checked_at':time.time()}
+                'checked_at':time.time(),'cause_code':getattr(exc,'code','') if getattr(exc,'code',code)!=code else ''}
         conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',
                      ('diagnostic_'+stage,encoded(detail),time.time()))
 
     def record_checkout_failure(self,exc):
         code=exc.code if isinstance(exc,GatewayError) else 'SQLITE' if isinstance(exc,sqlite3.Error) else 'INTERNAL'
         ident=getattr(exc,'correlation_id','') or secrets.token_hex(8)
-        if getattr(exc,'transaction_id','') and self.history_archived(exc.transaction_id):return ident
+        try:
+            if getattr(exc,'transaction_id','') and self.history_archived(exc.transaction_id):return ident
+        except sqlite3.Error:return ident
         detail={'stage':getattr(exc,'stage','checkout'),'code':code,'http_status':getattr(exc,'http_status',0),
                 'correlation_id':ident,'checked_at':time.time(),'credential':getattr(exc,'credential','current'),
                 'transaction_id':getattr(exc,'transaction_id',''),'transaction_state':getattr(exc,'transaction_state',''),
@@ -1147,8 +1168,11 @@ class Gateway:
             if status=='PENDING' and not row['qr_image']:
                 try:
                     image=await self.api.image(data)
-                    with self.connection(True) as conn:conn.execute("UPDATE klikqris_transactions SET qr_image=? WHERE id=? AND state='PENDING'",(self.crypt(image),ident))
-                except (GatewayError,ValueError):pass
+                    with self.connection(True) as conn:conn.execute("UPDATE klikqris_transactions SET qr_image=? WHERE id=? AND state='PENDING' AND fingerprint=?",(self.crypt(image),ident,self.fingerprint()))
+                except (GatewayError,ValueError) as exc:
+                    with self.connection(True) as conn:
+                        changed=conn.execute("UPDATE klikqris_transactions SET error='IMAGE' WHERE id=? AND state='PENDING' AND fingerprint=? AND NOT EXISTS(SELECT 1 FROM klikqris_settings s WHERE s.key='archived_'||klikqris_transactions.id)",(ident,self.fingerprint())).rowcount
+                        if changed:self.save_stage_diagnostic(conn,'image','IMAGE',exc)
             if status in {'SUCCESS','PAID'} and not row['sandbox'] and not self.config.sandbox:
                 return await self.settle(ident)
         except GatewayError as exc:
@@ -1504,6 +1528,7 @@ class Gateway:
             text+='⏳ Berlaku hingga: '+self.host.payment_receipts.format_wib(row['expires_at'],compact=True)+'\n'
         if row['state']=='PENDING' and row['error'] not in {'NOT_FOUND','ENDPOINT_NOT_FOUND'}:text+='Bayar tepat sesuai total. Status akan diperbarui otomatis.\n'
         if row['state'] in {'REQUESTING','CREATE_UNKNOWN'}:text+='Invoice sedang diperiksa. Jangan membuat pembayaran pengganti atau membayar dua kali.\n'
+        if row['state']=='PENDING' and row['error']=='IMAGE':text+='Gambar QRIS belum tersedia. Gunakan Cek Status untuk mengambil QR invoice yang sama; jangan membayar sebelum QR tampil.\n'
         if row['error'] and row['state'] not in {'SETTLED','SETTLED_BALANCE'}:text+='Pemeriksaan belum selesai; cek kembali atau hubungi owner.\n'
         return text+'\n<i>'+html.escape(self.host.STORE_FOOTER)+'</i>'
 
@@ -1605,7 +1630,7 @@ class Gateway:
         problems=self.config.problems()
         webhook=self.config.webhook_url if not any('KLIKQRIS_WEBHOOK_URL' in issue for issue in self.config.issues) else 'Perlu diperbaiki di environment hosting.'
         text=('👑 <b>PENGATURAN QRIS OTOMATIS</b>\n\nProvider: KlikQRIS\n'
-              f"Versi bot: {html.escape(str(self.host.BOT_VERSION))}\n"
+              f"Versi bot: {html.escape(str(self.host.BOT_VERSION))} • Gateway: {ADAPTER_VERSION}\n"
               f"Mode: {'MY PG' if settings['mode']=='my_pg' else 'Gateway biasa'}\n"
               f"Izin membuat invoice: {'AKTIF' if ready else 'NONAKTIF / belum siap'}\n"
               f"Status API: {html.escape(api_status)}\n"
@@ -1615,6 +1640,9 @@ class Gateway:
               f"Konfigurasi: {'Tersedia' if self.configured() else 'Perlu diperbaiki'}\n"
               f"Sandbox: {'ON; saldo/produk nyata diblokir' if self.config.sandbox else 'OFF'}\n\n"
               'Webhook: '+html.escape(webhook or 'Atur URL webhook pada dashboard; polling tetap tersedia.')+'\n')
+        text+='Database: '+html.escape(str(self.host.DB_PATH))+'\n'
+        reset=self.last_reset_result()
+        text+=('Reset tersimpan: '+self.host.payment_receipts.format_wib(reset['archived_at'],compact=True)+' • '+str(reset['count'])+' riwayat ditutup.\n' if reset else 'Reset tersimpan: belum ada konfirmasi berhasil pada database ini.\n')
         if proof.get('error') in {'NETWORK','UPSTREAM'} and int(proof.get('http_status') or 0)>=500:
             text+='\n⚠️ Nonaktifkan pembelian baru sementara. Periksa transaksi pending sebelum membuat invoice pengganti. HTTP 5xx dapat berasal dari gateway atau perantara jaringan; bukan bukti API key salah.\n'
         if problems:text+='\n⚠️ '+html.escape('\n'.join(problems))+'\n'
@@ -1649,6 +1677,7 @@ class Gateway:
                     diagnostic=json.loads(diagnostic['value'])
                     if key=='checkout_diagnostic':text+='\nKesalahan proses QRIS terakhir'+(' (teratasi)' if diagnostic.get('resolved_at') else ' (riwayat)')+'\n'
                     text+='\nTahap: '+html.escape(str(diagnostic['stage']))+' • Kode: '+html.escape(str(diagnostic['code']))+' • HTTP: '+str(diagnostic['http_status'] or '-')+'\nID: '+html.escape(diagnostic['correlation_id'])+'\nWaktu: '+self.host.payment_receipts.format_wib(diagnostic['checked_at'],compact=True)+'\n'
+                    if diagnostic.get('cause_code'):text+='Penyebab: '+html.escape(str(diagnostic['cause_code']))+'\n'
                     if diagnostic.get('transaction_state'):
                         text+='Status transaksi: '+html.escape(str(diagnostic['transaction_state']))+' • Mode: '+html.escape(str(diagnostic.get('mode','')))+'\n'
                         text+='Kredensial pembacaan: '+('akun asal' if diagnostic.get('credential')=='previous' else 'akun aktif')+'\n'
@@ -1659,7 +1688,7 @@ class Gateway:
         if blocked:
             text+='\nKonfigurasi lama: '+str(blocked)+' transaksi belum final. Draft NEW yang belum dikirim dipulihkan saat checkout dibuka.\n'
             text+='Semua request API memakai key aktif. Key lama hanya untuk membuka data terenkripsi secara lokal.\n'
-            text+='Jika status referensi lama tetap 404, minta KlikQRIS memeriksa hasil create asli; jangan reset transaksi atau membuat pengganti.\n'
+            text+='Untuk penutupan lokal yang Anda pilih, gunakan Reset Riwayat QRIS dan baca pratinjaunya. Invoice di KlikQRIS tidak otomatis dibatalkan.\n'
         if self.config.normalized:
             text+='\nℹ️ Format nilai environment dibaca otomatis; cukup isi nilainya saja.\n'
         if note:text+='\n'+html.escape(note)+'\n'
