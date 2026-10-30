@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.37"
+BOT_VERSION = "17.38"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -7928,6 +7928,7 @@ async def transaction_self_test():
 
     # Payment config (read-only; no probe invoice)
     auto_ready = KLIKQRIS_GATEWAY.ready()
+    auto_healthy = False
     try:
         gateway_settings=KLIKQRIS_GATEWAY.settings()
         checks.append(("KlikQRIS", not gateway_settings["enabled"] or auto_ready,
@@ -7935,6 +7936,9 @@ async def transaction_self_test():
         gateway_verified=KLIKQRIS_GATEWAY.verified(gateway_settings["mode"])
         checks.append(("KlikQRIS API", not gateway_settings["enabled"] or gateway_verified,
                        "terakhir terverifikasi" if gateway_verified else "belum terverifikasi; tidak membuat invoice uji"))
+        create_ok,create_detail=KLIKQRIS_GATEWAY.invoice_creation_health(gateway_settings["mode"])
+        checks.append(("KlikQRIS Create",not gateway_settings["enabled"] or create_ok,create_detail))
+        auto_healthy=auto_ready and gateway_verified and create_ok
     except sqlite3.Error:
         checks.append(("KlikQRIS", False, "SQLITE: pengaturan belum dapat dibaca"))
     qris_ready = bool(get_setting("qris_file_id",""))
@@ -7952,8 +7956,8 @@ async def transaction_self_test():
     ))
     checks.append((
         "Pembayaran",
-        bool(qris_ready or bank_ready or auto_ready),
-        "ready" if (qris_ready or bank_ready or auto_ready) else "Belum ada metode pembayaran siap"
+        bool(qris_ready or bank_ready or auto_healthy),
+        "ready" if (qris_ready or bank_ready or auto_healthy) else "Belum ada metode pembayaran terverifikasi siap"
     ))
 
     return checks
@@ -36666,7 +36670,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.37"
+EXPECTED_SOURCE_VERSION = "17.38"
 
 
 def source_integrity_self_test():
