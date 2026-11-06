@@ -8,7 +8,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from klikqris_gateway import GatewayError, buyer_error, environment_value
 
 METHODS = frozenset({'KLIKQRIS_AUTO', 'PAYINAJA_AUTO'})
-ADAPTER_VERSION = '17.43'
+ADAPTER_VERSION = '17.44'
 
 
 def managed(row):
@@ -152,6 +152,11 @@ async def checkout(host, call, bot, state, variant, qty):
     if not call.message or str(call.message.chat.type) != 'private' or call.message.chat.id != call.from_user.id:
         raise GatewayError('FORBIDDEN')
     gateway, row = other_pending(host, 'order', call.from_user.id, variant=variant, qty=qty)
+    if row and gateway is host.PAYINAJA_GATEWAY and gateway.is_prior_session(row):
+        row = await gateway.prior_checkout(row['id'])
+        if row:
+            return await gateway.show_prior_hold(call, row['id'])
+        gateway = None
     gateway = gateway or active(host)
     try:
         if row:
@@ -246,6 +251,11 @@ def register(router, host):
             amount = int(parts[2])
             await host.safe_callback_notice(call)
             gateway, row = other_pending(host, 'topup', call.from_user.id, amount=amount)
+            if row and gateway is host.PAYINAJA_GATEWAY and gateway.is_prior_session(row):
+                row = await gateway.prior_checkout(row['id'])
+                if row:
+                    return await gateway.show_prior_hold(call, row['id'])
+                gateway = None
             if row:
                 if gateway is host.PAYINAJA_GATEWAY and row['cancel_requested']:
                     return await gateway.show_existing_cancellation(call, row['id'])
