@@ -2,7 +2,7 @@ import asyncio
 import os
 import sys
 
-EXPECTED_VERSION = "17.41"
+EXPECTED_VERSION = "17.43"
 
 import bot
 
@@ -20,7 +20,7 @@ def launcher_self_test():
             "Upload semua modul runtime dari paket versi yang sama ke root repository."
         )
 
-    for module_name in ('klikqris_gateway', 'payinaja_gateway'):
+    for module_name in ('klikqris_gateway', 'payinaja_gateway', 'automatic_qris'):
         module = getattr(bot, module_name, None)
         actual = str(getattr(module, 'ADAPTER_VERSION', '') or '')
         if actual != EXPECTED_VERSION:

@@ -8,6 +8,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from klikqris_gateway import GatewayError, buyer_error, environment_value
 
 METHODS = frozenset({'KLIKQRIS_AUTO', 'PAYINAJA_AUTO'})
+ADAPTER_VERSION = '17.43'
 
 
 def managed(row):
@@ -40,6 +41,15 @@ def active(host):
 def ready(host):
     try:
         return active(host).ready()
+    except (GatewayError, sqlite3.Error):
+        return False
+
+
+def available(host):
+    """Configured + owner-enabled may authenticate on click; this is not verified readiness."""
+    try:
+        gateway = active(host)
+        return gateway.can_attempt() if gateway is host.PAYINAJA_GATEWAY else gateway.ready()
     except (GatewayError, sqlite3.Error):
         return False
 
@@ -146,11 +156,28 @@ async def checkout(host, call, bot, state, variant, qty):
     try:
         if row:
             # Read/check the old invoice. Never replace it using another provider.
+            if gateway is host.PAYINAJA_GATEWAY and row['cancel_requested']:
+                return await gateway.show_existing_cancellation(call, row['id'])
             return await gateway.show_status(call, row['id'])
         return await gateway.checkout(call, bot, state, variant, qty)
     except (GatewayError, sqlite3.Error) as exc:
         exc.provider = 'payinaja' if gateway is host.PAYINAJA_GATEWAY else 'klikqris'
         raise
+
+
+async def prompt_buyer_cancel(host, call, purpose, entity):
+    """Route legacy native buttons to the same Payinaja confirmation flow."""
+    try:
+        gateway = for_native(host, purpose, entity)
+        if gateway is not host.PAYINAJA_GATEWAY:
+            return False
+        row = gateway.linked(purpose, entity)
+        if row is None:
+            raise GatewayError('NOT_FOUND')
+        await gateway.prompt_cancel(call, row['id'])
+    except (GatewayError, sqlite3.Error) as exc:
+        await host.safe_callback_notice(call, 'Invoice belum dapat dibatalkan. Buka detail QRIS Otomatis.', show_alert=True)
+    return True
 
 
 async def owner_provider_menu(host, call):
@@ -220,6 +247,8 @@ def register(router, host):
             await host.safe_callback_notice(call)
             gateway, row = other_pending(host, 'topup', call.from_user.id, amount=amount)
             if row:
+                if gateway is host.PAYINAJA_GATEWAY and row['cancel_requested']:
+                    return await gateway.show_existing_cancellation(call, row['id'])
                 return await gateway.show_status(call, row['id'])
             gateway = active(host)
             await gateway.topup(call, amount, state)

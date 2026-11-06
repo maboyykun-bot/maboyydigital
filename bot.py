@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.41"
+BOT_VERSION = "17.43"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -6246,7 +6246,7 @@ def topup_payment_method_keyboard(amount: int):
             callback_data=f"topupmethod:qris:{amount}"
         )]
     ]
-    if automatic_qris.ready(_otp_sys.modules[__name__]):
+    if automatic_qris.available(_otp_sys.modules[__name__]):
         rows.insert(0,[InlineKeyboardButton(text=klikqris_gateway.LABEL,callback_data=f'topupmethod:auto:{amount}')])
     if bank_transfer_ready():
         rows.append([
@@ -9900,7 +9900,7 @@ def unique_code_for_order(conn=None):
 
 
 def auto_payment_ready():
-    return automatic_qris.ready(_otp_sys.modules[__name__]) or (automatic_qris.legacy_allowed(_otp_sys.modules[__name__]) and shopeepay_ready())
+    return automatic_qris.available(_otp_sys.modules[__name__]) or (automatic_qris.legacy_allowed(_otp_sys.modules[__name__]) and shopeepay_ready())
 
 
 def shopeepay_ready():
@@ -17846,7 +17846,8 @@ async def user_tools_vip_purchase(call: CallbackQuery,state: FSMContext):
         ok,_=persistent_rate_limit(call.from_user.id,'tools_vip_purchase',limit=5,window_seconds=60)
         if not ok:raise ValueError('Terlalu banyak percobaan. Coba kembali sebentar lagi.')
         method='WALLET' if parts[3]=='w' else automatic_qris.active_method(_otp_sys.modules[__name__])
-        if method in automatic_qris.METHODS and not automatic_qris.ready(_otp_sys.modules[__name__]):raise ValueError('QRIS Otomatis belum tersedia. Pilih saldo atau hubungi owner.')
+        if method in automatic_qris.METHODS and not automatic_qris.available(_otp_sys.modules[__name__]):raise ValueError('QRIS Otomatis belum tersedia. Pilih saldo atau hubungi owner.')
+        if method==payinaja_gateway.METHOD:await PAYINAJA_GATEWAY.ensure_profile()
         async with purchase_lock(call.from_user.id):
             conn=db()
             try:
@@ -24714,6 +24715,8 @@ async def user_cancel_order(call: CallbackQuery, bot: Bot, state: FSMContext = N
 
     if not recent_action_allowed(f"usercancel:{order_id}:{call.from_user.id}", 3):
         return await safe_callback_notice(call, "Sedang diproses. Jangan tekan dua kali.", show_alert=True)
+    if await automatic_qris.prompt_buyer_cancel(_otp_sys.modules[__name__],call,'order',order_id):
+        return
 
     conn = None
     was_cancelled = False
@@ -24942,6 +24945,8 @@ async def user_cancel_topup(call: CallbackQuery, state: FSMContext = None):
     topup_id = numbers[0]
     if not recent_action_allowed(f"topupcancel:{topup_id}:{call.from_user.id}", 3):
         return await safe_callback_notice(call, "Sedang diproses. Jangan tekan dua kali.", show_alert=True)
+    if await automatic_qris.prompt_buyer_cancel(_otp_sys.modules[__name__],call,'topup',topup_id):
+        return
     try:
         row, status = cancel_topup_atomic(topup_id, call.from_user.id)
     except sqlite3.Error:
@@ -26643,6 +26648,7 @@ async def owner_cancel_confirm(call: CallbackQuery, bot: Bot):
             except (klikqris_gateway.GatewayError,sqlite3.Error) as exc:
                 PAYINAJA_GATEWAY.diagnostic(exc,'cancel')
                 return await safe_callback_notice(call,'Pembatalan belum terkonfirmasi. Periksa detail transaksi QRIS Otomatis.',show_alert=True)
+        return await safe_callback_notice(call,'Metadata invoice Payinaja belum tersedia. Periksa transaksi sebelum membatalkan.',show_alert=True)
     ok, message = await cancel_pending_order(order_id, bot)
 
     if ok:
@@ -27103,6 +27109,14 @@ async def owner_pending_order_cancel(call: CallbackQuery):
         order_id=int(call.data.split(":")[-1])
     except Exception:
         return await call.answer("Order tidak valid.",show_alert=True)
+
+    if automatic_qris.for_native(_otp_sys.modules[__name__],'order',order_id) is PAYINAJA_GATEWAY:
+        return await safe_edit_or_answer(call,
+            '⚠️ <b>KONFIRMASI PEMBATALAN PAYINAJA</b>\n\nInvoice: '+invoice(order_id)+
+            '\nPembatalan provider baru diajukan setelah Anda konfirmasi.', parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text='✅ Ya, ajukan pembatalan',callback_data=f'ownercancel:confirm:{order_id}')],
+                [InlineKeyboardButton(text='⬅️ Kembali',callback_data='owner:pending_orders')]]))
 
     conn=db()
     begin_immediate_retry(conn)
@@ -36700,7 +36714,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.41"
+EXPECTED_SOURCE_VERSION = "17.43"
 
 
 def source_integrity_self_test():
