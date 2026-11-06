@@ -70,6 +70,7 @@ def rupiah(value):
 def method_label(value):
     return {"QRIS_MANUAL": "QRIS", "AUTO_QRIS": "QRIS Otomatis",
             "KLIKQRIS_AUTO": "⚡ QRIS Otomatis",
+            "PAYINAJA_AUTO": "⚡ QRIS Otomatis",
             "QRIS": "QRIS", "BALANCE": "Saldo Bot", "SALDO": "Saldo Bot",
             "WALLET": "Saldo Bot", "BANK": "Transfer Bank", "TRANSFER": "Transfer Bank",
             "BANK_TRANSFER": "Transfer Bank",
@@ -456,7 +457,7 @@ class ReceiptService:
             vip=conn.execute('SELECT access_expires_at FROM tools_vip_purchases WHERE order_id=? AND activated_at IS NOT NULL',(row['id'],)).fetchone()
             if vip:
                 result.update(category='VIP /tools',item='VIP /tools',variant='1 bulan',vip_until=vip['access_expires_at'])
-            if row['payment_method']=='KLIKQRIS_AUTO':
+            if row['payment_method'] in {'KLIKQRIS_AUTO','PAYINAJA_AUTO'}:
                 result['qris_adjustment']=max(0,int(result['amount'])-int(row['total'])+int(row['discount_amount'] or 0))
         elif source == "topup":
             row = dict(conn.execute("SELECT * FROM topups WHERE id=?", (entity_id,)).fetchone())
@@ -465,7 +466,7 @@ class ReceiptService:
                 quantity=1, amount=row["payment_total"] or row["amount"], credit=row["amount"],
                 unique_code=row["unique_code"], method=row["payment_method"], paid_at=row["verified_at"] or row["updated_at"] or row["created_at"])
             result["customer"] = self.customer(conn, user, row["username"])
-            if row['payment_method']=='KLIKQRIS_AUTO':
+            if row['payment_method'] in {'KLIKQRIS_AUTO','PAYINAJA_AUTO'}:
                 result['qris_adjustment']=max(0,int(result['amount'])-int(row['amount']))
         elif source == 'qris_review':
             row=dict(conn.execute('SELECT * FROM klikqris_transactions WHERE id=?',(entity_id,)).fetchone())
@@ -593,7 +594,9 @@ class ReceiptService:
             photo = BufferedInputFile(future.result(), filename="Invoice_"+re.sub(r"[^A-Za-z0-9_-]", "_", data["reference"])+".png")
             if await self.retire_if_inactive(bot,source,entity):return False
             caption,keyboard=self.view(row)
-            gateway = getattr(self.host, "KLIKQRIS_GATEWAY", None)
+            provider_router = getattr(self.host, "automatic_qris", None)
+            gateway = (provider_router.for_receipt(self.host, source, entity) if provider_router is not None
+                       else getattr(self.host, "KLIKQRIS_GATEWAY", None))
             linked = gateway.receipt_transaction(source, entity) if gateway is not None else None
             if not linked and not callable(getattr(bot,'send_photo',None)):
                 raise ValueError('Photo transport unavailable')

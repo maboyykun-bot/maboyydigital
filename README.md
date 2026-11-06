@@ -1,11 +1,11 @@
-# MaboyyDigital v17.38
+# MaboyyDigital v17.39
 
 Bot Telegram untuk penjualan produk digital dan pengelolaan transaksi.
 
 ## Fitur
 
 - Katalog produk, stok, keranjang dan riwayat pesanan.
-- Saldo, QRIS Otomatis, QRIS manual dan transfer rekening.
+- Saldo, QRIS Otomatis (KlikQRIS/Payinaja), QRIS manual dan transfer rekening.
 - Pengiriman produk, OTP, layanan Sosmed dan API mitra.
 
 ## Menjalankan
@@ -20,7 +20,7 @@ python main.py
 
 ## Pembaruan
 
-Gunakan `main.py`, `bot.py` dan `klikqris_gateway.py` dari versi yang sama.
+Gunakan seluruh file source dari paket versi yang sama saat memperbarui aplikasi.
 Pertahankan data dan konfigurasi saat memperbarui aplikasi.
 Jangan unggah `.env` aktif, database atau backup ke repository publik.
 

@@ -38,7 +38,7 @@ from types import SimpleNamespace
 from otp_smscode import TEXT_MENU_ACTIONS
 
 LABEL = '⚡ QRIS Otomatis'
-ADAPTER_VERSION = '17.38'
+ADAPTER_VERSION = '17.39'
 METHOD = 'KLIKQRIS_AUTO'
 PREFIX = 'aqris:'
 MAX_AMOUNT = 10**12
@@ -1757,6 +1757,8 @@ class Gateway:
               [('🔄 Rekonsiliasi','reconcile',None)],
               [('🧹 Reset Riwayat QRIS','reset_preview',None)],
               [('⬅️ Pengaturan Pembayaran','back',None)]]
+        if hasattr(self.host,'automatic_qris'):
+            rows.insert(-1,[('⚙️ Pilih Provider','providers',None)])
         if settings['enabled'] and not ready:rows.insert(2,[('🔴 Nonaktifkan','toggle','off')])
         await self.host.safe_edit_or_answer(call,text,reply_markup=self.owner_keyboard(rows),parse_mode='HTML')
 
@@ -1921,6 +1923,7 @@ def register(router,gateway):
                 return
             if action!='my_pg_input':await state.clear()
             if action=='menu':await gateway.owner_panel(call)
+            elif action=='providers':await host.automatic_qris.owner_provider_menu(host,call)
             elif action=='reset_preview':await gateway.owner_reset_preview(call)
             elif action=='reset_commit':
                 previous=gateway.last_reset_result()
