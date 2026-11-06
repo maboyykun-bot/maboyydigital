@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from io import BytesIO
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 
 import aiohttp
 import qrcode
@@ -36,7 +36,7 @@ PREFIX = 'payi:'
 LABEL = '⚡ QRIS Otomatis'
 FINAL = {'SETTLED', 'SETTLED_BALANCE', 'FAILED', 'CANCELLED'}
 TX_PREFIX = 'payinaja.tx.'
-ADAPTER_VERSION = '17.39'
+ADAPTER_VERSION = '17.41'
 
 
 @dataclass(frozen=True)
@@ -121,6 +121,36 @@ def render_qris(payload, total):
     except (qrcode.exceptions.DataOverflowError, ValueError, OSError):
         raise GatewayError('IMAGE') from None
     return output.getvalue()
+
+
+def qris_source(data, total):
+    """Recover the provider's exact EMV text; never fetch an image or alter QR bytes."""
+    raw = data.get('qris_string')
+    blank = raw in (None, '') or (isinstance(raw, str) and not raw.strip())
+    primary = None if blank else qris_payload(raw, total)
+    url = data.get('qris_image_url')
+    alternative = None
+    try:
+        if not isinstance(url, str) or not url or len(url) > 32768:
+            raise GatewayError('QR_SOURCE_MISSING')
+        parsed = urlsplit(url)
+        if (parsed.scheme != 'https' or parsed.hostname != 'quickchart.io' or parsed.port not in {None, 443}
+                or parsed.username or parsed.password or parsed.fragment or parsed.path not in {'/qr', '/qr/'}):
+            raise GatewayError('QR_URL_UNSUPPORTED')
+        query = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=20, errors='strict')
+        values = query.get('text', [])
+        if len(values) != 1 or not values[0]:
+            raise GatewayError('QR_URL_UNSUPPORTED')
+        alternative = qris_payload(values[0], total)
+    except (ValueError, UnicodeError):
+        if primary is None:
+            raise GatewayError('QR_URL_UNSUPPORTED') from None
+    except GatewayError as exc:
+        if primary is None or exc.code == 'MISMATCH':
+            raise
+    if primary is not None and alternative is not None and primary != alternative:
+        raise GatewayError('MISMATCH')
+    return primary or alternative
 
 
 def amounts(data, requested, expected_total=None, expected_fee=None):
@@ -264,6 +294,7 @@ class Client:
                 raise GatewayError('SCHEMA')
             return {'provider_id': ident, 'reference': ref, 'amount': base, 'fee': fee,
                     'total_amount': total, 'status': 'PENDING', 'qris_string': data.get('qris_string'),
+                    'qris_image_url': data.get('qris_image_url'),
                     'created_at': data.get('created_at')}
         except GatewayError as exc:
             exc.uncertain = True
@@ -277,18 +308,27 @@ class Client:
                 raise GatewayError('SCHEMA')
             if data.get('trx_id') != ident or data.get('merchant_ref') != ref:
                 raise GatewayError('MISMATCH')
-            base, checked_fee, checked_total = amounts(data, amount, total, fee)
-            if money(data.get('net_amount')) != checked_total - checked_fee:
-                raise GatewayError('MISMATCH')
-            if 'amount_requested' in data and money(data['amount_requested'], positive=True) != base:
-                raise GatewayError('MISMATCH')
             states = {'pending': 'PENDING', 'success': 'PAID', 'failed': 'FAILED'}
             if (not isinstance(data.get('status'), str) or data['status'] not in states
                     or str(data.get('payment_method', '')).casefold() != 'qris'):
                 raise GatewayError('SCHEMA')
+            if data['status'] == 'success' or total is None or fee is None:
+                base, checked_fee, checked_total = amounts(data, amount, total, fee)
+            else:
+                # Pending/failed values are not settlement evidence. Keep the
+                # authenticated create snapshot; reject contradictory positive values.
+                base, checked_fee, checked_total = money(amount, positive=True), money(fee), money(total, positive=True)
+                for field, expected in [('total_amount', checked_total), ('fee', checked_fee)]:
+                    if data.get(field) is not None and money(data[field]) not in {0, expected}:
+                        raise GatewayError('MISMATCH')
+            if data['status'] == 'success' and money(data.get('net_amount')) != checked_total - checked_fee:
+                raise GatewayError('MISMATCH')
+            if data.get('amount_requested') is not None and money(data['amount_requested'], positive=True) != base:
+                raise GatewayError('MISMATCH')
             return {'provider_id': ident, 'reference': ref, 'amount': base, 'fee': checked_fee,
                     'total_amount': checked_total, 'status': states[data['status']],
-                    'qris_string': data.get('qris_string'), 'created_at': data.get('created_at')}
+                    'qris_string': data.get('qris_string'), 'qris_image_url': data.get('qris_image_url'),
+                    'created_at': data.get('created_at')}
         except GatewayError as exc:
             raise self.validation_context(exc, 'GET /transaction/{trx_id}')
 
@@ -309,6 +349,24 @@ class Client:
 
     async def cancel(self, ident):
         await self.request('POST', '/transaction/' + reference(ident) + '/cancel')
+        return dict(accepted=True, http_status=200, checked_at=time.time(),
+                    correlation_id=secrets.token_hex(8), endpoint='POST /transaction/{trx_id}/cancel')
+
+    async def cancel_status(self, ident, ref):
+        """Identity + lifecycle only; this response NEVER authorizes a payment."""
+        ident, ref = reference(ident), reference(ref)
+        data = await self.request('GET', '/transaction/' + ident)
+        try:
+            if not isinstance(data, dict):
+                raise GatewayError('SCHEMA')
+            if data.get('trx_id') != ident or data.get('merchant_ref') != ref:
+                raise GatewayError('MISMATCH')
+            if (data.get('status') not in ('pending', 'success', 'failed')
+                    or str(data.get('payment_method', '')).casefold() != 'qris'):
+                raise GatewayError('SCHEMA')
+            return {'pending': 'PENDING', 'success': 'PAID', 'failed': 'FAILED'}[data['status']]
+        except GatewayError as exc:
+            raise self.validation_context(exc, 'GET /transaction/{trx_id}')
 
     async def close(self):
         if self.session is not None and not self.session.closed:
@@ -564,7 +622,7 @@ class Gateway:
                    created_at=time.time(), expires_at=time.time() + 900, next_poll_at=0, error='',
                    lease_owner=None, lease_until=0, cancel_requested=False, request_started_at=0,
                    verified_at=0, verified_total=None, verified_status='', verification_mac='',
-                   qris_cipher=None, qr_messages=[], delivery_owner=None, delivery_until=0,
+                   qris_cipher=None, qr_source_cipher=None, qr_messages=[], delivery_owner=None, delivery_until=0,
                    reconcile_offset=0, sandbox=0, cleanup_at=0, retention_done=False)
         self.save(conn, row)
         return row
@@ -604,27 +662,46 @@ class Gateway:
                     WHERE id=? AND user_id=? AND payment_method=? AND status!='completed'""",
                     (row['provider_id'], row['total_amount'], row['entity_id'], row['user_id'], METHOD))
 
-    def cache_qr(self, ident, payload):
+    def retain_qr_source(self, row, data):
+        # Called in the SAME transaction that saves the known invoice. No plaintext QR/URL in SQLite.
+        if row.get('qris_cipher') or row.get('retention_done') or row['cancel_requested']:
+            return
+        # Invalid nonblank fields must stay invalid, rather than becoming a missing
+        # primary field that could incorrectly enable the alternative source.
+        values = {key: (data[key] if isinstance(data.get(key), str) and len(data[key]) <= 32768 else
+                        None if data.get(key) is None else '!INVALID_QR_SOURCE')
+                  for key in ('qris_string', 'qris_image_url')}
+        if any(values.values()):
+            row['qr_source_cipher'] = self.crypt(encoded(values), row['id'])
+
+    def cache_qr(self, ident, payload=None):
         row = self.transaction(ident)
         if row['state'] != 'PENDING' or row['cancel_requested'] or row.get('retention_done'):
             return
         try:
-            payload = qris_payload(payload, row['total_amount'])
+            if payload is None:
+                source = row.get('qr_source_cipher')
+                data = json.loads(self.crypt(source, ident, decrypt=True)) if source else {}
+            else:
+                data = payload if isinstance(payload, dict) else {'qris_string': payload}
+            payload = qris_source(data, row['total_amount'])
             encrypted = self.crypt(payload, ident)
             with self.connection(True) as conn:
                 row = self.transaction(ident, conn=conn)
                 if row['state'] == 'PENDING' and not row['cancel_requested'] and not row.get('retention_done'):
                     row['qris_cipher'], row['error'] = encrypted, ''
                     self.save(conn, row)
+                    self.put(conn, 'diagnostic.image', dict(stage='image', code='OK', http_status=200,
+                        checked_at=time.time(), correlation_id=secrets.token_hex(8), fingerprint=self.fingerprint()))
         except GatewayError as exc:
-            if exc.code in {'IMAGE', 'MISMATCH', 'SCHEMA'}:
+            if exc.code in {'IMAGE', 'MISMATCH', 'SCHEMA'} or exc.code.startswith('QR_'):
                 exc.http_status = 200
             with self.connection(True) as conn:
                 row = self.transaction(ident, conn=conn)
-                if row['state'] == 'PENDING':
+                if row['state'] == 'PENDING' and not (row['error'] == 'IMAGE' and row.get('diagnostic', {}).get('code') == exc.code):
                     row['error'] = 'IMAGE'
+                    row['diagnostic'] = self.diagnostic(exc, 'image', conn=conn)
                     self.save(conn, row)
-                    self.diagnostic(exc, 'image', conn=conn)
 
     async def issue(self, ident):
         row = self.transaction(ident)
@@ -652,12 +729,24 @@ class Gateway:
                 current.update(provider_id=result['provider_id'], fee=result['fee'], total_amount=result['total_amount'],
                                lease_owner=None, lease_until=0, error='',
                                state='CANCELLED_LOCAL' if current['cancel_requested'] else 'PENDING')
+                self.retain_qr_source(current, result)
                 self.native_invoice(conn, current)
                 self.save(conn, current)
                 self.put(conn, 'create', dict(success=True, error='', http_status=200, stage='create',
                     checked_at=time.time(), correlation_id=secrets.token_hex(8), transaction_id=ident,
                     fingerprint=self.fingerprint(), endpoint='POST /qris/create' + ('2' if row['server'] == 2 else '')))
-            self.cache_qr(ident, result.get('qris_string'))
+            try:
+                self.cache_qr(ident)
+            except sqlite3.Error as exc:
+                detail = self.diagnostic(exc, 'image')
+                try:
+                    with self.connection(True) as conn:
+                        current = self.transaction(ident, conn=conn)
+                        if current['state'] == 'PENDING':
+                            current.update(error='IMAGE', diagnostic=detail)
+                            self.save(conn, current)
+                except sqlite3.Error:
+                    pass  # The durable invoice/source is retained even while storage is unavailable.
         except BaseException as exc:
             with self.connection(True) as conn:
                 current = self.transaction(ident, conn=conn)
@@ -674,6 +763,63 @@ class Gateway:
             if not isinstance(exc, Exception):
                 raise
         return self.transaction(ident)
+
+    async def reconcile_cancellation(self, ident, provider_id):
+        """Submit a bound invoice cancellation once per lease, then read lifecycle."""
+        token = secrets.token_hex(12)
+        with self.connection(True) as conn:
+            row = self.transaction(ident, conn=conn)
+            if row['state'] in FINAL | {'REVIEW', 'PAID_VERIFIED'} or not row['cancel_requested']:
+                return None
+            if row.get('cancel_lease_until', 0) > time.time():
+                return None
+            row.update(cancel_lease_owner=token, cancel_lease_until=time.time() + self.config.timeout * 3 + 30)
+            self.save(conn, row)
+        try:
+            # A recovered history ID must be confirmed against this reference
+            # before it becomes a cancellation target. Known create IDs are bound already.
+            if not row['provider_id']:
+                lifecycle = await self.api.cancel_status(provider_id, row['reference'])
+                with self.connection(True) as conn:
+                    current = self.transaction(ident, conn=conn)
+                    current['provider_id'] = provider_id
+                    self.save(conn, current)
+                if lifecycle != 'PENDING':
+                    return lifecycle
+            evidence = row.get('cancel_evidence', {})
+            accepted = (evidence.get('accepted') is True and evidence.get('provider_id') == provider_id
+                        and evidence.get('reference') == row['reference']
+                        and evidence.get('account_binding') == row['account_binding'])
+            if not accepted and row.get('cancel_retry_at', 0) <= time.time():
+                with self.connection(True) as conn:
+                    current = self.transaction(ident, conn=conn)
+                    current.update(cancel_attempted_at=time.time(), cancel_retry_at=time.time() + 30)
+                    self.save(conn, current)
+                try:
+                    result = await self.api.cancel(provider_id)
+                    detail = dict(stage='cancel', code='ACCEPTED', http_status=200, checked_at=result['checked_at'],
+                                  correlation_id=result['correlation_id'], endpoint=result['endpoint'], fingerprint=self.fingerprint())
+                    with self.connection(True) as conn:
+                        current = self.transaction(ident, conn=conn)
+                        current['cancel_evidence'] = dict(result, provider_id=provider_id, reference=row['reference'],
+                                                          account_binding=row['account_binding'])
+                        current['cancel_diagnostic'] = detail
+                        self.put(conn, 'diagnostic.cancel', detail)
+                        self.save(conn, current)
+                except GatewayError as exc:
+                    detail = self.diagnostic(exc, 'cancel')
+                    with self.connection(True) as conn:
+                        current = self.transaction(ident, conn=conn)
+                        current.update(cancel_diagnostic=detail,
+                                       cancel_retry_at=time.time() + max(30, exc.retry_after))
+                        self.save(conn, current)
+            return await self.api.cancel_status(provider_id, row['reference'])
+        finally:
+            with self.connection(True) as conn:
+                current = self.transaction(ident, conn=conn)
+                if current.get('cancel_lease_owner') == token:
+                    current.update(cancel_lease_owner=None, cancel_lease_until=0, next_poll_at=time.time() + 15)
+                    self.save(conn, current)
 
     async def refresh(self, ident):
         row = self.transaction(ident)
@@ -693,6 +839,8 @@ class Gateway:
             profile = await self.ensure_profile()
             if profile['account_binding'] != row['account_binding'] or row['origin'] != self.config.base_url:
                 raise GatewayError('ACCOUNT_CHANGED')
+            if row['state'] == 'PENDING' and not row['qris_cipher'] and row.get('qr_source_cipher'):
+                self.cache_qr(ident)
             ident_provider = row['provider_id']
             if not ident_provider:
                 history = await self.api.history(20, row.get('reconcile_offset', 0))
@@ -707,20 +855,31 @@ class Gateway:
                         self.save(conn, current)
                     return self.transaction(ident)  # No absence proof and no replacement POST.
                 ident_provider = reference(found[0]['trx_id'])
+            if row['cancel_requested']:
+                lifecycle = await self.reconcile_cancellation(ident, ident_provider)
+                if lifecycle == 'FAILED':
+                    with self.connection(True) as conn:
+                        current = self.transaction(ident, conn=conn)
+                        if current['state'] not in FINAL | {'REVIEW', 'PAID_VERIFIED'} and not self.paid_proof(current):
+                            self.expire_native(conn, current)
+                            current.update(state='CANCELLED', error='', cancel_confirmed_at=time.time(),
+                                           qris_cipher=None, qr_source_cipher=None)
+                            current['cancel_confirmation'] = dict(status='FAILED', http_status=200, checked_at=time.time(),
+                                correlation_id=secrets.token_hex(8), provider_id=ident_provider, reference=current['reference'])
+                            self.save(conn, current)
+                    await self.retire_paid_messages(self.bot, ident)
+                    return self.transaction(ident)
+                if lifecycle != 'PAID':
+                    return self.transaction(ident)  # Accepted/pending is NOT final cancellation.
+            # PAID always follows the full amount/reference/account checks below.
             data = await self.api.status(ident_provider, row['reference'], row['amount'], row['total_amount'], row['fee'])
-            if row['cancel_requested'] and data['status'] == 'PENDING':
-                try:
-                    await self.api.cancel(ident_provider)
-                except GatewayError as exc:
-                    self.diagnostic(exc, 'cancel')
-                # Even cancel 200 is followed by an authenticated final status read.
-                data = await self.api.status(ident_provider, row['reference'], row['amount'], row['total_amount'], row['fee'])
             with self.connection(True) as conn:
                 current = self.transaction(ident, conn=conn)
                 if current['state'] in FINAL | {'REVIEW', 'PAID_VERIFIED'}:
                     return current
                 current.update(provider_id=ident_provider, total_amount=data['total_amount'], fee=data['fee'],
-                               next_poll_at=time.time() + 15, error='')
+                               next_poll_at=time.time() + 15,
+                               error='IMAGE' if current['error'] == 'IMAGE' and not current['qris_cipher'] else '')
                 self.native_invoice(conn, current)
                 if data['status'] == 'PAID':
                     table = 'orders' if current['purpose'] == 'order' else 'topups'
@@ -734,13 +893,16 @@ class Gateway:
                     current['state'] = 'CANCELLED' if current['cancel_requested'] else 'FAILED'
                 else:
                     current['state'] = 'CANCELLED_LOCAL' if current['cancel_requested'] else 'PENDING'
+                    self.retain_qr_source(current, data)
+                if data['status'] != 'PENDING':
+                    current['error'] = ''
                 self.save(conn, current)
                 create = self.setting('create', {}, conn)
                 if create.get('transaction_id') == ident and create.get('error') and not create.get('resolved_at'):
                     create.update(resolved_at=time.time(), resolution_http_status=200)
                     self.put(conn, 'create', create)
-            if data.get('qris_string') and not self.transaction(ident).get('qris_cipher'):
-                self.cache_qr(ident, data['qris_string'])
+            if not self.transaction(ident).get('qris_cipher'):
+                self.cache_qr(ident)
             if self.transaction(ident)['state'] == 'PAID_VERIFIED':
                 return await self.settle(ident)
         except GatewayError as exc:
@@ -934,7 +1096,8 @@ class Gateway:
     def user_keyboard(self, row):
         rows = [[InlineKeyboardButton(text='🔄 Cek Status', callback_data=PREFIX + 'u:check:' + row['id'])]]
         if row['state'] not in FINAL | {'REVIEW', 'PAID_VERIFIED'}:
-            rows.append([InlineKeyboardButton(text='❌ Batalkan', callback_data=PREFIX + 'u:cancel:' + row['id'])])
+            rows.append([InlineKeyboardButton(text='🔄 Periksa Pembatalan' if row['cancel_requested'] else '❌ Batalkan',
+                                             callback_data=PREFIX + 'u:cancel:' + row['id'])])
         rows.append([InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -942,7 +1105,7 @@ class Gateway:
         invoice = self.host.invoice(row['entity_id']) if row['purpose'] == 'order' else self.host.topup_invoice(row['entity_id'])
         states = dict(NEW='Menyiapkan pembayaran', REQUESTING='Menyiapkan pembayaran', CREATE_UNKNOWN='Menunggu kepastian invoice',
                       PENDING='Menunggu pembayaran', PAID_VERIFIED='Pembayaran diterima; sedang diproses', SETTLED='Pembayaran berhasil',
-                      SETTLED_BALANCE='Pembayaran masuk ke saldo', CANCELLED_LOCAL='Dibatalkan di bot; pemeriksaan provider belum selesai',
+                      SETTLED_BALANCE='Pembayaran masuk ke saldo', CANCELLED_LOCAL='Pembatalan diajukan; menunggu konfirmasi Payinaja',
                       CANCELLED='Dibatalkan', FAILED='Pembayaran gagal / kedaluwarsa', REVIEW='Perlu pemeriksaan owner')
         text = LABEL + '\n<b>MABOYY DIGITAL</b>\n\n🧾 ' + html.escape(invoice) + '\n'
         text += ('💰 Nominal saldo: ' if row['purpose'] == 'topup' else '💵 Harga pesanan: ') + self.host.rupiah(row['amount']) + '\n'
@@ -959,7 +1122,7 @@ class Gateway:
         elif row['state'] in {'REQUESTING', 'CREATE_UNKNOWN', 'CANCELLED_LOCAL'}:
             text += 'Jangan membuat tagihan pengganti sebelum hasil invoice ini dipastikan.\n'
         elif row['state'] == 'PENDING' and not row['qris_cipher']:
-            text += 'Invoice tersedia, tetapi gambar QR belum dapat diambil dari API. Cek Status atau batalkan dan tunggu konfirmasi.\n'
+            text += 'Invoice tersedia, tetapi gambar QR belum siap ditampilkan. Cek Status atau hubungi owner; jangan membuat tagihan pengganti.\n'
         return text
 
     def native_status(self, purpose, entity):
@@ -1037,20 +1200,27 @@ class Gateway:
             return await self.show_payment(call, ident)
         await self.host.safe_edit_or_answer(call, self.status_text(row), reply_markup=self.user_keyboard(row), parse_mode='HTML')
 
-    async def cancel(self, call, ident):
-        row = self.transaction(ident, call.from_user.id)
-        if row['state'] in FINAL | {'PAID_VERIFIED', 'REVIEW'} or self.paid_proof(row):
-            return await self.show_status(call, ident)
-        if row['purpose'] == 'topup':
-            _, reason = self.host.cancel_topup_atomic(row['entity_id'], call.from_user.id)
-            ok = reason in {'cancelled', 'already_cancelled'}
-        else:
-            ok, _ = await self.host.cancel_pending_order(row['entity_id'], call.bot)
-        if not ok:
-            return await self.show_status(call, ident)
+    async def cancel(self, call, ident, *, admin=False):
+        if not call.message or str(call.message.chat.type) != 'private' or call.message.chat.id != call.from_user.id:
+            raise GatewayError('FORBIDDEN')
         with self.connection(True) as conn:
-            row = self.transaction(ident, call.from_user.id, conn=conn)
-            if row['state'] not in FINAL | {'PAID_VERIFIED', 'REVIEW'}:
+            row = self.transaction(ident, call.from_user.id, conn=conn, admin=admin)
+            if row['state'] not in FINAL | {'PAID_VERIFIED', 'REVIEW'} and not self.paid_proof(row):
+                table = 'orders' if row['purpose'] == 'order' else 'topups'
+                native = conn.execute('SELECT * FROM ' + table + ' WHERE id=?', (row['entity_id'],)).fetchone()
+                if not native or native['user_id'] != row['user_id'] or native['payment_method'] != METHOD:
+                    raise GatewayError('MISMATCH')
+                paid = native['payment_status'] == 'paid' if row['purpose'] == 'order' else native['status'] in {'paid', 'completed'}
+                if paid:
+                    raise GatewayError('BUSY')
+                if row['purpose'] == 'order':
+                    if native['status'] == 'completed':
+                        raise GatewayError('BUSY')
+                    self.host.release_order_reservation(conn, native)
+                    conn.execute("UPDATE orders SET status='cancelled',payment_status='cancelled',reserved_until='' WHERE id=?", (row['entity_id'],))
+                else:
+                    conn.execute("UPDATE topups SET status='cancelled',updated_at=? WHERE id=?",
+                                 (datetime.now().isoformat(timespec='seconds'), row['entity_id']))
                 row.update(cancel_requested=True,
                            state='CANCELLED' if not row['request_started_at'] and not row['provider_id'] else 'CANCELLED_LOCAL',
                            next_poll_at=0)
@@ -1060,9 +1230,14 @@ class Gateway:
                 await self.refresh(ident)
             except GatewayError:
                 pass
-        await self.host.render_cancelled_payment_message(call,
-            LABEL + '\nPembayaran ditutup di bot. Jangan bayar QR lama. Pembatalan provider tetap diperiksa sebelum invoice pengganti.',
-            self.user_keyboard(self.transaction(ident)))
+        current = self.transaction(ident)
+        if admin:
+            await self.retire_paid_messages(call.bot, ident)
+            return await self.owner_detail(call, ident)
+        if current['state'] in {'SETTLED', 'PAID_VERIFIED', 'REVIEW'}:
+            return await self.show_status(call, ident, refresh=False)
+        await self.host.render_cancelled_payment_message(call, self.status_text(current), self.user_keyboard(current))
+        await self.retire_paid_messages(call.bot, ident)
 
     def receipt_transaction(self, source, entity):
         return self.linked(source, int(entity)) if source in {'order', 'topup'} else None
@@ -1217,7 +1392,7 @@ class Gateway:
                 with self.connection(True) as conn:
                     current = self.transaction(ident, conn=conn)
                     if now >= current.get('credited_at', now) + 3600:
-                        current.update(qris_cipher=None, retention_done=True)
+                        current.update(qris_cipher=None, qr_source_cipher=None, retention_done=True)
                     else:
                         current['cleanup_at'] = current['credited_at'] + 3600
                     self.save(conn, current)
@@ -1237,7 +1412,7 @@ class Gateway:
                     if receipt:
                         current['cleanup_at'] = max(current['cleanup_at'], receipt['lease_until'], receipt['next_retry_at'])
                     if receipt and receipt['status'] == 'UNKNOWN' and now >= current['verified_at'] + 3600:
-                        current.update(qris_cipher=None, retention_done=True)
+                        current.update(qris_cipher=None, qr_source_cipher=None, retention_done=True)
                     self.save(conn, current)
                     continue
                 changed = conn.execute("""UPDATE payment_receipts SET status='ARCHIVING',lease_token=?,lease_until=?,
@@ -1247,6 +1422,7 @@ class Gateway:
                 if changed != 1:
                     continue
                 current['qris_cipher'] = None
+                current['qr_source_cipher'] = None
                 if receipt['message_id'] and not any(item['id'] == receipt['message_id'] for item in current['qr_messages']):
                     current['qr_messages'].append(dict(id=receipt['message_id'], kind='INVOICE', attempts=0, retry_at=0))
                 self.save(conn, current)
@@ -1284,7 +1460,7 @@ class Gateway:
                     current = self.transaction(ident, conn=conn)
                     pending = [item for item in current['qr_messages'] if item['kind'] in {'QR', 'INVOICE'}]
                     if not pending:
-                        current.update(retention_done=True, qr_messages=[], qris_cipher=None)
+                        current.update(retention_done=True, qr_messages=[], qris_cipher=None, qr_source_cipher=None)
                         conn.execute("""UPDATE payment_receipts SET status='ARCHIVED',message_id=NULL,
                             lease_token=NULL,lease_until=0,next_retry_at=0 WHERE source=? AND entity_id=? AND lease_token=?""",
                             (row['purpose'], str(row['entity_id']), token))
@@ -1396,6 +1572,14 @@ class Gateway:
         self.require_owner(call.from_user.id)
         proof = self.proof()
         _, health = self.creation_health()
+        last = self.setting('create', {})
+        last_row = (self.transaction(last['transaction_id']) if last.get('transaction_id')
+                    and last.get('fingerprint') == self.fingerprint() else None)
+        qr_state = ('Belum ada invoice dengan key aktif' if last_row is None else
+                    'Menunggu kepastian invoice' if last_row['state'] in {'NEW', 'REQUESTING', 'CREATE_UNKNOWN'} else
+                    'QR tidak ditampilkan untuk status ' + last_row['state'] if last_row['state'] != 'PENDING' else
+                    'Payload QR tersedia; pengiriman Telegram terpisah' if last_row.get('qris_cipher') else
+                    'Belum tersedia; periksa diagnosis image dan detail invoice')
         text = ('👑 <b>PENGATURAN QRIS OTOMATIS</b>\n\nProvider: Payinaja\n'
                 f'Versi bot: {html.escape(self.host.BOT_VERSION)} • Gateway: {ADAPTER_VERSION}\n'
                 f'Server create: {self.config.server}\n'
@@ -1403,6 +1587,7 @@ class Gateway:
                 f'Konfigurasi: {"Tersedia" if self.config.valid() else "Periksa PAYINAJA_API_KEY / konfigurasi API"}\n'
                 f'Autentikasi: {"Terverifikasi; merchant approved" if proof.get("approved") else "Belum terverifikasi"}\n'
                 'Status pembuatan invoice: ' + html.escape(health) + '\n'
+                'Sumber QR invoice terakhir: ' + qr_state + '\n'
                 'Cek Koneksi hanya GET profil. Pembayaran diverifikasi lewat API status; callback H2H tidak dipakai.\n'
                 'Kredensial tidak ditampilkan. Key KlikQRIS tidak dipakai untuk Payinaja.\n')
         for kind in ['connection', 'checkout', 'create', 'status', 'image', 'telegram', 'cancel', 'poll', 'cleanup']:
@@ -1461,6 +1646,16 @@ class Gateway:
             text += ('\nTahap: ' + html.escape(detail['stage']) + ' • HTTP: ' + str(detail.get('http_status') or '-') +
                      '\nWaktu: ' + self.host.payment_receipts.format_wib(detail['checked_at'], compact=True) +
                      ' • ID: ' + html.escape(detail['correlation_id']))
+        cancel_detail = row.get('cancel_diagnostic')
+        if cancel_detail:
+            text += ('\nPengajuan pembatalan terakhir: ' + html.escape(cancel_detail['code']) + ' • HTTP: ' + str(cancel_detail.get('http_status') or '-') +
+                     '\nWaktu: ' + self.host.payment_receipts.format_wib(cancel_detail['checked_at'], compact=True) +
+                     ' • ID: ' + html.escape(cancel_detail['correlation_id']))
+        confirmation = row.get('cancel_confirmation')
+        if confirmation:
+            text += ('\nKonfirmasi API: FAILED • HTTP: 200\nWaktu: ' +
+                     self.host.payment_receipts.format_wib(confirmation['checked_at'], compact=True) +
+                     ' • ID: ' + html.escape(confirmation['correlation_id']))
         controls = [[('🔄 Rekonsiliasi Status', 'check', ident)]]
         if row['state'] == 'REVIEW' and self.paid_proof(row):
             text += '\nPembayaran sah perlu penanganan owner; tidak ada saldo atau produk diproses otomatis.'

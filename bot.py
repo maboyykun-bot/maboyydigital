@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.39"
+BOT_VERSION = "17.41"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -26635,6 +26635,14 @@ async def owner_cancel_confirm(call: CallbackQuery, bot: Bot):
         return await call.answer("Akses ditolak.", show_alert=True)
 
     order_id = int(call.data.split(":")[2])
+    if automatic_qris.for_native(_otp_sys.modules[__name__],'order',order_id) is PAYINAJA_GATEWAY:
+        transaction=PAYINAJA_GATEWAY.linked('order',order_id)
+        if transaction:
+            try:
+                return await PAYINAJA_GATEWAY.cancel(call,transaction['id'],admin=True)
+            except (klikqris_gateway.GatewayError,sqlite3.Error) as exc:
+                PAYINAJA_GATEWAY.diagnostic(exc,'cancel')
+                return await safe_callback_notice(call,'Pembatalan belum terkonfirmasi. Periksa detail transaksi QRIS Otomatis.',show_alert=True)
     ok, message = await cancel_pending_order(order_id, bot)
 
     if ok:
@@ -36692,7 +36700,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.39"
+EXPECTED_SOURCE_VERSION = "17.41"
 
 
 def source_integrity_self_test():
