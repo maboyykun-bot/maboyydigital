@@ -39,7 +39,8 @@ PREFIX = 'payi:'
 LABEL = '⚡ QRIS Otomatis'
 FINAL = {'SETTLED', 'SETTLED_BALANCE', 'FAILED', 'CANCELLED'}
 TX_PREFIX = 'payinaja.tx.'
-ADAPTER_VERSION = '17.44'
+ADAPTER_VERSION = '17.45'
+QR_BLOCKING_ERRORS = frozenset({'SCHEMA', 'MISMATCH', 'AUTH', 'ACCOUNT_CHANGED', 'DUPLICATE_REFERENCE'})
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,29 @@ def qris_source(data, total):
     if primary is not None and alternative is not None and primary != alternative:
         raise GatewayError('MISMATCH')
     return primary or alternative
+
+
+def qr_source_shape(data):
+    """Fixed source categories only; never disclose QR text, URL or query values."""
+    raw, image = data.get('qris_string'), data.get('qris_image_url')
+    text = ('missing' if raw is None else 'invalid-type' if not isinstance(raw, str) else
+            'blank' if not raw.strip() else 'present')
+    kind = 'missing' if image is None else 'invalid-type' if not isinstance(image, str) else 'unsupported'
+    if isinstance(image, str):
+        if not image.strip():
+            kind = 'blank'
+        elif image.startswith('data:image/'):
+            kind = 'inline'
+        else:
+            try:
+                parsed = urlsplit(urljoin('https://payinaja.com/', image))
+                if parsed.hostname == 'quickchart.io':
+                    kind = 'quickchart'
+                elif parsed.hostname in API_HOSTS:
+                    kind = 'official-api' if parsed.path.startswith('/api/v1/') else 'official-image'
+            except (ValueError, TypeError):
+                pass
+    return dict(qris_string=text, qris_image_url=kind)
 
 
 def amounts(data, requested, expected_total=None, expected_fee=None):
@@ -832,6 +856,7 @@ class Gateway:
         row = self.transaction(ident)
         if row['state'] != 'PENDING' or row['cancel_requested'] or row.get('retention_done') or self.has_qr(row):
             return
+        data = {}
         try:
             if payload is None:
                 source = row.get('qr_source_cipher')
@@ -842,7 +867,8 @@ class Gateway:
             encrypted = self.crypt(payload, ident)
             with self.connection(True) as conn:
                 row = self.transaction(ident, conn=conn)
-                if row['state'] == 'PENDING' and not row['cancel_requested'] and not row.get('retention_done'):
+                if (row['state'] == 'PENDING' and not row['cancel_requested'] and not row.get('retention_done')
+                        and row['error'] not in QR_BLOCKING_ERRORS):
                     row['qris_cipher'], row['error'] = encrypted, ''
                     self.save(conn, row)
                     self.put(conn, 'diagnostic.image', dict(stage='image', code='OK', http_status=200,
@@ -850,9 +876,12 @@ class Gateway:
         except GatewayError as exc:
             if exc.code in {'IMAGE', 'MISMATCH', 'SCHEMA'} or exc.code.startswith('QR_'):
                 exc.http_status = 200
+            exc.schema_hint = qr_source_shape(data)
             with self.connection(True) as conn:
                 row = self.transaction(ident, conn=conn)
-                if row['state'] == 'PENDING' and not self.has_qr(row) and not (row['error'] == 'IMAGE' and row.get('diagnostic', {}).get('code') == exc.code):
+                if row['state'] == 'PENDING' and row['error'] not in QR_BLOCKING_ERRORS and not self.has_qr(row) and not (row['error'] == 'IMAGE'
+                        and row.get('diagnostic', {}).get('code') == exc.code
+                        and row.get('diagnostic', {}).get('schema') == exc.schema_hint):
                     row['error'] = 'IMAGE'
                     row['diagnostic'] = self.diagnostic(exc, 'image', conn=conn)
                     self.save(conn, row)
@@ -860,6 +889,7 @@ class Gateway:
     async def prepare_qr(self, ident):
         row = self.transaction(ident)
         if (row['state'] != 'PENDING' or row['cancel_requested'] or row.get('retention_done')
+                or row['error'] in QR_BLOCKING_ERRORS
                 or self.has_qr(row) or row['expires_at'] <= time.time()
                 or row.get('image_retry_at', 0) > time.time()):
             return row
@@ -889,6 +919,7 @@ class Gateway:
         with self.connection(True) as conn:
             current = self.transaction(ident, conn=conn)
             if (current['state'] != 'PENDING' or current['cancel_requested'] or self.has_qr(current)
+                    or current['error'] in QR_BLOCKING_ERRORS
                     or current.get('image_lease_until', 0) > time.time() or current.get('image_retry_at', 0) > time.time()):
                 return current
             current.update(image_lease_owner=token, image_lease_until=time.time() + self.config.timeout + 30)
@@ -899,6 +930,7 @@ class Gateway:
             with self.connection(True) as conn:
                 current = self.transaction(ident, conn=conn)
                 if (current['state'] == 'PENDING' and not current['cancel_requested'] and not current.get('retention_done')
+                        and current['error'] not in QR_BLOCKING_ERRORS
                         and current['expires_at'] > time.time()
                         and self.proof(conn).get('approved') and self.proof(conn).get('account_binding') == current['account_binding']
                         and current.get('qr_source_cipher') == source and not self.has_qr(current)):
@@ -909,10 +941,11 @@ class Gateway:
                     self.put(conn, 'diagnostic.image', dict(stage='image', code='OK_ORIGINAL_IMAGE', http_status=200,
                         checked_at=time.time(), correlation_id=secrets.token_hex(8), fingerprint=self.fingerprint()))
         except GatewayError as exc:
+            exc.schema_hint = qr_source_shape(data)
             detail = self.diagnostic(exc, 'image')
             with self.connection(True) as conn:
                 current = self.transaction(ident, conn=conn)
-                if current['state'] == 'PENDING' and not self.has_qr(current):
+                if current['state'] == 'PENDING' and current['error'] not in QR_BLOCKING_ERRORS and not self.has_qr(current):
                     current.update(error='IMAGE', diagnostic=detail, image_retry_at=time.time() + max(5, exc.retry_after))
                     self.save(conn, current)
         finally:
@@ -1459,28 +1492,32 @@ class Gateway:
                 row.update(retention_done=False, cleanup_at=0)
             self.save(conn, row)
 
-    async def show_payment(self, call, ident):
+    async def show_payment(self, call, ident, *, automatic=False):
         row = self.transaction(ident, call.from_user.id)
         self.bot = call.bot
+        if automatic and (self.is_prior_session(row) or row['qr_messages'] or row.get('qr_send_retry_at', 0) > time.time()):
+            return
         if row['state'] == 'PENDING' and not row['cancel_requested'] and not self.proof().get('approved'):
             try:
                 await self.ensure_profile()
             except GatewayError:
-                return await self.show_status(call, ident, refresh=False)
+                return None if automatic else await self.show_status(call, ident, refresh=False)
         if (row['state'] != 'PENDING' or row['cancel_requested']
-                or row['error'] in {'SCHEMA', 'MISMATCH', 'AUTH', 'ACCOUNT_CHANGED', 'DUPLICATE_REFERENCE'}
+                or row['error'] in QR_BLOCKING_ERRORS
+                or row['origin'] != self.config.base_url
                 or self.proof().get('account_binding') != row['account_binding'] or not self.proof().get('approved')
                 or row['expires_at'] <= time.time()):
-            return await self.show_status(call, ident, refresh=False)
+            return None if automatic else await self.show_status(call, ident, refresh=False)
         if not self.has_qr(row):
             if row['error'] == 'IMAGE' and row.get('diagnostic', {}).get('code') == 'SQLITE':
-                return await self.show_status(call, ident, refresh=False)
+                return None if automatic else await self.show_status(call, ident, refresh=False)
             await self.prepare_qr(ident)
             row = self.transaction(ident, call.from_user.id)
             if (row['state'] != 'PENDING' or row['cancel_requested'] or not self.has_qr(row)
+                    or row['error'] in QR_BLOCKING_ERRORS
                     or row['expires_at'] <= time.time() or not self.proof().get('approved')
                     or self.proof().get('account_binding') != row['account_binding']):
-                return await self.show_status(call, ident, refresh=False)
+                return None if automatic else await self.show_status(call, ident, refresh=False)
         with self.connection() as conn:
             native = conn.execute('SELECT * FROM ' + ('orders' if row['purpose'] == 'order' else 'topups') + ' WHERE id=?',
                                   (row['entity_id'],)).fetchone()
@@ -1488,6 +1525,8 @@ class Gateway:
             raise GatewayError('MISMATCH')
         paid = native['payment_status'] == 'paid' if row['purpose'] == 'order' else native['status'] in {'paid', 'completed'}
         if paid or native['status'] in {'cancelled', 'expired', 'completed', 'rejected'}:
+            if automatic:
+                return
             return await self.host.safe_edit_or_answer(call,
                 self.status_text(row) + '\nPesanan sudah ditutup atau diproses di bot. QR tidak ditampilkan; status provider perlu diperiksa owner.',
                 reply_markup=self.user_keyboard(row), parse_mode='HTML')
@@ -1496,28 +1535,84 @@ class Gateway:
                    self.api.image_valid(base64.b64decode(self.crypt(row['qr_image_cipher'], ident, decrypt=True), validate=True)))
         except (GatewayError, ValueError, TypeError) as exc:
             self.diagnostic(exc if isinstance(exc, GatewayError) else GatewayError('IMAGE'), 'image')
+            if automatic:
+                return
             return await self.host.safe_edit_or_answer(call, self.status_text(row) + '\nGambar QR belum dapat dibuka; tidak ada invoice baru dibuat.',
                        reply_markup=self.user_keyboard(row), parse_mode='HTML')
-        try:
-            message = await call.bot.send_photo(call.from_user.id, BufferedInputFile(raw, filename='qris.png'),
-                caption=self.status_text(row), reply_markup=self.user_keyboard(row), parse_mode='HTML')
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self.diagnostic(exc if isinstance(exc, GatewayError) else GatewayError('TELEGRAM'), 'telegram')
-            return await self.host.safe_edit_or_answer(call, self.status_text(row) + '\nGambar belum terkirim; Cek Status tidak membuat invoice baru.',
-                       reply_markup=self.user_keyboard(row), parse_mode='HTML')
-        self.remember_payment_message(ident, row['user_id'], message.message_id)
-        if row['purpose'] == 'topup':
-            self.host.save_topup_payment_message(row['entity_id'], row['user_id'], message.message_id)
+        # Manual clicks and the recovery worker share one durable send lease.
+        # This lease concerns Telegram only; it never authorizes a payment/create.
+        token = secrets.token_hex(12)
         with self.connection(True) as conn:
-            self.put(conn, 'diagnostic.telegram', dict(stage='telegram', code='OK', http_status=0,
-                checked_at=time.time(), correlation_id=secrets.token_hex(8), fingerprint=self.fingerprint()))
+            current = self.transaction(ident, row['user_id'], conn=conn)
+            if (current['state'] != 'PENDING' or current['cancel_requested'] or current.get('retention_done')
+                    or current['error'] in QR_BLOCKING_ERRORS or current['expires_at'] <= time.time()
+                    or current['origin'] != self.config.base_url
+                    or self.proof(conn).get('account_binding') != current['account_binding'] or not self.proof(conn).get('approved')
+                    or current.get('qris_cipher') != row.get('qris_cipher')
+                    or current.get('qr_image_cipher') != row.get('qr_image_cipher')
+                    or current.get('qr_send_until', 0) > time.time()
+                    or (automatic and (self.is_prior_session(current) or current['qr_messages']
+                                       or current.get('qr_send_retry_at', 0) > time.time()))):
+                return
+            native = conn.execute('SELECT * FROM ' + ('orders' if current['purpose'] == 'order' else 'topups') + ' WHERE id=?',
+                                  (current['entity_id'],)).fetchone()
+            if (not native or native['user_id'] != current['user_id'] or native['payment_method'] != METHOD
+                    or native['status'] in {'cancelled', 'expired', 'completed', 'rejected'}
+                    or (native['payment_status'] == 'paid' if current['purpose'] == 'order' else native['status'] == 'paid')):
+                return
+            current.update(qr_send_owner=token, qr_send_until=time.time() + self.config.timeout + 45)
+            self.save(conn, current)
+        try:
+            try:
+                message = await asyncio.wait_for(call.bot.send_photo(call.from_user.id, BufferedInputFile(raw, filename='qris.png'),
+                    caption=self.status_text(row), reply_markup=self.user_keyboard(row), parse_mode='HTML'), timeout=self.config.timeout + 15)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                delay = max(30, min(3600, float(getattr(exc, 'retry_after', 0) or 0)))
+                status = 429 if isinstance(exc, TelegramRetryAfter) else 403 if isinstance(exc, TelegramForbiddenError) else 400 if isinstance(exc, TelegramBadRequest) else 0
+                self.diagnostic(GatewayError('TELEGRAM', http_status=status), 'telegram')
+                with self.connection(True) as conn:
+                    current = self.transaction(ident, conn=conn)
+                    current['qr_send_retry_at'] = time.time() + delay
+                    self.save(conn, current)
+                if automatic:
+                    return
+                return await self.host.safe_edit_or_answer(call, self.status_text(row) + '\nGambar belum terkirim; pengiriman akan dicoba kembali. Cek Status tidak membuat invoice baru.',
+                           reply_markup=self.user_keyboard(row), parse_mode='HTML')
+            self.remember_payment_message(ident, row['user_id'], message.message_id)
+            if row['purpose'] == 'topup':
+                self.host.save_topup_payment_message(row['entity_id'], row['user_id'], message.message_id)
+            with self.connection(True) as conn:
+                current = self.transaction(ident, conn=conn)
+                current['qr_send_retry_at'] = 0
+                self.save(conn, current)
+                self.put(conn, 'diagnostic.telegram', dict(stage='telegram', code='OK', http_status=200,
+                    checked_at=time.time(), correlation_id=secrets.token_hex(8), fingerprint=self.fingerprint()))
+        finally:
+            with self.connection(True) as conn:
+                current = self.transaction(ident, conn=conn)
+                if current.get('qr_send_owner') == token:
+                    current.update(qr_send_owner=None, qr_send_until=0)
+                    self.save(conn, current)
         await self.retire_paid_messages(call.bot, ident)
+        if automatic:
+            return
         try:
             await call.message.delete()
         except Exception:
             pass
+
+    async def deliver_pending_qr(self, ident):
+        """Send a recovered current-process invoice; old invoices stay opt-in."""
+        if self.bot is None:
+            return
+        row = self.transaction(ident)
+        if (row['state'] != 'PENDING' or self.is_prior_session(row) or row['qr_messages']
+                or row['cancel_requested'] or not self.has_qr(row)):
+            return
+        call = SimpleNamespace(from_user=SimpleNamespace(id=row['user_id']), bot=self.bot)
+        await self.show_payment(call, ident, automatic=True)
 
     async def show_status(self, call, ident, *, refresh=True, admin=False):
         row = self.transaction(ident, call.from_user.id, admin=admin)
@@ -1874,6 +1969,7 @@ class Gateway:
                             self.save(conn, current)
                 else:
                     await self.refresh(ident)
+                await self.deliver_pending_qr(ident)
             except GatewayError as exc:
                 if exc.code == 'RATE_LIMIT':
                     break
