@@ -1,4 +1,4 @@
-# MaboyyDigital v17.46
+# MaboyyDigital v17.47
 
 Bot Telegram untuk penjualan produk digital dan pengelolaan transaksi.
 

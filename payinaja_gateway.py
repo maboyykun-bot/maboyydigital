@@ -39,8 +39,88 @@ PREFIX = 'payi:'
 LABEL = '⚡ QRIS Otomatis'
 FINAL = {'SETTLED', 'SETTLED_BALANCE', 'FAILED', 'CANCELLED'}
 TX_PREFIX = 'payinaja.tx.'
-ADAPTER_VERSION = '17.46'
+ADAPTER_VERSION = '17.47'
 QR_BLOCKING_ERRORS = frozenset({'SCHEMA', 'MISMATCH', 'AUTH', 'ACCOUNT_CHANGED', 'DUPLICATE_REFERENCE'})
+DENIAL_LIMIT = 16384
+
+
+async def denial_context(response):
+    """Classify a rejection without retaining its body, identities or secrets."""
+    result = dict(kind='credentials_rejected' if response.status == 401 else 'http_forbidden',
+                  format='empty', source='http-status')
+    if str(response.headers.get('cf-mitigated', '')).casefold() == 'challenge':
+        return dict(kind='edge_challenge', format='unread', source='edge-header')
+    async def read():
+        raw = bytearray()
+        async for chunk in response.content.iter_chunked(4096):
+            raw.extend(chunk[:DENIAL_LIMIT + 1 - len(raw)])
+            if len(raw) > DENIAL_LIMIT:
+                break
+        return bytes(raw)
+    try:
+        raw = await asyncio.wait_for(read(), timeout=3)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        result['format'] = 'unreadable'
+        return result
+    if len(raw) > DENIAL_LIMIT:
+        result['format'] = 'oversize'
+        return result
+    if not raw.strip():
+        return result
+    try:
+        data = json.loads(raw)
+    except (ValueError, UnicodeError):
+        lower = raw[:DENIAL_LIMIT].lower()
+        result['format'] = 'html' if b'<html' in lower or b'<!doctype html' in lower else 'text'
+        if result['format'] == 'html' and (b'challenge-platform' in lower or b'cf_chl_' in lower):
+            result.update(kind='edge_challenge', source='html-challenge')
+        return result
+    result['format'] = 'json'
+    if not isinstance(data, dict):
+        return result
+    nested = data.get('error') if isinstance(data.get('error'), dict) else {}
+    codes = [data.get('code'), data.get('error_code'), nested.get('code')]
+    mapping = {'IP_NOT_ALLOWED': 'ip_restricted', 'IP_NOT_WHITELISTED': 'ip_restricted',
+               'IP_RESTRICTED': 'ip_restricted', 'INVALID_API_KEY': 'credentials_rejected',
+               'API_KEY_INVALID': 'credentials_rejected', 'API_KEY_REVOKED': 'credentials_rejected',
+               'MERCHANT_INACTIVE': 'merchant_restricted', 'MERCHANT_NOT_APPROVED': 'merchant_restricted',
+               'ACCOUNT_SUSPENDED': 'merchant_restricted', 'PERMISSION_DENIED': 'api_permission'}
+    for value in codes:
+        if isinstance(value, str) and value.strip().upper() in mapping:
+            result.update(kind=mapping[value.strip().upper()], source='json-code')
+            return result
+    messages = [data.get('message'), data.get('error'), nested.get('message')]
+    for value in messages:
+        if not isinstance(value, str):
+            continue
+        value = value[:DENIAL_LIMIT].casefold()
+        kind = None
+        if re.search(r'\bip\b', value) and any(term in value for term in ['not allowed', 'not whitelisted', 'tidak diizinkan',
+                'belum terdaftar', 'tidak terdaftar', 'not in whitelist', 'belum diwhitelist', 'tidak masuk whitelist']):
+            kind = 'ip_restricted'
+        elif any(term in value for term in ['invalid api key', 'api key tidak valid', 'api key salah', 'api key revoked']):
+            kind = 'credentials_rejected'
+        elif any(term in value for term in ['merchant not approved', 'merchant inactive', 'account suspended', 'akun diblokir', 'akun belum disetujui']):
+            kind = 'merchant_restricted'
+        elif any(term in value for term in ['permission denied', 'insufficient permissions', 'tidak memiliki akses']):
+            kind = 'api_permission'
+        if kind:
+            result.update(kind=kind, source='json-message')
+            return result
+    return result
+
+
+def access_note(denial, status):
+    notes = {'ip_restricted': 'Respons API menyebut pembatasan IP pembayaran.',
+             'credentials_rejected': 'Respons API menolak kredensial pembayaran.',
+             'merchant_restricted': 'Respons API menyebut pembatasan atau persetujuan akun merchant.',
+             'api_permission': 'Respons API menyebut izin akses yang belum tersedia.',
+             'edge_challenge': 'Respons meminta challenge dari perantara keamanan; request API belum diterima normal.'}
+    kind = denial.get('kind') if isinstance(denial, dict) else None
+    return notes.get(kind, 'HTTP 403 menolak akses; alasan spesifik belum diberikan oleh respons API.' if status == 403 else
+                     'Pemeriksaan API belum berhasil. Tidak ada invoice uji dibuat.')
 
 
 @dataclass(frozen=True)
@@ -255,6 +335,7 @@ class Client:
             exc = GatewayError(code, http_status=status, uncertain=write,
                                endpoint=endpoint, retry_after=retry_after)
             exc.provider = 'payinaja'
+            exc.request_checked_at = time.time()
             return exc
 
         if self.cooldown_until > time.time():
@@ -279,7 +360,9 @@ class Client:
                 if status >= 500:
                     raise error('UPSTREAM', status)
                 if status in {401, 403}:
-                    raise error('AUTH', status)
+                    exc = error('AUTH', status)
+                    exc.denial = await denial_context(response)
+                    raise exc
                 if status == 404:
                     code = ('NOT_FOUND' if path.startswith('/transaction/') else
                             'HISTORY_UNAVAILABLE' if path.startswith(('/transactions?', '/showtrx?')) else
@@ -323,6 +406,7 @@ class Client:
         exc.http_status = 200
         exc.endpoint = endpoint
         exc.provider = 'payinaja'
+        exc.request_checked_at = time.time()
         if exc.code == 'SCHEMA':
             exc.schema_hint = response_shape(data)
         return exc
@@ -665,10 +749,17 @@ class Gateway:
         return bool(row.get('qris_cipher') or row.get('qr_image_cipher'))
 
     def diagnostic(self, exc, stage, *, conn=None):
+        if not hasattr(exc, 'request_checked_at'):
+            exc.request_checked_at = time.time()
         data = dict(stage=stage, code=getattr(exc, 'code', 'SQLITE' if isinstance(exc, sqlite3.Error) else 'INTERNAL'),
                     http_status=getattr(exc, 'http_status', 0), checked_at=time.time(),
                     correlation_id=getattr(exc, 'correlation_id', '') or secrets.token_hex(8),
-                    endpoint=getattr(exc, 'endpoint', ''), fingerprint=self.fingerprint())
+                    endpoint=getattr(exc, 'endpoint', ''), fingerprint=self.fingerprint(),
+                    request_checked_at=exc.request_checked_at)
+        if getattr(exc, 'cached', False):
+            data.update(cached=True, request_checked_at=getattr(exc, 'request_checked_at', data['checked_at']))
+        if isinstance(getattr(exc, 'denial', None), dict):
+            data['denial'] = exc.denial
         if isinstance(getattr(exc, 'schema_hint', None), dict):
             data['schema'] = exc.schema_hint
         logging.warning('Payinaja stage=%s code=%s correlation_id=%s', stage, data['code'], data['correlation_id'])
@@ -676,19 +767,21 @@ class Gateway:
             if conn is None:
                 with self.connection(True) as db:
                     self.put(db, 'diagnostic.' + stage, data)
-                    if data['code'] in {'AUTH', 'MERCHANT_INACTIVE'}:
+                    if data['code'] in {'AUTH', 'MERCHANT_INACTIVE'} and not data.get('cached'):
                         proof = self.proof(db)
                         if proof:
-                            proof.update(approved=False, checked_at=time.time(), error=data['code'],
-                                         http_status=data['http_status'])
+                            proof.update(approved=False, checked_at=data['request_checked_at'], error=data['code'],
+                                         http_status=data['http_status'], error_endpoint=data['endpoint'],
+                                         error_correlation_id=data['correlation_id'], error_denial=data.get('denial', {}))
                             self.put(db, 'profile', proof)
             else:
                 self.put(conn, 'diagnostic.' + stage, data)
-                if data['code'] in {'AUTH', 'MERCHANT_INACTIVE'}:
+                if data['code'] in {'AUTH', 'MERCHANT_INACTIVE'} and not data.get('cached'):
                     proof = self.proof(conn)
                     if proof:
-                        proof.update(approved=False, checked_at=time.time(), error=data['code'],
-                                     http_status=data['http_status'])
+                        proof.update(approved=False, checked_at=data['request_checked_at'], error=data['code'],
+                                     http_status=data['http_status'], error_endpoint=data['endpoint'],
+                                     error_correlation_id=data['correlation_id'], error_denial=data.get('denial', {}))
                         self.put(conn, 'profile', proof)
         except sqlite3.Error:
             pass
@@ -699,14 +792,23 @@ class Gateway:
         if current.get('approved') and not force:
             return current
         if not force and current.get('error') and current.get('checked_at', 0) + 30 > time.time():
-            raise GatewayError(current['error'], http_status=current.get('http_status', 0), endpoint='GET /profile')
+            exc = GatewayError(current['error'], http_status=current.get('http_status', 0),
+                               endpoint=current.get('error_endpoint') or 'GET /profile')
+            exc.cached = True
+            exc.request_checked_at = current.get('checked_at', 0)
+            if re.fullmatch('[0-9a-f]{16}', str(current.get('error_correlation_id', ''))):
+                exc.correlation_id = current['error_correlation_id']
+            exc.denial = current.get('error_denial', {})
+            raise exc
         try:
             result = await self.api.profile()
         except GatewayError as exc:
-            self.diagnostic(exc, 'connection')
+            detail = self.diagnostic(exc, 'connection')
             with self.connection(True) as conn:
                 self.put(conn, 'profile', dict(approved=False, fingerprint=self.fingerprint(),
-                    checked_at=time.time(), error=exc.code, http_status=exc.http_status))
+                    checked_at=detail['request_checked_at'], error=exc.code, http_status=exc.http_status,
+                    error_endpoint=detail['endpoint'], error_correlation_id=detail['correlation_id'],
+                    error_denial=detail.get('denial', {})))
             raise
         result.update(fingerprint=self.fingerprint(), checked_at=time.time(), http_status=200)
         with self.connection(True) as conn:
@@ -733,7 +835,11 @@ class Gateway:
     def creation_health(self):
         proof = self.setting('create', {})
         if not isinstance(proof, dict) or proof.get('fingerprint') != self.fingerprint():
-            return False, 'Belum ada bukti create dengan key aktif.'
+            profile = self.proof()
+            if profile.get('error'):
+                return False, ('Belum diuji: akses API/profil belum berhasil (HTTP ' +
+                               str(profile.get('http_status') or '-') + '). Self-test tidak membuat invoice.')
+            return False, 'Belum ada bukti create dengan key aktif. Self-test tidak membuat invoice.'
         if proof.get('error') and not proof.get('resolved_at'):
             return False, str(proof['error']) + ' • HTTP ' + str(proof.get('http_status') or '-')
         return bool(proof.get('success') or proof.get('resolved_at')), 'Metadata create terakhir tervalidasi / direkonsiliasi.'
@@ -2067,6 +2173,9 @@ class Gateway:
                 'Profil dan invoice diperiksa otomatis saat checkout. '
                 'Pembayaran diverifikasi lewat API status; callback H2H tidak dipakai.\n'
                 'Kredensial tidak ditampilkan. Key KlikQRIS tidak dipakai untuk Payinaja.\n')
+        if proof.get('error') and not proof.get('approved'):
+            text += ('\nPembayaran belum siap: ' + access_note(proof.get('error_denial'), proof.get('http_status')) +
+                     '\nAktivasi hanya berhasil setelah akses API diterima; tidak ada invoice uji dibuat.\n')
         for kind in ['connection', 'checkout', 'create', 'status', 'image', 'telegram', 'cancel', 'poll', 'cleanup']:
             detail = self.setting('diagnostic.' + kind, {})
             if not isinstance(detail, dict) or detail.get('fingerprint') != self.fingerprint():
@@ -2077,6 +2186,13 @@ class Gateway:
                      ' • HTTP: ' + str(detail.get('http_status') or '-') +
                      '\nWaktu: ' + self.host.payment_receipts.format_wib(detail['checked_at'], compact=True) +
                      ' • ID: ' + html.escape(detail['correlation_id']) + '\n')
+            if detail.get('endpoint'):
+                text += 'Request: ' + html.escape(str(detail['endpoint'])) + '\n'
+            if detail.get('cached'):
+                text += ('Sumber: cache penolakan sebelumnya; tidak ada request API baru pada pemeriksaan ini.\n'
+                         'Waktu request API: ' + self.host.payment_receipts.format_wib(detail['request_checked_at'], compact=True) + '\n')
+            if detail.get('denial'):
+                text += access_note(detail['denial'], detail.get('http_status')) + '\n'
             if detail.get('schema'):
                 text += 'Bentuk respons (tanpa nilai privat): ' + html.escape(encoded(detail['schema'])) + '\n'
         if note:
@@ -2241,6 +2357,8 @@ def register(router, gateway):
                 text = 'Minimum pembayaran QRIS Payinaja Rp500. Pilih metode lain untuk nominal lebih kecil.'
             elif getattr(exc, 'code', '') == 'CONFIRM_EXPIRED':
                 text = 'Konfirmasi sudah dipakai atau kedaluwarsa. Buka kembali invoice; tidak ada pembatalan baru diajukan.'
+            elif owner and getattr(exc, 'code', '') == 'AUTH':
+                text = access_note(getattr(exc, 'denial', None), getattr(exc, 'http_status', 0))
             if owner and host.is_owner(call.from_user.id):
                 try:
                     await gateway.owner_panel(call, note='Kode: ' + detail['code'] + ' • ID: ' + detail['correlation_id'])
@@ -2248,3 +2366,32 @@ def register(router, gateway):
                     pass
             await host.safe_callback_notice(call, text, show_alert=True)
     return gateway
+
+
+async def read_only_access_probe(config=None):
+    """Hosting diagnostic: exactly GET profile, no DB, activation or invoice."""
+    api = Client(config or Config.environment())
+    try:
+        await api.profile()
+        return dict(code='OK', http_status=200, endpoint='GET /profile', approved=True,
+                    correlation_id=secrets.token_hex(8), read_only=True, invoice_created=False)
+    except GatewayError as exc:
+        result = dict(code=exc.code, http_status=exc.http_status, endpoint=exc.endpoint,
+                      approved=False, correlation_id=exc.correlation_id, read_only=True, invoice_created=False)
+        if isinstance(getattr(exc, 'denial', None), dict):
+            result['denial'] = exc.denial
+        return result
+    finally:
+        await api.close()
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='Pemeriksaan akses Payinaja tanpa membuat invoice atau mengubah database.')
+    parser.add_argument('--check-access', action='store_true', help='GET profil memakai secret hosting; output hanya diagnosis aman.')
+    args = parser.parse_args()
+    if not args.check_access:
+        parser.error('Gunakan --check-access untuk pemeriksaan read-only.')
+    result = asyncio.run(read_only_access_probe())
+    print(encoded(result))
+    raise SystemExit(0 if result['code'] == 'OK' else 1)

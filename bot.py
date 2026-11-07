@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.46"
+BOT_VERSION = "17.47"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -7947,7 +7947,7 @@ async def transaction_self_test():
         payi_ready=PAYINAJA_GATEWAY.ready()
         payi_verified=PAYINAJA_GATEWAY.proof().get("approved") is True
         payi_create,payi_detail=PAYINAJA_GATEWAY.creation_health()
-        optional_payi=chosen!="payinaja" or not PAYINAJA_GATEWAY.enabled()
+        optional_payi=chosen!="payinaja"
         checks.append(("Payinaja",optional_payi or payi_ready,"izin invoice aktif" if payi_ready else "nonaktif / belum siap"))
         checks.append(("Payinaja API",optional_payi or payi_verified,"GET profil approved" if payi_verified else "belum terverifikasi; tidak membuat invoice uji"))
         checks.append(("Payinaja Create",optional_payi or payi_create,payi_detail))
@@ -36714,7 +36714,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.46"
+EXPECTED_SOURCE_VERSION = "17.47"
 
 
 def source_integrity_self_test():
