@@ -4,6 +4,7 @@ import binascii
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import logging
 import os
@@ -39,7 +40,7 @@ PREFIX = 'payi:'
 LABEL = '⚡ QRIS Otomatis'
 FINAL = {'SETTLED', 'SETTLED_BALANCE', 'FAILED', 'CANCELLED'}
 TX_PREFIX = 'payinaja.tx.'
-ADAPTER_VERSION = '17.47'
+ADAPTER_VERSION = '17.48'
 QR_BLOCKING_ERRORS = frozenset({'SCHEMA', 'MISMATCH', 'AUTH', 'ACCOUNT_CHANGED', 'DUPLICATE_REFERENCE'})
 DENIAL_LIMIT = 16384
 
@@ -121,6 +122,36 @@ def access_note(denial, status):
     kind = denial.get('kind') if isinstance(denial, dict) else None
     return notes.get(kind, 'HTTP 403 menolak akses; alasan spesifik belum diberikan oleh respons API.' if status == 403 else
                      'Pemeriksaan API belum berhasil. Tidak ada invoice uji dibuat.')
+
+
+async def hosting_ipv4():
+    """Observe this service's IPv4 toward ipify; never send payment credentials."""
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5), trust_env=True,
+                                         cookie_jar=aiohttp.DummyCookieJar()) as session:
+            async with session.get('https://api.ipify.org?format=json', headers={'Accept': 'application/json'},
+                                   allow_redirects=False) as response:
+                if response.status != 200:
+                    raise GatewayError('IP_LOOKUP_HTTP', http_status=response.status)
+                raw = bytearray()
+                async for chunk in response.content.iter_chunked(256):
+                    raw.extend(chunk[:1025 - len(raw)])
+                    if len(raw) > 1024:
+                        raise GatewayError('IP_LOOKUP_SIZE')
+                try:
+                    data = json.loads(raw)
+                    value = data.get('ip') if isinstance(data, dict) else None
+                    if not isinstance(value, str) or len(value) > 45:
+                        raise ValueError
+                    address = ipaddress.ip_address(value)
+                    if (address.version != 4 or not address.is_global or address.is_multicast
+                            or address.is_reserved or address.is_unspecified):
+                        raise ValueError
+                    return str(address)
+                except (ValueError, TypeError, UnicodeError):
+                    raise GatewayError('IP_LOOKUP_SCHEMA') from None
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise GatewayError('IP_LOOKUP_UNAVAILABLE') from None
 
 
 @dataclass(frozen=True)
@@ -821,16 +852,59 @@ class Gateway:
         self.require_owner(actor)
         return await self.ensure_profile(force=True)
 
-    async def activate(self, actor):
+    async def activate(self, actor, *, progress=None):
         self.require_owner(actor)
-        await self.ensure_profile(force=True)  # GET only, never a probe invoice.
+        if not self.config.valid():
+            raise GatewayError('CONFIG')
+        token, fingerprint = secrets.token_hex(12), self.fingerprint()
         with self.connection(True) as conn:
-            self.put(conn, 'enabled', True)
+            current = self.setting('activation', {}, conn)
+            if (current.get('state') == 'checking' and current.get('lease_until', 0) > time.time()
+                    and current.get('fingerprint') == fingerprint):
+                raise GatewayError('BUSY')
+            self.put(conn, 'activation', dict(token=token, state='checking', fingerprint=fingerprint,
+                     lease_until=time.time() + self.config.timeout + 45))
+        try:
+            if progress is not None:
+                try:
+                    await asyncio.wait_for(progress(), timeout=10)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    raise GatewayError('TELEGRAM') from None
+            current = self.setting('activation', {})
+            if current.get('token') != token or self.fingerprint() != fingerprint:
+                raise GatewayError('ACTIVATION_CANCELLED')
+            await self.ensure_profile(force=True)  # GET only, never a probe invoice.
+            with self.connection(True) as conn:
+                current = self.setting('activation', {}, conn)
+                if current.get('token') != token or self.fingerprint() != fingerprint:
+                    raise GatewayError('ACTIVATION_CANCELLED')
+                self.put(conn, 'enabled', True)
+                current.update(state='enabled', token=None, lease_until=0)
+                self.put(conn, 'activation', current)
+                source = self.setting('diagnostic.connection', {}, conn)
+                self.put(conn, 'diagnostic.activation', dict(stage='activation', code='OK', http_status=200,
+                    checked_at=time.time(), request_checked_at=self.proof(conn).get('checked_at', time.time()),
+                    correlation_id=source.get('correlation_id') or secrets.token_hex(8),
+                    endpoint='GET /profile', fingerprint=fingerprint))
+        except BaseException as exc:
+            with self.connection(True) as conn:
+                current = self.setting('activation', {}, conn)
+                if current.get('token') == token:
+                    current.update(state='cancelled' if isinstance(exc, asyncio.CancelledError) else 'denied',
+                                   token=None, lease_until=0)
+                    self.put(conn, 'activation', current)
+                    self.diagnostic(GatewayError('ACTIVATION_CANCELLED') if isinstance(exc, asyncio.CancelledError) else exc,
+                                    'activation', conn=conn)
+            raise
 
     def disable(self, actor):
         self.require_owner(actor)
         with self.connection(True) as conn:
             self.put(conn, 'enabled', False)
+            self.put(conn, 'activation', dict(token=secrets.token_hex(12), state='disabled', lease_until=0,
+                     fingerprint=self.fingerprint()))
 
     def creation_health(self):
         proof = self.setting('create', {})
@@ -2176,32 +2250,80 @@ class Gateway:
         if proof.get('error') and not proof.get('approved'):
             text += ('\nPembayaran belum siap: ' + access_note(proof.get('error_denial'), proof.get('http_status')) +
                      '\nAktivasi hanya berhasil setelah akses API diterima; tidak ada invoice uji dibuat.\n')
-        for kind in ['connection', 'checkout', 'create', 'status', 'image', 'telegram', 'cancel', 'poll', 'cleanup']:
+        activation = self.setting('activation', {})
+        checking = (activation.get('state') == 'checking' and activation.get('lease_until', 0) > time.time()
+                    and activation.get('fingerprint') == self.fingerprint())
+        if checking:
+            text += '\n⏳ Aktivasi sedang memeriksa akses Payinaja. Pembayaran belum dinyatakan aktif.\n'
+        elif activation.get('state') == 'denied' and not self.enabled():
+            text += '\n❌ Percobaan aktivasi gagal. Tombol sudah diproses; akses API belum diterima.\n'
+        if note:
+            text += '\n' + html.escape(note[:500]) + '\n'
+        hidden = 0
+        for kind in ['activation', 'connection', 'create', 'checkout', 'status', 'image', 'telegram', 'cancel', 'poll', 'cleanup']:
             detail = self.setting('diagnostic.' + kind, {})
             if not isinstance(detail, dict) or detail.get('fingerprint') != self.fingerprint():
                 continue
             if detail.get('checked_at', 0) < self.started_at:
                 continue  # Old diagnostics remain in storage/detail history, not the fresh process panel.
-            text += ('\nTahap: ' + html.escape(str(detail['stage'])) + ' • Kode: ' + html.escape(str(detail['code'])) +
+            block = ('\nTahap: ' + html.escape(str(detail['stage'])) + ' • Kode: ' + html.escape(str(detail['code'])) +
                      ' • HTTP: ' + str(detail.get('http_status') or '-') +
                      '\nWaktu: ' + self.host.payment_receipts.format_wib(detail['checked_at'], compact=True) +
                      ' • ID: ' + html.escape(detail['correlation_id']) + '\n')
             if detail.get('endpoint'):
-                text += 'Request: ' + html.escape(str(detail['endpoint'])) + '\n'
+                block += 'Request: ' + html.escape(str(detail['endpoint'])) + '\n'
+            compact = block
             if detail.get('cached'):
-                text += ('Sumber: cache penolakan sebelumnya; tidak ada request API baru pada pemeriksaan ini.\n'
+                block += ('Sumber: cache penolakan sebelumnya; tidak ada request API baru pada pemeriksaan ini.\n'
                          'Waktu request API: ' + self.host.payment_receipts.format_wib(detail['request_checked_at'], compact=True) + '\n')
+                compact += 'Sumber: cache penolakan sebelumnya.\n'
             if detail.get('denial'):
-                text += access_note(detail['denial'], detail.get('http_status')) + '\n'
+                block += access_note(detail['denial'], detail.get('http_status')) + '\n'
             if detail.get('schema'):
-                text += 'Bentuk respons (tanpa nilai privat): ' + html.escape(encoded(detail['schema'])) + '\n'
-        if note:
-            text += '\n' + html.escape(note)
-        await self.host.safe_edit_or_answer(call, text, parse_mode='HTML', reply_markup=self.owner_keyboard([
-            [('🔴 Nonaktifkan' if self.enabled() else '🟢 Aktifkan Payinaja', 'toggle', 'off' if self.enabled() else 'on')],
+                block += 'Bentuk respons (tanpa nilai privat): ' + html.escape(encoded(detail['schema'])) + '\n'
+            # Keep complete HTML blocks below Telegram's message limit. Older
+            # diagnostics remain stored; they must not make the button go silent.
+            if len((text + block).encode('utf-16-le')) // 2 <= 3600:
+                text += block
+            elif len((text + compact).encode('utf-16-le')) // 2 <= 3600:
+                text += compact
+            else:
+                hidden += 1
+        if hidden:
+            text += '\nSebagian diagnosis tetap tersimpan. Detail transaksi tersedia di Riwayat.\n'
+        controls = []
+        if checking:
+            controls += [[('⏳ Memeriksa akses…', 'menu', None)], [('🔴 Batalkan Aktivasi', 'toggle', 'off')]]
+        else:
+            label = ('🔴 Nonaktifkan' if self.enabled() else '🔄 Coba Aktifkan Kembali' if activation.get('state') == 'denied' else '🟢 Aktifkan Payinaja')
+            controls.append([(label, 'toggle', 'off' if self.enabled() else 'on')])
+        if proof.get('error_denial', {}).get('kind') == 'ip_restricted':
+            controls.append([('🌐 Info IP Hosting', 'hosting_ip', None)])
+        controls += [
             [('📊 Riwayat', 'history', '0'), ('⏳ Pending', 'pending', '0')],
             [('🔄 Rekonsiliasi', 'reconcile', None)],
-            [('⚙️ Pilih Provider', 'providers', None)], [('⬅️ Pengaturan Pembayaran', 'back', None)]]))
+            [('⚙️ Pilih Provider', 'providers', None)], [('⬅️ Pengaturan Pembayaran', 'back', None)]]
+        await self.host.safe_edit_or_answer(call, text, parse_mode='HTML', reply_markup=self.owner_keyboard(controls))
+
+    async def owner_hosting_ip(self, call):
+        self.require_owner(call.from_user.id)
+        if (not call.message or str(call.message.chat.type) != 'private'
+                or call.message.chat.id != call.from_user.id):
+            raise GatewayError('FORBIDDEN')
+        controls = self.owner_keyboard([[('⬅️ QRIS Otomatis', 'menu', None)]])
+        await self.host.safe_edit_or_answer(call, '⏳ Mengambil info IP keluar service bot…', reply_markup=controls)
+        try:
+            address = await hosting_ipv4()
+        except GatewayError:
+            return await self.host.safe_edit_or_answer(call,
+                'Info IP hosting belum tersedia. Status aktivasi dan pembayaran tidak diubah.', reply_markup=controls)
+        text = ('🌐 <b>INFO IP HOSTING</b>\n\nIP keluar IPv4 ke layanan pemeriksa:\n<code>' + html.escape(address) + '</code>\n\n'
+                'Alamat ini diamati dari service bot ke ipify; belum membuktikan IP yang diterima Payinaja. '
+                'Rute proxy, tujuan, atau IPv6 dapat berbeda.\n\n'
+                'Cocokkan pada akun Payinaja yang memakai API key aktif → Whitelist IP API Terima Pembayaran, lalu Simpan. '
+                'Whitelist H2H PPOB berbeda. Jika tetap ditolak padahal cocok, minta Payinaja memeriksa aturan akses akun tersebut.\n\n'
+                'Tidak ada invoice dibuat atau pengaturan pembayaran diubah.')
+        return await self.host.safe_edit_or_answer(call, text, parse_mode='HTML', reply_markup=controls)
 
     async def owner_list(self, call, *, pending=False, page=0):
         self.require_owner(call.from_user.id)
@@ -2320,12 +2442,19 @@ def register(router, gateway):
                 await gateway.owner_panel(call, note='Profil diperiksa; tidak ada invoice dibuat.')
             elif action == 'toggle':
                 if value == 'on':
-                    await gateway.activate(call.from_user.id)
+                    async def progress():
+                        await host.safe_edit_or_answer(call,
+                            '⏳ <b>Memeriksa akses Payinaja…</b>\n\nTombol Aktifkan sudah diterima. '
+                            'Bot sedang meminta profil akun; belum ada invoice dibuat.', parse_mode='HTML',
+                            reply_markup=gateway.owner_keyboard([[('🔴 Batalkan Aktivasi', 'toggle', 'off')]]))
+                    await gateway.activate(call.from_user.id, progress=progress)
                 elif value == 'off':
                     gateway.disable(call.from_user.id)
                 else:
                     raise GatewayError('INPUT')
                 await gateway.owner_panel(call)
+            elif action == 'hosting_ip':
+                await gateway.owner_hosting_ip(call)
             elif action in {'history', 'pending'}:
                 if not value or not re.fullmatch('[0-9]{1,6}', value):
                     raise GatewayError('INPUT')
@@ -2359,9 +2488,15 @@ def register(router, gateway):
                 text = 'Konfirmasi sudah dipakai atau kedaluwarsa. Buka kembali invoice; tidak ada pembatalan baru diajukan.'
             elif owner and getattr(exc, 'code', '') == 'AUTH':
                 text = access_note(getattr(exc, 'denial', None), getattr(exc, 'http_status', 0))
+            elif owner and getattr(exc, 'code', '') in {'BUSY', 'RATE_LIMIT'}:
+                text = 'Pemeriksaan aktivasi sedang berjalan atau terlalu sering diminta. Tunggu sebentar.'
+            elif owner and getattr(exc, 'code', '') == 'ACTIVATION_CANCELLED':
+                text = 'Aktivasi dibatalkan atau digantikan permintaan terbaru. Respons lama tidak mengaktifkan pembayaran.'
+            elif owner and getattr(exc, 'code', '') == 'TELEGRAM':
+                text = 'Pesan aktivasi belum dapat diperbarui. Silakan coba kembali; tidak ada invoice dibuat.'
             if owner and host.is_owner(call.from_user.id):
                 try:
-                    await gateway.owner_panel(call, note='Kode: ' + detail['code'] + ' • ID: ' + detail['correlation_id'])
+                    await gateway.owner_panel(call, note=text + '\nKode: ' + detail['code'] + ' • ID: ' + detail['correlation_id'])
                 except (GatewayError, sqlite3.Error):
                     pass
             await host.safe_callback_notice(call, text, show_alert=True)
