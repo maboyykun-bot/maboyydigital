@@ -38,7 +38,7 @@ from types import SimpleNamespace
 from otp_smscode import TEXT_MENU_ACTIONS
 
 LABEL = '⚡ QRIS Otomatis'
-ADAPTER_VERSION = '17.45'
+ADAPTER_VERSION = '17.46'
 METHOD = 'KLIKQRIS_AUTO'
 PREFIX = 'aqris:'
 MAX_AMOUNT = 10**12
@@ -381,6 +381,8 @@ class Gateway:
         self.task=None
         self.cleanup_task=None
         self.delivery_locks={}
+        self.started_at=time.time()
+        self.requested_qr_ids=set()
 
     @contextmanager
     def connection(self,write=False):
@@ -1379,6 +1381,7 @@ class Gateway:
             try:
                 if row['state']=='NEW':await self.issue(row['id'])
                 else:await self.refresh(row['id'])
+                await self.deliver_pending_order_qr(row['id'])
             except GatewayError as exc:
                 if exc.code=='RATE_LIMIT':break
             except asyncio.CancelledError:raise
@@ -1545,13 +1548,15 @@ class Gateway:
                         (call.from_user.id,call.from_user.username or '',product['id'],variant_id,qty,unit,subtotal,METHOD,note,amount,
                          datetime.now().isoformat(timespec='seconds'),voucher,discount)).lastrowid
                     tx=self.reserve(conn,'order',ident,call.from_user.id,amount)
+            if tx['state']=='NEW':
+                await self.host.safe_edit_or_answer(call,self.status_text(tx),reply_markup=self.user_keyboard(tx),parse_mode='HTML')
             resumed=await self.resume(tx['id'])
             self.record_checkout_ready(resumed)
             await state.clear()
             await self.show_payment(call,tx['id'])
 
     def user_keyboard(self,row):
-        rows=[[InlineKeyboardButton(text='🔄 Cek Status',callback_data=PREFIX+'u:check:'+row['id'])]]
+        rows=[] if row['purpose']=='order' else [[InlineKeyboardButton(text='🔄 Cek Status',callback_data=PREFIX+'u:check:'+row['id'])]]
         if row['state'] in {'NEW','REQUESTING','CREATE_UNKNOWN','PENDING'}:
             rows.append([InlineKeyboardButton(text='❌ Batalkan',callback_data=PREFIX+'u:cancel:'+row['id'])])
         rows.append([InlineKeyboardButton(text='🏠 Menu Awal',callback_data='home')])
@@ -1574,7 +1579,9 @@ class Gateway:
             text+='⏳ Berlaku hingga: '+self.host.payment_receipts.format_wib(row['expires_at'],compact=True)+'\n'
         if row['state']=='PENDING' and row['error'] not in {'NOT_FOUND','ENDPOINT_NOT_FOUND'}:text+='Bayar tepat sesuai total. Status akan diperbarui otomatis.\n'
         if row['state'] in {'REQUESTING','CREATE_UNKNOWN'}:text+='Invoice sedang diperiksa. Jangan membuat pembayaran pengganti atau membayar dua kali.\n'
-        if row['state']=='PENDING' and row['error']=='IMAGE':text+='Gambar QRIS belum tersedia. Gunakan Cek Status untuk mengambil QR invoice yang sama; jangan membayar sebelum QR tampil.\n'
+        if row['state']=='PENDING' and row['error']=='IMAGE':
+            text+=('Gambar QRIS sedang diambil dan akan dikirim otomatis saat tersedia; jangan membayar sebelum QR tampil.\n' if row['purpose']=='order' else
+                   'Gambar QRIS belum tersedia. Gunakan Cek Status untuk mengambil QR invoice yang sama; jangan membayar sebelum QR tampil.\n')
         if row['error'] and row['state'] not in {'SETTLED','SETTLED_BALANCE'}:text+='Pemeriksaan belum selesai; cek kembali atau hubungi owner.\n'
         return text+'\n<i>'+html.escape(self.host.STORE_FOOTER)+'</i>'
 
@@ -1615,8 +1622,10 @@ class Gateway:
             return await self.show_payment(call,ident)
         await self.host.safe_edit_or_answer(call,self.status_text(row),reply_markup=self.user_keyboard(row),parse_mode='HTML')
 
-    async def show_payment(self,call,ident):
+    async def show_payment(self,call,ident,*,automatic=False):
         row=self.transaction(ident,call.from_user.id)
+        if row['purpose']=='order':return await self.show_order_qr(call,ident,automatic=automatic)
+        if automatic:return
         if self.history_archived(ident):return await self.show_status(call,ident,refresh=False)
         if row['fingerprint']!=self.fingerprint():return await self.show_status(call,ident,refresh=False)
         if row['error'] in {'NOT_FOUND','ENDPOINT_NOT_FOUND'}:return await self.show_status(call,ident)
@@ -1643,6 +1652,93 @@ class Gateway:
         try:
             if not receipt or receipt['message_id']!=call.message.message_id:await call.message.delete()
         except Exception:pass
+
+    def qr_delivery(self,ident,conn):
+        found=conn.execute('SELECT value FROM klikqris_settings WHERE key=?',('qr_send_'+ident,)).fetchone()
+        try:result=json.loads(found['value']) if found else {}
+        except (ValueError,TypeError):raise GatewayError('STORAGE') from None
+        if not isinstance(result,dict):raise GatewayError('STORAGE')
+        return result
+
+    def save_qr_delivery(self,conn,ident,data):
+        conn.execute('INSERT OR REPLACE INTO klikqris_settings VALUES(?,?,?)',('qr_send_'+ident,encoded(data),time.time()))
+
+    async def show_order_qr(self,call,ident,*,automatic=False):
+        row=self.transaction(ident,call.from_user.id)
+        self.bot=call.bot
+        if row['purpose']!='order':raise GatewayError('INPUT')
+        if not automatic:self.requested_qr_ids.add(ident)
+        if automatic and row['created_at']<self.started_at and ident not in self.requested_qr_ids:return
+        if (not automatic and not self.history_archived(ident) and row['fingerprint']==self.fingerprint()
+                and (row['state']!='PENDING' or not row['qr_image'] or row['error'] not in {'','IMAGE','TELEGRAM'})):
+            try:await self.refresh(ident)
+            except GatewayError:pass
+            row=self.transaction(ident,call.from_user.id)
+        blocked=(self.history_archived(ident) or row['fingerprint']!=self.fingerprint() or row['sandbox'] or self.config.sandbox
+                 or row['state']!='PENDING' or not row['qr_image'] or row['provider_status']!='PENDING'
+                 or row['error'] not in {'','IMAGE','TELEGRAM'} or (row['expires_at'] and row['expires_at']<=time.time()))
+        if blocked:return None if automatic else await self.show_status(call,ident,refresh=False)
+        token=secrets.token_hex(12)
+        with self.connection(True) as conn:
+            current=dict(conn.execute('SELECT * FROM klikqris_transactions WHERE id=?',(ident,)).fetchone())
+            delivery=self.qr_delivery(ident,conn)
+            native=conn.execute('SELECT * FROM orders WHERE id=?',(current['entity_id'],)).fetchone()
+            if (self.history_archived(ident,conn) or current['state']!='PENDING' or current['fingerprint']!=self.fingerprint()
+                    or current['sandbox'] or self.config.sandbox or current['provider_status']!='PENDING'
+                    or current['error'] not in {'','IMAGE','TELEGRAM'} or not current['qr_image']
+                    or (current['expires_at'] and current['expires_at']<=time.time())
+                    or not native or native['user_id']!=current['user_id'] or native['payment_method']!=METHOD
+                    or native['status'] in {'cancelled','expired','completed','rejected'} or native['payment_status']=='paid'
+                    or native['provider_reference']!=current['reference'] or native['payment_total']!=current['total_amount']
+                    or native['total']-int(native['discount_amount'] or 0)!=current['amount']
+                    or delivery.get('until',0)>time.time()
+                    or (automatic and (delivery.get('sent_at') or delivery.get('retry_at',0)>time.time()))):return
+            raw=self.crypt(current['qr_image'],decrypt=True)
+            delivery.update(owner=token,until=time.time()+self.config.timeout+45)
+            self.save_qr_delivery(conn,ident,delivery)
+            row=current
+        try:
+            try:
+                sent=await asyncio.wait_for(call.bot.send_photo(row['user_id'],BufferedInputFile(raw,filename='qris-'+str(row['entity_id'])+'.png'),
+                    caption=self.status_text(row),reply_markup=self.user_keyboard(row),parse_mode='HTML'),timeout=self.config.timeout+15)
+            except asyncio.CancelledError:raise
+            except Exception as exc:
+                delay=max(30,min(3600,float(getattr(exc,'retry_after',0) or 0)))
+                with self.connection(True) as conn:
+                    delivery=self.qr_delivery(ident,conn)
+                    if delivery.get('owner')==token:
+                        delivery['retry_at']=time.time()+delay
+                        self.save_qr_delivery(conn,ident,delivery)
+                    conn.execute("UPDATE klikqris_transactions SET error='TELEGRAM' WHERE id=? AND state='PENDING'",(ident,))
+                    self.save_stage_diagnostic(conn,'telegram','TELEGRAM')
+                    self.audit(conn,0,'qr_delivery_failed',ident,encoded({'stage':'telegram','code':'TELEGRAM','correlation_id':secrets.token_hex(8)}))
+                if automatic:return
+                return await self.host.safe_edit_or_answer(call,self.status_text(self.transaction(ident))+'\nGambar belum terkirim; pengiriman akan dicoba kembali secara otomatis.',reply_markup=self.user_keyboard(self.transaction(ident)),parse_mode='HTML')
+            self.remember_payment_message(ident,row['user_id'],sent.message_id)
+            with self.connection(True) as conn:
+                delivery=self.qr_delivery(ident,conn)
+                if delivery.get('owner')==token:
+                    delivery.update(sent_at=time.time(),message_id=sent.message_id,retry_at=0)
+                    self.save_qr_delivery(conn,ident,delivery)
+                conn.execute("UPDATE klikqris_transactions SET error='' WHERE id=? AND state='PENDING' AND error='TELEGRAM'",(ident,))
+        finally:
+            with self.connection(True) as conn:
+                delivery=self.qr_delivery(ident,conn)
+                if delivery.get('owner')==token:
+                    delivery.update(owner=None,until=0)
+                    self.save_qr_delivery(conn,ident,delivery)
+        await self.retire_paid_messages(call.bot,ident)
+        if not automatic:
+            try:await call.message.delete()
+            except Exception:pass
+
+    async def deliver_pending_order_qr(self,ident):
+        if self.bot is None:return
+        row=self.transaction(ident)
+        if (row['purpose']!='order' or row['state']!='PENDING' or not row['qr_image']
+                or (row['created_at']<self.started_at and ident not in self.requested_qr_ids)):return
+        call=SimpleNamespace(from_user=SimpleNamespace(id=row['user_id']),bot=self.bot)
+        await self.show_payment(call,ident,automatic=True)
 
     async def cancel(self,call,ident):
         row=self.transaction(ident,call.from_user.id)
@@ -1714,7 +1810,7 @@ class Gateway:
         if not verified and settings['mode']=='gateway' and not problems and not proof.get('error'):
             text+='API akan diverifikasi saat invoice pembayaran dibuat. Saldo masuk setelah pembayaran sah.\n'
         if proof.get('source')=='original_account_status':
-            text+='Pemeriksaan lama memakai key asal. Ulangi Cek Koneksi untuk memeriksa key aktif.\n'
+            text+='Pemeriksaan lama memakai key asal. Key aktif diperiksa otomatis melalui alur invoice.\n'
         if verified and proof.get('source') in {'invoice_created','existing_gateway_order'}:
             text+='Verifikasi API memakai invoice nyata.\n'
         connection=self.one('SELECT value FROM klikqris_settings WHERE key=?',('connection_'+settings['mode'],))
@@ -1751,7 +1847,7 @@ class Gateway:
         if self.config.normalized:
             text+='\nℹ️ Format nilai environment dibaca otomatis; cukup isi nilainya saja.\n'
         if note:text+='\n'+html.escape(note)+'\n'
-        rows=[[('🔌 Cek Koneksi','connect',None),('⚙️ Pilih Mode','modes',None)],
+        rows=[[('⚙️ Pilih Mode','modes',None)],
               [('🔴 Nonaktifkan' if ready else '🟢 Aktifkan KlikQRIS','toggle','off' if ready else 'on')],
               [('📊 Riwayat Transaksi','history',0),('⏳ Transaksi Pending','pending',0)],
               [('🔄 Rekonsiliasi','reconcile',None)],

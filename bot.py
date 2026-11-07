@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.45"
+BOT_VERSION = "17.46"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -24094,11 +24094,11 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
             return await reject_checkout_voucher(call,state,variant_id,exc)
         except klikqris_gateway.GatewayError as exc:
             automatic_qris.record_failure(_otp_sys.modules[__name__],exc)
-            text=klikqris_gateway.buyer_error(exc)
+            text=automatic_qris.checkout_error_text(exc)
             return await safe_callback_notice(call,text,show_alert=True)
         except sqlite3.Error as exc:
             automatic_qris.record_failure(_otp_sys.modules[__name__],exc)
-            return await safe_callback_notice(call,'Pembayaran belum dapat diproses; periksa status sebelum mencoba kembali.',show_alert=True)
+            return await safe_callback_notice(call,'Pembayaran belum dapat diproses; hubungi owner jika belum tersedia.',show_alert=True)
     if not shopeepay_ready():
         return await call.answer(
             "QRIS otomatis belum dikonfigurasi lengkap.",
@@ -36714,7 +36714,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.45"
+EXPECTED_SOURCE_VERSION = "17.46"
 
 
 def source_integrity_self_test():

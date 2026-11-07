@@ -39,7 +39,7 @@ PREFIX = 'payi:'
 LABEL = '⚡ QRIS Otomatis'
 FINAL = {'SETTLED', 'SETTLED_BALANCE', 'FAILED', 'CANCELLED'}
 TX_PREFIX = 'payinaja.tx.'
-ADAPTER_VERSION = '17.45'
+ADAPTER_VERSION = '17.46'
 QR_BLOCKING_ERRORS = frozenset({'SCHEMA', 'MISMATCH', 'AUTH', 'ACCOUNT_CHANGED', 'DUPLICATE_REFERENCE'})
 
 
@@ -538,6 +538,7 @@ class Gateway:
         self.tasks = []
         self.delivery_locks = {}
         self.started_at = time.time()
+        self.requested_qr_ids = set()
 
     @contextmanager
     def connection(self, write=False):
@@ -1198,6 +1199,12 @@ class Gateway:
 
     async def show_prior_hold(self, call, ident):
         row = self.transaction(ident, call.from_user.id)
+        if row['purpose'] == 'order':
+            # Opening checkout is an explicit request for this invoice. A restart
+            # alone still never resends an old QR to the buyer.
+            self.requested_qr_ids.add(ident)
+            if row['state'] == 'PENDING' and not row['cancel_requested'] and row['error'] in {'', 'IMAGE'}:
+                return await self.show_payment(call, ident)
         text = ('<b>Pemeriksaan pembayaran sebelumnya</b>\n\n'
                 'Belum ada invoice baru dibuat. ' +
                 ('Pembayaran sebelumnya sudah berhasil diproses. Periksa riwayat pesanan.' if row['state'] in {'SETTLED', 'SETTLED_BALANCE'} else
@@ -1205,6 +1212,9 @@ class Gateway:
         controls = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text='🔄 Periksa pembayaran sebelumnya', callback_data=PREFIX + 'u:check:' + ident)],
             [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]])
+        if row['purpose'] == 'order':
+            controls = self.user_keyboard(row)
+            text += '\nBot melanjutkan pemeriksaan pembayaran secara otomatis.'
         return await self.host.safe_edit_or_answer(call, text, reply_markup=controls, parse_mode='HTML')
 
     def expire_native(self, conn, row):
@@ -1357,6 +1367,8 @@ class Gateway:
                          METHOD, note, amount, datetime.now().isoformat(timespec='seconds'), voucher, discount)).lastrowid
                     row = self.reserve(conn, 'order', entity, call.from_user.id, amount)
             if row['state'] == 'NEW':
+                await self.host.safe_edit_or_answer(call, self.status_text(row),
+                    reply_markup=self.user_keyboard(row), parse_mode='HTML')
                 await self.issue(row['id'])
             elif row['cancel_requested']:
                 await state.clear()
@@ -1404,8 +1416,10 @@ class Gateway:
             await self.show_payment(call, row['id'])
 
     def user_keyboard(self, row):
-        rows = [[InlineKeyboardButton(text='🔄 Periksa Pembatalan' if row['cancel_requested'] else '🔄 Cek Status',
-                                      callback_data=PREFIX + 'u:check:' + row['id'])]]
+        rows = []
+        if row['purpose'] != 'order':
+            rows.append([InlineKeyboardButton(text='🔄 Periksa Pembatalan' if row['cancel_requested'] else '🔄 Cek Status',
+                                             callback_data=PREFIX + 'u:check:' + row['id'])])
         if row['state'] not in FINAL | {'REVIEW', 'PAID_VERIFIED'} and not row['cancel_requested']:
             rows.append([InlineKeyboardButton(text='❌ Batalkan', callback_data=PREFIX + 'u:cancel:' + row['id'])])
         rows.append([InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')])
@@ -1435,7 +1449,8 @@ class Gateway:
             if row['cancel_requested'] and audit:
                 text += 'Permintaan pembatalan tercatat: ' + self.host.payment_receipts.format_wib(audit['created_at'], compact=True) + '\n'
         elif row['state'] == 'PENDING' and not self.has_qr(row):
-            text += 'Invoice tersedia, tetapi gambar QR belum siap ditampilkan. Cek Status atau hubungi owner; jangan membuat tagihan pengganti.\n'
+            text += ('Invoice tersedia. Bot sedang menyiapkan dan mengirim gambar QR secara otomatis.\n' if row['purpose'] == 'order' else
+                     'Invoice tersedia, tetapi gambar QR belum siap ditampilkan. Cek Status atau hubungi owner; jangan membuat tagihan pengganti.\n')
         return text
 
     def native_status(self, purpose, entity):
@@ -1495,7 +1510,9 @@ class Gateway:
     async def show_payment(self, call, ident, *, automatic=False):
         row = self.transaction(ident, call.from_user.id)
         self.bot = call.bot
-        if automatic and (self.is_prior_session(row) or row['qr_messages'] or row.get('qr_send_retry_at', 0) > time.time()):
+        if not automatic and row['purpose'] == 'order':
+            self.requested_qr_ids.add(ident)
+        if automatic and (not self.can_auto_deliver(row) or row['qr_messages'] or row.get('qr_send_retry_at', 0) > time.time()):
             return
         if row['state'] == 'PENDING' and not row['cancel_requested'] and not self.proof().get('approved'):
             try:
@@ -1551,7 +1568,7 @@ class Gateway:
                     or current.get('qris_cipher') != row.get('qris_cipher')
                     or current.get('qr_image_cipher') != row.get('qr_image_cipher')
                     or current.get('qr_send_until', 0) > time.time()
-                    or (automatic and (self.is_prior_session(current) or current['qr_messages']
+                    or (automatic and (not self.can_auto_deliver(current) or current['qr_messages']
                                        or current.get('qr_send_retry_at', 0) > time.time()))):
                 return
             native = conn.execute('SELECT * FROM ' + ('orders' if current['purpose'] == 'order' else 'topups') + ' WHERE id=?',
@@ -1578,7 +1595,9 @@ class Gateway:
                     self.save(conn, current)
                 if automatic:
                     return
-                return await self.host.safe_edit_or_answer(call, self.status_text(row) + '\nGambar belum terkirim; pengiriman akan dicoba kembali. Cek Status tidak membuat invoice baru.',
+                note = ('\nGambar belum terkirim; bot akan mencoba pengiriman kembali secara otomatis.' if row['purpose'] == 'order' else
+                        '\nGambar belum terkirim; pengiriman akan dicoba kembali. Cek Status tidak membuat invoice baru.')
+                return await self.host.safe_edit_or_answer(call, self.status_text(row) + note,
                            reply_markup=self.user_keyboard(row), parse_mode='HTML')
             self.remember_payment_message(ident, row['user_id'], message.message_id)
             if row['purpose'] == 'topup':
@@ -1603,12 +1622,15 @@ class Gateway:
         except Exception:
             pass
 
+    def can_auto_deliver(self, row):
+        return not self.is_prior_session(row) or (row['purpose'] == 'order' and row['id'] in self.requested_qr_ids)
+
     async def deliver_pending_qr(self, ident):
         """Send a recovered current-process invoice; old invoices stay opt-in."""
         if self.bot is None:
             return
         row = self.transaction(ident)
-        if (row['state'] != 'PENDING' or self.is_prior_session(row) or row['qr_messages']
+        if (row['state'] != 'PENDING' or not self.can_auto_deliver(row) or row['qr_messages']
                 or row['cancel_requested'] or not self.has_qr(row)):
             return
         call = SimpleNamespace(from_user=SimpleNamespace(id=row['user_id']), bot=self.bot)
@@ -2042,7 +2064,7 @@ class Gateway:
                 f'Autentikasi: {"Terverifikasi; merchant approved" if proof.get("approved") else "Belum terverifikasi"}\n'
                 'Status pembuatan invoice: ' + html.escape(health) + '\n'
                 'Sumber QR invoice terakhir: ' + qr_state + '\n'
-                'Profil diperiksa otomatis saat checkout; Cek Koneksi manual hanya opsional. '
+                'Profil dan invoice diperiksa otomatis saat checkout. '
                 'Pembayaran diverifikasi lewat API status; callback H2H tidak dipakai.\n'
                 'Kredensial tidak ditampilkan. Key KlikQRIS tidak dipakai untuk Payinaja.\n')
         for kind in ['connection', 'checkout', 'create', 'status', 'image', 'telegram', 'cancel', 'poll', 'cleanup']:
@@ -2060,7 +2082,6 @@ class Gateway:
         if note:
             text += '\n' + html.escape(note)
         await self.host.safe_edit_or_answer(call, text, parse_mode='HTML', reply_markup=self.owner_keyboard([
-            [('🔌 Cek Koneksi', 'connect', None)],
             [('🔴 Nonaktifkan' if self.enabled() else '🟢 Aktifkan Payinaja', 'toggle', 'off' if self.enabled() else 'on')],
             [('📊 Riwayat', 'history', '0'), ('⏳ Pending', 'pending', '0')],
             [('🔄 Rekonsiliasi', 'reconcile', None)],

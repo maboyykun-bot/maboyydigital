@@ -8,7 +8,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from klikqris_gateway import GatewayError, buyer_error, environment_value
 
 METHODS = frozenset({'KLIKQRIS_AUTO', 'PAYINAJA_AUTO'})
-ADAPTER_VERSION = '17.45'
+ADAPTER_VERSION = '17.46'
 
 
 def managed(row):
@@ -151,14 +151,19 @@ def other_pending(host, purpose, user, *, variant=None, qty=None, amount=None):
 async def checkout(host, call, bot, state, variant, qty):
     if not call.message or str(call.message.chat.type) != 'private' or call.message.chat.id != call.from_user.id:
         raise GatewayError('FORBIDDEN')
-    gateway, row = other_pending(host, 'order', call.from_user.id, variant=variant, qty=qty)
-    if row and gateway is host.PAYINAJA_GATEWAY and gateway.is_prior_session(row):
-        row = await gateway.prior_checkout(row['id'])
-        if row:
-            return await gateway.show_prior_hold(call, row['id'])
-        gateway = None
-    gateway = gateway or active(host)
+    await host.safe_callback_notice(call)
+    await host.safe_edit_or_answer(call, '⏳ <b>Menyiapkan QRIS Otomatis</b>\n\nMohon tunggu, bot sedang menyiapkan pembayaran.',
+        parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]]))
+    gateway = None
     try:
+        gateway, row = other_pending(host, 'order', call.from_user.id, variant=variant, qty=qty)
+        if row and gateway is host.PAYINAJA_GATEWAY and gateway.is_prior_session(row):
+            row = await gateway.prior_checkout(row['id'])
+            if row:
+                return await gateway.show_prior_hold(call, row['id'])
+            gateway = None
+        gateway = gateway or active(host)
         if row:
             # Read/check the old invoice. Never replace it using another provider.
             if gateway is host.PAYINAJA_GATEWAY and row['cancel_requested']:
@@ -166,8 +171,39 @@ async def checkout(host, call, bot, state, variant, qty):
             return await gateway.show_status(call, row['id'])
         return await gateway.checkout(call, bot, state, variant, qty)
     except (GatewayError, sqlite3.Error) as exc:
-        exc.provider = 'payinaja' if gateway is host.PAYINAJA_GATEWAY else 'klikqris'
+        if gateway is not None:
+            exc.provider = 'payinaja' if gateway is host.PAYINAJA_GATEWAY else 'klikqris'
+        row = None
+        try:
+            if gateway is host.PAYINAJA_GATEWAY:
+                row = gateway.resumable('order', call.from_user.id, variant=variant, qty=qty)
+            elif gateway is not None:
+                row = gateway.one("""SELECT t.* FROM klikqris_transactions t JOIN orders n ON n.id=t.entity_id
+                    WHERE t.purpose='order' AND t.user_id=? AND n.variant_id=? AND n.qty=?
+                    AND t.state IN ('NEW','REQUESTING','CREATE_UNKNOWN','PENDING','PAID_VERIFIED','CANCELLED_LOCAL')
+                    AND NOT EXISTS(SELECT 1 FROM klikqris_settings s WHERE s.key='archived_'||t.id)
+                    ORDER BY t.created_at DESC LIMIT 1""", (call.from_user.id, variant, qty))
+        except (GatewayError, sqlite3.Error):
+            pass
+        if row is not None:
+            await host.safe_edit_or_answer(call, gateway.status_text(row) + '\nBot melanjutkan pemeriksaan secara otomatis.',
+                parse_mode='HTML', reply_markup=gateway.user_keyboard(row))
+        else:
+            await host.safe_edit_or_answer(call, checkout_error_text(exc), parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]]))
         raise
+
+
+def checkout_error_text(exc):
+    code = getattr(exc, 'code', '')
+    if code in {'STOCK', 'FORBIDDEN', 'RATE_LIMIT', 'LIMIT'}:
+        return {'STOCK': 'Stok tidak mencukupi.', 'FORBIDDEN': 'Akses pembayaran ditolak.',
+                'RATE_LIMIT': 'Terlalu banyak permintaan pembayaran. Tunggu sebentar.',
+                'LIMIT': 'Batas pembelian tercapai. Hubungi owner.'}[code]
+    if code in {'AUTH', 'MERCHANT_INACTIVE', 'CONFIG', 'NOT_READY'}:
+        return 'QRIS Otomatis belum tersedia. Hubungi owner untuk memeriksa pengaturan pembayaran.'
+    return 'QRIS belum dapat ditampilkan. Status invoice tetap diperiksa otomatis; hubungi owner jika belum muncul.'
 
 
 async def prompt_buyer_cancel(host, call, purpose, entity):
