@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.49"
+BOT_VERSION = "17.50"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -7934,6 +7934,7 @@ async def transaction_self_test():
 
     # Read-only readiness: provider choice does not create or authenticate invoices.
     auto_healthy = False
+    auto_untested = False
     try:
         chosen=automatic_qris.selected(_otp_sys.modules[__name__])
         gateway_settings=KLIKQRIS_GATEWAY.settings()
@@ -7952,6 +7953,7 @@ async def transaction_self_test():
         checks.append(("Payinaja API",optional_payi or payi_verified,"GET profil approved" if payi_verified else "belum terverifikasi; tidak membuat invoice uji"))
         checks.append(("Payinaja Create",optional_payi or payi_create,payi_detail))
         auto_healthy=(klik_ready and klik_verified and create_ok) if chosen=="klikqris" else (payi_ready and payi_verified and payi_create)
+        auto_untested=chosen=="payinaja" and payi_ready and payi_verified and payi_create is None
     except (sqlite3.Error,klikqris_gateway.GatewayError):
         checks.append(("QRIS Otomatis",False,"CONFIG/SQLITE: pengaturan belum dapat dibaca"))
     qris_ready = bool(get_setting("qris_file_id",""))
@@ -7969,11 +7971,19 @@ async def transaction_self_test():
     ))
     checks.append((
         "Pembayaran",
-        bool(qris_ready or bank_ready or auto_healthy),
-        "ready" if (qris_ready or bank_ready or auto_healthy) else "Belum ada metode pembayaran terverifikasi siap"
+        True if (qris_ready or bank_ready or auto_healthy) else None if auto_untested else False,
+        "ready" if (qris_ready or bank_ready or auto_healthy) else "Belum diuji: create QRIS belum terverifikasi; checkout tetap dapat membuat invoice." if auto_untested else "Belum ada metode pembayaran terverifikasi siap"
     ))
 
     return checks
+
+
+def self_test_groups(checks):
+    """Keep an untested payment capability separate from pass/fail totals."""
+    passed, failed, untested = [], [], []
+    for check in checks:
+        (untested if check[1] is None else passed if check[1] else failed).append(check)
+    return passed, failed, untested
 
 
 def system_health_score():
@@ -32473,7 +32483,7 @@ async def render_owner_diagnostics(call: CallbackQuery, bot: Bot):
 
     for name, (ok, detail) in merged.items():
         lines.append(
-            f"{'✅' if ok else '❌'} {html.escape(str(name))}: "
+            f"{'⏳' if ok is None else '✅' if ok else '❌'} {html.escape(str(name))}: "
             f"{html.escape(str(detail))}"
         )
 
@@ -35654,12 +35664,12 @@ async def owner_selftest_v2(call: CallbackQuery,bot: Bot):
     inv2=inventory_integrity_v2(conn)
     _sig,alerts=smart_alert_signature(conn)
     conn.close()
-    failed=[x for x in checks if not x[1]]
+    passed,failed,untested=self_test_groups(checks)
 
     lines=[
         "🧪 <b>SELF-TEST v2</b>","",
-        f"✅ Lolos: <b>{len(checks)-len(failed)}/{len(checks)}</b>",
-        f"{'✅' if not failed else '⚠️'} Status: <b>{'SIAP' if not failed else 'PERLU PEMERIKSAAN'}</b>",
+        f"✅ Lolos: <b>{len(passed)}/{len(checks)}</b>",
+        f"{'✅' if not failed and not untested else '⚠️'} Status: <b>{'PERLU PEMERIKSAAN' if failed else 'BELUM SEMUA DIUJI' if untested else 'SIAP'}</b>",
         "",
         "📦 <b>Inventory Integrity v2</b>",
         f"• Available punya order: <b>{inv2['available_with_order']}</b>",
@@ -35678,6 +35688,10 @@ async def owner_selftest_v2(call: CallbackQuery,bot: Bot):
     if failed:
         lines += ["","❌ <b>Perlu diperiksa</b>"]
         for name,_ok,detail in failed:
+            lines.append(f"• {html.escape(name)}: {html.escape(str(detail))}")
+    if untested:
+        lines += ["","⏳ <b>Belum diuji</b>"]
+        for name,_ok,detail in untested:
             lines.append(f"• {html.escape(name)}: {html.escape(str(detail))}")
 
     await safe_edit_or_answer(
@@ -35910,10 +35924,10 @@ async def owner_recovery_selftest(call: CallbackQuery):
     conn=db()
     inv2=inventory_integrity_v2(conn)
     conn.close()
-    failed=[x for x in checks if not x[1]]
+    passed,failed,untested=self_test_groups(checks)
     lines=[
         "🧪 <b>SELF-TEST • RECOVERY</b>","",
-        f"✅ Lolos: <b>{len(checks)-len(failed)}/{len(checks)}</b>",
+        f"✅ Lolos: <b>{len(passed)}/{len(checks)}</b>",
         f"📦 Allocated orphan: <b>{inv2['allocated_without_order']}</b>",
         f"📦 Sold orphan: <b>{inv2['sold_without_order']}</b>",
         f"📨 Delivered tanpa sold item: <b>{inv2['delivered_without_sold']}</b>",
@@ -35922,6 +35936,10 @@ async def owner_recovery_selftest(call: CallbackQuery):
     if failed:
         lines += ["","❌ <b>Perlu diperiksa</b>"]
         for name,_ok,detail in failed:
+            lines.append(f"• {html.escape(name)}: {html.escape(str(detail))}")
+    if untested:
+        lines += ["","⏳ <b>Belum diuji</b>"]
+        for name,_ok,detail in untested:
             lines.append(f"• {html.escape(name)}: {html.escape(str(detail))}")
     await safe_edit_or_answer(
         call,
@@ -36678,16 +36696,19 @@ async def silent_recovery_loop(bot: Bot):
     try:
         results = await startup_recovery_audit(bot)
         txchecks=await transaction_self_test()
-        failed_checks=[name for name,ok,detail in txchecks if not ok]
+        passed,failed,untested=self_test_groups(txchecks)
+        failed_checks=[name for name,ok,detail in failed]
+        untested_checks=[name for name,ok,detail in untested]
 
         if ADMIN_ID:
             try:
                 await bot.send_message(
                     ADMIN_ID,
                     "🩺 <b>STARTUP CHECK • MABOYY DIGITAL</b>\n\n"
-                    f"{'✅ Sistem siap' if not failed_checks else '⚠️ Perlu pemeriksaan'}\n"
-                    f"🧪 Self-test: <b>{len(txchecks)-len(failed_checks)}/{len(txchecks)} lolos</b>\n"
+                    f"{'⚠️ Perlu pemeriksaan' if failed_checks else '⏳ Belum semua diuji' if untested_checks else '✅ Sistem siap'}\n"
+                    f"🧪 Self-test: <b>{len(passed)}/{len(txchecks)} lolos</b>\n"
                     + (f"❌ Gagal: <b>{html.escape(', '.join(failed_checks))}</b>\n" if failed_checks else "")
+                    + (f"⏳ Belum diuji: <b>{html.escape(', '.join(untested_checks))}</b>\n" if untested_checks else "")
                     + "\n♻️ <b>Recovery</b>\n"
                     f"✅ Order recovered: <b>{results['recovered_orders']}</b>\n"
                     f"📦 Paid belum terkirim: <b>{results['pending_orders']}</b>\n"
@@ -36715,7 +36736,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.49"
+EXPECTED_SOURCE_VERSION = "17.50"
 
 
 def source_integrity_self_test():

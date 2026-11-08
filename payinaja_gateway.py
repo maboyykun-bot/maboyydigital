@@ -40,7 +40,7 @@ PREFIX = 'payi:'
 LABEL = '⚡ QRIS Otomatis'
 FINAL = {'SETTLED', 'SETTLED_BALANCE', 'FAILED', 'CANCELLED'}
 TX_PREFIX = 'payinaja.tx.'
-ADAPTER_VERSION = '17.49'
+ADAPTER_VERSION = '17.50'
 QR_BLOCKING_ERRORS = frozenset({'SCHEMA', 'MISMATCH', 'AUTH', 'ACCOUNT_CHANGED', 'DUPLICATE_REFERENCE'})
 DENIAL_LIMIT = 16384
 
@@ -907,13 +907,15 @@ class Gateway:
                      fingerprint=self.fingerprint()))
 
     def creation_health(self):
+        # None means no create was observed with this configuration. It is not
+        # success, and it must not be reported as a failed production request.
         proof = self.setting('create', {})
         if not isinstance(proof, dict) or proof.get('fingerprint') != self.fingerprint():
             profile = self.proof()
             if profile.get('error'):
-                return False, ('Belum diuji: akses API/profil belum berhasil (HTTP ' +
+                return None, ('Belum diuji: akses API/profil belum berhasil (HTTP ' +
                                str(profile.get('http_status') or '-') + '). Self-test tidak membuat invoice.')
-            return False, 'Belum ada bukti create dengan key aktif. Self-test tidak membuat invoice.'
+            return None, 'Belum diuji: belum ada bukti create dengan key aktif. Self-test tidak membuat invoice.'
         if proof.get('error') and not proof.get('resolved_at'):
             return False, str(proof['error']) + ' • HTTP ' + str(proof.get('http_status') or '-')
         return bool(proof.get('success') or proof.get('resolved_at')), 'Metadata create terakhir tervalidasi / direkonsiliasi.'
@@ -1050,10 +1052,12 @@ class Gateway:
                 row = self.transaction(ident, conn=conn)
                 if (row['state'] == 'PENDING' and not row['cancel_requested'] and not row.get('retention_done')
                         and row['error'] not in QR_BLOCKING_ERRORS):
+                    detail = dict(stage='image', code='OK', http_status=200,
+                        checked_at=time.time(), correlation_id=secrets.token_hex(8), fingerprint=self.fingerprint())
                     row['qris_cipher'], row['error'] = encrypted, ''
+                    row['qr_diagnostic'] = detail
                     self.save(conn, row)
-                    self.put(conn, 'diagnostic.image', dict(stage='image', code='OK', http_status=200,
-                        checked_at=time.time(), correlation_id=secrets.token_hex(8), fingerprint=self.fingerprint()))
+                    self.put(conn, 'diagnostic.image', detail)
         except GatewayError as exc:
             if exc.code in {'IMAGE', 'MISMATCH', 'SCHEMA'} or exc.code.startswith('QR_'):
                 exc.http_status = 200
@@ -1065,6 +1069,7 @@ class Gateway:
                         and row.get('diagnostic', {}).get('schema') == exc.schema_hint):
                     row['error'] = 'IMAGE'
                     row['diagnostic'] = self.diagnostic(exc, 'image', conn=conn)
+                    row['qr_diagnostic'] = row['diagnostic']
                     self.save(conn, row)
 
     async def prepare_qr(self, ident):
@@ -1118,16 +1123,19 @@ class Gateway:
                     current.update(qr_image_cipher=encrypted, error='', image_retry_at=0)
                     if data['qris_image_url'].startswith('data:image/'):
                         current['qr_source_cipher'] = None  # No duplicate large inline copy.
+                    detail = dict(stage='image', code='OK_ORIGINAL_IMAGE', http_status=200,
+                        checked_at=time.time(), correlation_id=secrets.token_hex(8), fingerprint=self.fingerprint())
+                    current['qr_diagnostic'] = detail
                     self.save(conn, current)
-                    self.put(conn, 'diagnostic.image', dict(stage='image', code='OK_ORIGINAL_IMAGE', http_status=200,
-                        checked_at=time.time(), correlation_id=secrets.token_hex(8), fingerprint=self.fingerprint()))
+                    self.put(conn, 'diagnostic.image', detail)
         except GatewayError as exc:
             exc.schema_hint = qr_source_shape(data)
             detail = self.diagnostic(exc, 'image')
             with self.connection(True) as conn:
                 current = self.transaction(ident, conn=conn)
                 if current['state'] == 'PENDING' and current['error'] not in QR_BLOCKING_ERRORS and not self.has_qr(current):
-                    current.update(error='IMAGE', diagnostic=detail, image_retry_at=time.time() + max(5, exc.retry_after))
+                    current.update(error='IMAGE', diagnostic=detail, qr_diagnostic=detail,
+                                   image_retry_at=time.time() + max(5, exc.retry_after))
                     self.save(conn, current)
         finally:
             with self.connection(True) as conn:
@@ -1177,7 +1185,7 @@ class Gateway:
                     with self.connection(True) as conn:
                         current = self.transaction(ident, conn=conn)
                         if current['state'] == 'PENDING':
-                            current.update(error='IMAGE', diagnostic=detail)
+                            current.update(error='IMAGE', diagnostic=detail, qr_diagnostic=detail)
                             self.save(conn, current)
                 except sqlite3.Error:
                     pass  # The durable invoice/source is retained even while storage is unavailable.
@@ -1738,7 +1746,20 @@ class Gateway:
             raw = (render_qris(self.crypt(row['qris_cipher'], ident, decrypt=True), row['total_amount']) if row.get('qris_cipher') else
                    self.api.image_valid(base64.b64decode(self.crypt(row['qr_image_cipher'], ident, decrypt=True), validate=True)))
         except (GatewayError, ValueError, TypeError) as exc:
-            self.diagnostic(exc if isinstance(exc, GatewayError) else GatewayError('IMAGE'), 'image')
+            detail = self.diagnostic(exc if isinstance(exc, GatewayError) else GatewayError('IMAGE'), 'image')
+            with self.connection(True) as conn:
+                current = self.transaction(ident, conn=conn)
+                current['qr_diagnostic'] = detail
+                # An unreadable cached image must not permanently block recovery
+                # from the retained, authenticated source of this SAME invoice.
+                # Keep ciphertext on key/decryption or amount failures.
+                if (detail['code'] == 'IMAGE' and current['state'] == 'PENDING'
+                        and not current['cancel_requested'] and current['error'] not in QR_BLOCKING_ERRORS
+                        and current.get('qr_source_cipher')
+                        and current.get('qris_cipher') == row.get('qris_cipher')
+                        and current.get('qr_image_cipher') == row.get('qr_image_cipher')):
+                    current.update(qris_cipher=None, qr_image_cipher=None, error='IMAGE', image_retry_at=0)
+                self.save(conn, current)
             if automatic:
                 return
             return await self.host.safe_edit_or_answer(call, self.status_text(row) + '\nGambar QR belum dapat dibuka; tidak ada invoice baru dibuat.',
@@ -1775,10 +1796,11 @@ class Gateway:
             except Exception as exc:
                 delay = max(30, min(3600, float(getattr(exc, 'retry_after', 0) or 0)))
                 status = 429 if isinstance(exc, TelegramRetryAfter) else 403 if isinstance(exc, TelegramForbiddenError) else 400 if isinstance(exc, TelegramBadRequest) else 0
-                self.diagnostic(GatewayError('TELEGRAM', http_status=status), 'telegram')
+                detail = self.diagnostic(GatewayError('TELEGRAM', http_status=status), 'telegram')
                 with self.connection(True) as conn:
                     current = self.transaction(ident, conn=conn)
                     current['qr_send_retry_at'] = time.time() + delay
+                    current['qr_diagnostic'] = detail
                     self.save(conn, current)
                 if automatic:
                     return
@@ -1792,9 +1814,11 @@ class Gateway:
             with self.connection(True) as conn:
                 current = self.transaction(ident, conn=conn)
                 current['qr_send_retry_at'] = 0
+                detail = dict(stage='telegram', code='OK', http_status=200,
+                    checked_at=time.time(), correlation_id=secrets.token_hex(8), fingerprint=self.fingerprint())
+                current['qr_diagnostic'] = detail
                 self.save(conn, current)
-                self.put(conn, 'diagnostic.telegram', dict(stage='telegram', code='OK', http_status=200,
-                    checked_at=time.time(), correlation_id=secrets.token_hex(8), fingerprint=self.fingerprint()))
+                self.put(conn, 'diagnostic.telegram', detail)
         finally:
             with self.connection(True) as conn:
                 current = self.transaction(ident, conn=conn)
@@ -2366,6 +2390,14 @@ class Gateway:
         row = self.transaction(ident, call.from_user.id, admin=True)
         text = self.status_text(row) + '\nProvider: Payinaja\nRef: ' + html.escape(row['reference'])
         text += '\nID provider: ' + html.escape(row['provider_id'] or '-') + '\nKode: ' + html.escape(row['error'] or '-')
+        text += '\nSumber QR: ' + ('tersedia' if self.has_qr(row) else 'belum tersedia')
+        text += '\nPesan QR tercatat: ' + ('ada' if row['qr_messages'] else 'tidak ada')
+        qr_detail = row.get('qr_diagnostic')
+        if qr_detail:
+            text += ('\nPemrosesan QR terakhir: ' + html.escape(qr_detail['stage']) +
+                     ' • Kode: ' + html.escape(qr_detail['code']) + ' • HTTP: ' + str(qr_detail.get('http_status') or '-') +
+                     '\nWaktu: ' + self.host.payment_receipts.format_wib(qr_detail['checked_at'], compact=True) +
+                     ' • ID: ' + html.escape(qr_detail['correlation_id']))
         detail = row.get('diagnostic')
         if detail and row['error']:
             text += ('\nTahap: ' + html.escape(detail['stage']) + ' • HTTP: ' + str(detail.get('http_status') or '-') +
