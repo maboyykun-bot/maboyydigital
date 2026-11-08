@@ -40,7 +40,7 @@ PREFIX = 'payi:'
 LABEL = '⚡ QRIS Otomatis'
 FINAL = {'SETTLED', 'SETTLED_BALANCE', 'FAILED', 'CANCELLED'}
 TX_PREFIX = 'payinaja.tx.'
-ADAPTER_VERSION = '17.48'
+ADAPTER_VERSION = '17.49'
 QR_BLOCKING_ERRORS = frozenset({'SCHEMA', 'MISMATCH', 'AUTH', 'ACCOUNT_CHANGED', 'DUPLICATE_REFERENCE'})
 DENIAL_LIMIT = 16384
 
@@ -1493,12 +1493,17 @@ class Gateway:
         await self.host.safe_callback_notice(call)
         await self.ensure_profile()  # Automatic auth after acknowledging the click, before invoice creation.
 
-    async def checkout(self, call, bot, state, variant_id, qty):
+    async def checkout(self, call, bot, state, variant_id, qty, *, request_id=None):
         await self.buyer_guard(call)
         qty = money(qty, positive=True)
         data = await state.get_data()
         note = self.host.get_checkout_note_from_state(data)
-        prior = self.resumable('order', call.from_user.id, variant=variant_id, qty=qty)
+        def request_row(conn=None):
+            if request_id is not None:
+                return self.host.automatic_qris.checkout_request_row(self.host, 'payinaja', call.from_user.id,
+                    variant_id, qty, request_id, conn=conn)
+            return self.resumable('order', call.from_user.id, variant=variant_id, qty=qty, conn=conn)
+        prior = request_row() if request_id is None else None
         if prior and self.is_prior_session(prior):
             prior = await self.prior_checkout(prior['id'])
             if prior:
@@ -1511,12 +1516,12 @@ class Gateway:
                 or not self.host.valid_family_gmail(data.get('family_gmail', ''))):
             return await self.host.require_family_checkout_gmail(call, state, product, variant_id, qty, data)
         async with self.host.purchase_lock(call.from_user.id):
-            if not self.resumable('order', call.from_user.id, variant=variant_id, qty=qty):
+            if not request_row():
                 allowed, _ = self.host.anti_abuse_checkout(call.from_user.id, METHOD)
                 if not allowed:
                     raise GatewayError('LIMIT')
             with self.connection(True) as conn:
-                row = self.resumable('order', call.from_user.id, variant=variant_id, qty=qty, conn=conn)
+                row = request_row(conn)
                 if row is None:
                     variant = conn.execute('SELECT * FROM product_variants WHERE id=?', (variant_id,)).fetchone()
                     product = conn.execute('SELECT * FROM products WHERE id=?', (variant['product_id'],)).fetchone() if variant else None
@@ -1546,6 +1551,8 @@ class Gateway:
                         (call.from_user.id, call.from_user.username or '', product['id'], variant_id, qty, unit, subtotal,
                          METHOD, note, amount, datetime.now().isoformat(timespec='seconds'), voucher, discount)).lastrowid
                     row = self.reserve(conn, 'order', entity, call.from_user.id, amount)
+                    self.host.automatic_qris.save_checkout_request(self.host, 'payinaja', conn, call.from_user.id,
+                        variant_id, qty, request_id, row['id'])
             if row['state'] == 'NEW':
                 await self.host.safe_edit_or_answer(call, self.status_text(row),
                     reply_markup=self.user_keyboard(row), parse_mode='HTML')

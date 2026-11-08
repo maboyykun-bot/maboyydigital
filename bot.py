@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.48"
+BOT_VERSION = "17.49"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -4687,7 +4687,7 @@ def payment_method_keyboard(variant_id: int, qty: int):
         rows.append([
             InlineKeyboardButton(
                 text="⚡ QRIS Otomatis",
-                callback_data=f"processauto:{variant_id}:{qty}"
+                callback_data=automatic_qris.checkout_callback(variant_id,qty)
             )
         ])
 
@@ -23291,7 +23291,7 @@ async def payment_select(call: CallbackQuery):
     if auto_ready:
         kb.button(
             text="⚡ QRIS Otomatis",
-            callback_data=f"processauto:{variant_id}:{qty}"
+            callback_data=automatic_qris.checkout_callback(variant_id,qty)
         )
 
     kb.button(text="⬅️ Kembali", callback_data=f"variant:{variant_id}")
@@ -24075,10 +24075,11 @@ async def process_order(call: CallbackQuery, bot: Bot, state: FSMContext):
 
 @router.callback_query(F.data.startswith("processauto:"))
 async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
-    numbers = callback_positive_numbers(call.data, "processauto", 2)
-    if not numbers:
+    request = automatic_qris.parse_checkout_callback(_otp_sys.modules[__name__],call.data)
+    if not request:
         return await safe_callback_notice(call, "Variasi atau jumlah tidak valid.", show_alert=True)
-    variant_id, requested_qty = numbers
+    variant_id, requested_qty, request_id = request
+    request_id = request_id or automatic_qris.legacy_checkout_request(call,variant_id,requested_qty)
     qty = 1
     if safe_mode_enabled() and not is_owner(call.from_user.id):
         return await call.answer(
@@ -24089,7 +24090,7 @@ async def process_auto_order(call: CallbackQuery, bot: Bot, state: FSMContext):
         return await call.answer("Toko sedang maintenance. Silakan coba kembali nanti.", show_alert=True)
     if automatic_qris.handles_checkout(_otp_sys.modules[__name__]):
         try:
-            return await automatic_qris.checkout(_otp_sys.modules[__name__],call,bot,state,variant_id,requested_qty)
+            return await automatic_qris.checkout(_otp_sys.modules[__name__],call,bot,state,variant_id,requested_qty,request_id=request_id)
         except VoucherCheckoutError as exc:
             return await reject_checkout_voucher(call,state,variant_id,exc)
         except klikqris_gateway.GatewayError as exc:
@@ -36714,7 +36715,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.48"
+EXPECTED_SOURCE_VERSION = "17.49"
 
 
 def source_integrity_self_test():

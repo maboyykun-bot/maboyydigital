@@ -38,7 +38,7 @@ from types import SimpleNamespace
 from otp_smscode import TEXT_MENU_ACTIONS
 
 LABEL = '⚡ QRIS Otomatis'
-ADAPTER_VERSION = '17.48'
+ADAPTER_VERSION = '17.49'
 METHOD = 'KLIKQRIS_AUTO'
 PREFIX = 'aqris:'
 MAX_AMOUNT = 10**12
@@ -1496,7 +1496,7 @@ class Gateway:
             if state is not None:await state.clear()
             await self.show_payment(call,tx['id'])
 
-    async def checkout(self,call,bot,state,variant_id,qty):
+    async def checkout(self,call,bot,state,variant_id,qty,*,request_id=None):
         await self.buyer_guard(call)
         qty=money(qty,positive=True)
         data=await state.get_data()
@@ -1519,13 +1519,16 @@ class Gateway:
             ORDER BY t.created_at DESC LIMIT 1'''
         lookup_args=(call.from_user.id,variant_id,qty)
         async with self.host.purchase_lock(call.from_user.id):
-            if not self.one(lookup_sql,lookup_args):
+            existing=(self.host.automatic_qris.checkout_request_row(self.host,'klikqris',call.from_user.id,variant_id,qty,request_id)
+                      if request_id is not None else self.one(lookup_sql,lookup_args))
+            if not existing:
                 # The guard can write security events; keep it outside BEGIN
                 # IMMEDIATE and apply it only when creating a new native order.
                 allowed,_=self.host.anti_abuse_checkout(call.from_user.id,METHOD)
                 if not allowed:raise GatewayError('LIMIT')
             with self.connection(True) as conn:
-                row=conn.execute(lookup_sql,lookup_args).fetchone()
+                row=(self.host.automatic_qris.checkout_request_row(self.host,'klikqris',call.from_user.id,variant_id,qty,request_id,conn=conn)
+                     if request_id is not None else conn.execute(lookup_sql,lookup_args).fetchone())
                 if row:tx=dict(row)
                 else:
                     variant=conn.execute('SELECT * FROM product_variants WHERE id=?',(variant_id,)).fetchone()
@@ -1548,6 +1551,9 @@ class Gateway:
                         (call.from_user.id,call.from_user.username or '',product['id'],variant_id,qty,unit,subtotal,METHOD,note,amount,
                          datetime.now().isoformat(timespec='seconds'),voucher,discount)).lastrowid
                     tx=self.reserve(conn,'order',ident,call.from_user.id,amount)
+                    if request_id is not None:
+                        self.host.automatic_qris.save_checkout_request(self.host,'klikqris',conn,call.from_user.id,
+                            variant_id,qty,request_id,tx['id'])
             if tx['state']=='NEW':
                 await self.host.safe_edit_or_answer(call,self.status_text(tx),reply_markup=self.user_keyboard(tx),parse_mode='HTML')
             resumed=await self.resume(tx['id'])

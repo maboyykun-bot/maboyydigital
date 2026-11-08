@@ -1,5 +1,9 @@
 """Choose a provider for NEW invoices; existing payments keep their original provider."""
 import os
+import hashlib
+import json
+import re
+import secrets
 import sqlite3
 
 from aiogram import F
@@ -8,7 +12,108 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from klikqris_gateway import GatewayError, buyer_error, environment_value
 
 METHODS = frozenset({'KLIKQRIS_AUTO', 'PAYINAJA_AUTO'})
-ADAPTER_VERSION = '17.48'
+ADAPTER_VERSION = '17.49'
+
+
+def checkout_callback(variant, qty):
+    return f'processauto:{variant}:{qty}:{secrets.token_hex(8)}'
+
+
+def parse_checkout_callback(host, data):
+    parts = str(data or '').split(':')
+    if len(parts) not in {3, 4} or parts[0] != 'processauto':
+        return None
+    token = parts[3] if len(parts) == 4 else None
+    if token is not None and not re.fullmatch('[0-9a-f]{16}', token):
+        return None
+    numbers = host.callback_positive_numbers(':'.join(parts[:3]), 'processauto', 2)
+    return (*numbers, token) if numbers else None
+
+
+def legacy_checkout_request(call, variant, qty):
+    """Give old Telegram shop buttons a stable attempt identity as well."""
+    message_id = getattr(getattr(call, 'message', None), 'message_id', None)
+    user = getattr(getattr(call, 'from_user', None), 'id', None)
+    if any(type(value) is not int or value <= 0 for value in (message_id, user, variant, qty)):
+        return None
+    return hashlib.sha256(f'legacy-shop:{user}:{message_id}:{variant}:{qty}'.encode()).hexdigest()[:16]
+
+
+def _request_key(user, variant, qty, token):
+    if (any(type(value) is not int or value <= 0 for value in (user, variant, qty))
+            or not isinstance(token, str) or not re.fullmatch('[0-9a-f]{16}', token)):
+        raise GatewayError('INPUT')
+    return 'auto_qris_request:' + str(user) + ':' + token
+
+
+def load_checkout_request(host, user, variant, qty, token, conn=None):
+    if token is None:
+        return None
+    key = _request_key(user, variant, qty, token)
+    own = conn is None
+    conn = host.db() if own else conn
+    try:
+        found = conn.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+        if found is None:
+            return None
+        try:
+            if not isinstance(found[0], (str, bytes)) or len(found[0]) > 2048:
+                raise ValueError
+            data = json.loads(found[0])
+            if (not isinstance(data, dict) or type(data.get('version')) is not int or data['version'] != 1
+                    or data.get('provider') not in {'klikqris', 'payinaja'}
+                    or any(type(data.get(field)) is not int for field in ('user_id', 'variant_id', 'qty'))
+                    or not isinstance(data.get('transaction_id'), str)
+                    or not re.fullmatch('[A-Za-z0-9_-]{1,96}', data['transaction_id'])):
+                raise ValueError
+        except (ValueError, TypeError, UnicodeError):
+            raise GatewayError('STORAGE') from None
+        if (data['user_id'], data['variant_id'], data['qty']) != (user, variant, qty):
+            raise GatewayError('INPUT')
+        return data
+    finally:
+        if own:
+            conn.close()
+
+
+def checkout_request_row(host, provider, user, variant, qty, token, conn=None):
+    own = conn is None
+    conn = host.db() if own else conn
+    try:
+        record = load_checkout_request(host, user, variant, qty, token, conn=conn)
+        if record is None:
+            return None
+        if record['provider'] != provider:
+            raise GatewayError('CHECKOUT_BOUND')
+        if provider == 'payinaja':
+            row = host.PAYINAJA_GATEWAY.transaction(record['transaction_id'], user, conn=conn)
+        else:
+            found = conn.execute('SELECT * FROM klikqris_transactions WHERE id=? AND user_id=?',
+                                 (record['transaction_id'], user)).fetchone()
+            if found is None:
+                raise GatewayError('STORAGE')
+            row = dict(found)
+        native = conn.execute('SELECT * FROM orders WHERE id=? AND user_id=? AND variant_id=? AND qty=?',
+                              (row['entity_id'], user, variant, qty)).fetchone()
+        expected = 'PAYINAJA_AUTO' if provider == 'payinaja' else 'KLIKQRIS_AUTO'
+        if row['purpose'] != 'order' or not native or native['payment_method'] != expected:
+            raise GatewayError('STORAGE')
+        return row
+    finally:
+        if own:
+            conn.close()
+
+
+def save_checkout_request(host, provider, conn, user, variant, qty, token, transaction_id):
+    if token is None:
+        return
+    key = _request_key(user, variant, qty, token)
+    if provider not in {'klikqris', 'payinaja'} or not re.fullmatch('[A-Za-z0-9_-]{1,96}', transaction_id):
+        raise GatewayError('INPUT')
+    record = dict(version=1, user_id=user, provider=provider, variant_id=variant, qty=qty,
+                  transaction_id=transaction_id)
+    # Immutable request identity is committed atomically with its order/reservation.
+    conn.execute('INSERT INTO settings(key,value) VALUES(?,?)', (key, json.dumps(record, sort_keys=True)))
 
 
 def managed(row):
@@ -148,7 +253,7 @@ def other_pending(host, purpose, user, *, variant=None, qty=None, amount=None):
     return (gateway, row) if row else (None, None)
 
 
-async def checkout(host, call, bot, state, variant, qty):
+async def checkout(host, call, bot, state, variant, qty, *, request_id=None):
     if not call.message or str(call.message.chat.type) != 'private' or call.message.chat.id != call.from_user.id:
         raise GatewayError('FORBIDDEN')
     await host.safe_callback_notice(call)
@@ -157,6 +262,15 @@ async def checkout(host, call, bot, state, variant, qty):
             [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]]))
     gateway = None
     try:
+        if request_id is not None:
+            record = load_checkout_request(host, call.from_user.id, variant, qty, request_id)
+            name = record['provider'] if record else selected(host)
+            gateway = host.PAYINAJA_GATEWAY if name == 'payinaja' else host.KLIKQRIS_GATEWAY
+            if record:
+                row = checkout_request_row(host, name, call.from_user.id, variant, qty, request_id)
+                if row['state'] != 'NEW':
+                    return await gateway.show_status(call, row['id'])
+            return await gateway.checkout(call, bot, state, variant, qty, request_id=request_id)
         gateway, row = other_pending(host, 'order', call.from_user.id, variant=variant, qty=qty)
         if row and gateway is host.PAYINAJA_GATEWAY and gateway.is_prior_session(row):
             row = await gateway.prior_checkout(row['id'])
@@ -171,11 +285,20 @@ async def checkout(host, call, bot, state, variant, qty):
             return await gateway.show_status(call, row['id'])
         return await gateway.checkout(call, bot, state, variant, qty)
     except (GatewayError, sqlite3.Error) as exc:
+        if getattr(exc, 'code', '') == 'CHECKOUT_BOUND' and request_id is not None:
+            record = load_checkout_request(host, call.from_user.id, variant, qty, request_id)
+            gateway = host.PAYINAJA_GATEWAY if record['provider'] == 'payinaja' else host.KLIKQRIS_GATEWAY
+            return await gateway.show_status(call, record['transaction_id'])
         if gateway is not None:
             exc.provider = 'payinaja' if gateway is host.PAYINAJA_GATEWAY else 'klikqris'
         row = None
         try:
-            if gateway is host.PAYINAJA_GATEWAY:
+            if request_id is not None:
+                record = load_checkout_request(host, call.from_user.id, variant, qty, request_id)
+                if record:
+                    gateway = host.PAYINAJA_GATEWAY if record['provider'] == 'payinaja' else host.KLIKQRIS_GATEWAY
+                    row = checkout_request_row(host, record['provider'], call.from_user.id, variant, qty, request_id)
+            elif gateway is host.PAYINAJA_GATEWAY:
                 row = gateway.resumable('order', call.from_user.id, variant=variant, qty=qty)
             elif gateway is not None:
                 row = gateway.one("""SELECT t.* FROM klikqris_transactions t JOIN orders n ON n.id=t.entity_id
