@@ -40,7 +40,7 @@ PREFIX = 'payi:'
 LABEL = '⚡ QRIS Otomatis'
 FINAL = {'SETTLED', 'SETTLED_BALANCE', 'FAILED', 'CANCELLED'}
 TX_PREFIX = 'payinaja.tx.'
-ADAPTER_VERSION = '17.51'
+ADAPTER_VERSION = '17.52'
 QR_BLOCKING_ERRORS = frozenset({'SCHEMA', 'MISMATCH', 'AUTH', 'ACCOUNT_CHANGED', 'DUPLICATE_REFERENCE'})
 DENIAL_LIMIT = 16384
 
@@ -546,7 +546,7 @@ class Client:
                 reference(row.get('trx_id'))
             return data
         except GatewayError as exc:
-            raise self.validation_context(exc, 'GET /transactions')
+            raise self.validation_context(exc, 'GET /showtrx')
 
     async def cancel(self, ident):
         await self.request('POST', '/transaction/' + reference(ident) + '/cancel')
@@ -775,15 +775,30 @@ class Gateway:
         value = self.setting('enabled', self.config.enabled)
         return value is True
 
+    def selected_server(self, conn=None):
+        # An explicit owner choice overrides the hosting default for NEW invoices.
+        value = self.setting('server', None, conn)
+        value = self.config.server if value is None else value
+        if type(value) is not int or value not in {1, 2}:
+            raise GatewayError('CONFIG')
+        return value
+
+    def set_server(self, actor, server):
+        self.require_owner(actor)
+        if server is not None and (type(server) is not int or server not in {1, 2}):
+            raise GatewayError('INPUT')
+        with self.connection(True) as conn:
+            self.put(conn, 'server', server)
+
     def ready(self):
         try:
-            return self.config.valid() and self.enabled() and self.proof().get('approved') is True
+            return self.config.valid() and bool(self.selected_server()) and self.enabled() and self.proof().get('approved') is True
         except (sqlite3.Error, GatewayError):
             return False
 
     def can_attempt(self):
         try:
-            return self.config.valid() and self.enabled()
+            return self.config.valid() and bool(self.selected_server()) and self.enabled()
         except (sqlite3.Error, GatewayError):
             return False
 
@@ -918,20 +933,56 @@ class Gateway:
             self.put(conn, 'activation', dict(token=secrets.token_hex(12), state='disabled', lease_until=0,
                      fingerprint=self.fingerprint()))
 
+    def create_proof(self, server=None, conn=None):
+        server = self.selected_server(conn) if server is None else server
+        if type(server) is not int or server not in {1, 2}:
+            raise GatewayError('CONFIG')
+        proof = self.setting('create.server.' + str(server), None, conn)
+        if proof is None:
+            proof = self.setting('create', {}, conn)
+        if not isinstance(proof, dict) or proof.get('fingerprint') != self.fingerprint():
+            return {}
+        source = proof.get('server')
+        if source is None and proof.get('transaction_id'):
+            try:
+                source = self.transaction(proof['transaction_id'], conn=conn).get('server')
+            except GatewayError:
+                return {}  # Unbound legacy metadata is never authentication evidence.
+        if source is None:
+            source = {'POST /qris/create': 1, 'POST /qris/create2': 2}.get(proof.get('endpoint'))
+        if type(source) is not int or source != server:
+            return {}
+        return dict(proof, server=source, code=proof.get('code') or ('OK' if proof.get('success') else proof.get('error') or 'UNKNOWN'))
+
+    def record_create_proof(self, conn, proof, server):
+        proof = dict(proof, server=server, code=proof.get('code') or ('OK' if proof.get('success') else proof.get('error') or 'UNKNOWN'))
+        self.put(conn, 'create', proof)  # Compatibility alias: most recently completed request.
+        self.put(conn, 'create.server.' + str(server), proof)
+
+    def resolve_create_proof(self, conn, row, status):
+        for key in ('create', 'create.server.' + str(row['server'])):
+            proof = self.setting(key, {}, conn)
+            if (isinstance(proof, dict) and proof.get('transaction_id') == row['id']
+                    and proof.get('error') and not proof.get('resolved_at')):
+                proof.update(resolved_at=time.time(), resolution_http_status=200, resolution_status=status)
+                self.put(conn, key, proof)
+
     def creation_health(self):
         # None means no create was observed with this configuration. It is not
         # success, and it must not be reported as a failed production request.
-        proof = self.setting('create', {})
-        if not isinstance(proof, dict) or proof.get('fingerprint') != self.fingerprint():
+        proof = self.create_proof()
+        if not proof:
             profile = self.proof()
             if profile.get('error'):
                 return None, ('Belum diuji: akses API/profil belum berhasil (HTTP ' +
                                str(profile.get('http_status') or '-') + '). Self-test tidak membuat invoice.')
-            return None, 'Belum diuji: belum ada bukti create dengan key aktif. Self-test tidak membuat invoice.'
+            return None, 'Belum diuji: belum ada bukti create untuk server terpilih dengan key aktif. Self-test tidak membuat invoice.'
         if proof.get('error') and not proof.get('resolved_at'):
             return False, str(proof['error']) + ' • HTTP ' + str(proof.get('http_status') or '-')
         if proof.get('resolution_status') == 'FAILED':
             return False, 'Provider mengonfirmasi invoice gagal; QR tidak tersedia untuk tagihan tersebut.'
+        if proof.get('resolution_status') == 'CANCELLED':
+            return False, 'Invoice dibatalkan; belum ada bukti create berhasil untuk tagihan tersebut.'
         return bool(proof.get('success') or proof.get('resolved_at')), 'Metadata create terakhir tervalidasi / direkonsiliasi.'
 
     def _key(self):
@@ -984,7 +1035,7 @@ class Gateway:
         profile = self.proof(conn)
         row = dict(version=1, id=self.ident(purpose, entity), purpose=purpose, entity_id=entity, user_id=user,
                    reference='PA-' + purpose[0].upper() + '-' + str(entity) + '-' + secrets.token_hex(8),
-                   origin=self.config.base_url, server=self.config.server, account_binding=profile['account_binding'],
+                   origin=self.config.base_url, server=self.selected_server(conn), account_binding=profile['account_binding'],
                    amount=amount, fee=None, total_amount=None, provider_id=None, state='NEW',
                    created_at=time.time(), expires_at=time.time() + 900, next_poll_at=0, error='',
                    lease_owner=None, lease_until=0, cancel_requested=False, request_started_at=0,
@@ -1188,9 +1239,9 @@ class Gateway:
                 self.retain_qr_source(current, result)
                 self.native_invoice(conn, current)
                 self.save(conn, current)
-                self.put(conn, 'create', dict(success=True, error='', http_status=200, stage='create',
+                self.record_create_proof(conn, dict(success=True, error='', http_status=200, stage='create',
                     checked_at=time.time(), correlation_id=secrets.token_hex(8), transaction_id=ident,
-                    fingerprint=self.fingerprint(), endpoint='POST /qris/create' + ('2' if row['server'] == 2 else '')))
+                    fingerprint=self.fingerprint(), endpoint='POST /qris/create' + ('2' if row['server'] == 2 else '')), row['server'])
             try:
                 await self.prepare_qr(ident)
             except sqlite3.Error as exc:
@@ -1212,10 +1263,10 @@ class Gateway:
                                    next_poll_at=time.time() + max(15, getattr(exc, 'retry_after', 0)))
                     self.save(conn, current)
                     detail = self.diagnostic(exc, 'create', conn=conn)
-                    detail.update(error=detail['code'], success=False, transaction_id=ident)
+                    detail.update(error=detail['code'], success=False, transaction_id=ident, server=row['server'])
                     current['diagnostic'] = detail
                     self.save(conn, current)
-                    self.put(conn, 'create', detail)
+                    self.record_create_proof(conn, detail, row['server'])
             if not isinstance(exc, Exception):
                 raise
         return self.transaction(ident)
@@ -1350,10 +1401,7 @@ class Gateway:
                             self.put(conn, 'diagnostic.status', dict(stage='status', code='CONFIRMED_FAILED', http_status=200,
                                 checked_at=time.time(), correlation_id=secrets.token_hex(8), fingerprint=self.fingerprint(), transaction_id=ident))
                             self.save(conn, current)
-                            create = self.setting('create', {}, conn)
-                            if create.get('transaction_id') == ident and create.get('error') and not create.get('resolved_at'):
-                                create.update(resolved_at=time.time(), resolution_http_status=200, resolution_status='CANCELLED')
-                                self.put(conn, 'create', create)
+                            self.resolve_create_proof(conn, current, 'CANCELLED')
                     await self.retire_paid_messages(self.bot, ident)
                     return self.transaction(ident)
                 if lifecycle != 'PAID':
@@ -1391,10 +1439,7 @@ class Gateway:
                 if data['status'] != 'PENDING':
                     current['error'] = ''
                 self.save(conn, current)
-                create = self.setting('create', {}, conn)
-                if create.get('transaction_id') == ident and create.get('error') and not create.get('resolved_at'):
-                    create.update(resolved_at=time.time(), resolution_http_status=200, resolution_status=data['status'])
-                    self.put(conn, 'create', create)
+                self.resolve_create_proof(conn, current, data['status'])
             if prepare_image and not self.has_qr(self.transaction(ident)):
                 await self.prepare_qr(ident)
             if self.transaction(ident)['state'] == 'PAID_VERIFIED':
@@ -2351,11 +2396,15 @@ class Gateway:
     async def owner_panel(self, call, *, note=''):
         self.require_owner(call.from_user.id)
         proof = self.proof()
-        _, health = self.creation_health()
-        last = self.setting('create', {})
+        try:
+            server = self.selected_server()
+            _, health = self.creation_health()
+            last = self.create_proof(server)
+        except GatewayError:
+            server, last, health = None, {}, 'CONFIG: pilihan server perlu diperbaiki.'
         last_row = (self.transaction(last['transaction_id']) if last.get('transaction_id')
                     and last.get('fingerprint') == self.fingerprint() else None)
-        if last.get('checked_at', 0) < self.started_at:
+        if last and last.get('checked_at', 0) < self.started_at:
             health = 'Belum ada create pada proses ini; riwayat tetap tersimpan.'
         if last_row and self.is_prior_session(last_row):
             last_row = None
@@ -2366,15 +2415,16 @@ class Gateway:
                     'Belum tersedia; periksa diagnosis image dan detail invoice')
         text = ('👑 <b>PENGATURAN QRIS OTOMATIS</b>\n\nProvider: Payinaja\n'
                 f'Versi bot: {html.escape(self.host.BOT_VERSION)} • Gateway: {ADAPTER_VERSION}\n'
-                f'Server create: {self.config.server}\n'
+                f'Server create: {server or "Periksa pengaturan"} • Sumber: {"bot" if self.setting("server", None) is not None else "hosting/default"}\n'
                 f'Batas waktu create: {self.config.create_timeout} detik\n'
                 f'Izin membuat invoice: {"AKTIF" if self.enabled() else "NONAKTIF"}\n'
-                f'Konfigurasi: {"Tersedia" if self.config.valid() else "Periksa PAYINAJA_API_KEY / konfigurasi API"}\n'
+                f'Konfigurasi: {"Tersedia" if self.config.valid() and server is not None else "Periksa PAYINAJA_API_KEY / konfigurasi API"}\n'
                 f'Autentikasi: {"Terverifikasi; merchant approved" if proof.get("approved") else "Belum terverifikasi"}\n'
                 'Status pembuatan invoice: ' + html.escape(health) + '\n'
                 'Sumber QR invoice terakhir: ' + qr_state + '\n'
                 'Profil dan invoice diperiksa otomatis saat checkout. '
                 'Pembayaran diverifikasi lewat API status; callback H2H tidak dipakai.\n'
+                'Profil approved tidak membuktikan pembuatan QR berhasil.\n'
                 'Kredensial tidak ditampilkan. Key KlikQRIS tidak dipakai untuk Payinaja.\n')
         if proof.get('error') and not proof.get('approved'):
             text += ('\nPembayaran belum siap: ' + access_note(proof.get('error_denial'), proof.get('http_status')) +
@@ -2390,7 +2440,17 @@ class Gateway:
             text += '\n' + html.escape(note[:500]) + '\n'
         hidden = 0
         for kind in ['activation', 'connection', 'create', 'checkout', 'status', 'image', 'telegram', 'cancel', 'poll', 'cleanup']:
-            detail = self.setting('diagnostic.' + kind, {})
+            detail = last if kind == 'create' else self.setting('diagnostic.' + kind, {})
+            if kind == 'create' and not detail:
+                legacy = self.setting('diagnostic.create', {})
+                if isinstance(legacy, dict):
+                    source = legacy.get('server')
+                    if source is None:
+                        source = {'POST /qris/create': 1, 'POST /qris/create2': 2}.get(legacy.get('endpoint'))
+                    if type(source) is int and source == server:
+                        detail = legacy  # Preserve a known-route legacy failure, not creation proof.
+                    elif source is None:
+                        detail = dict(legacy, stage='create (server belum diketahui)')
             if not isinstance(detail, dict) or detail.get('fingerprint') != self.fingerprint():
                 continue
             if detail.get('checked_at', 0) < self.started_at:
@@ -2431,7 +2491,25 @@ class Gateway:
         controls += [
             [('📊 Riwayat', 'history', '0'), ('⏳ Pending', 'pending', '0')],
             [('🔄 Rekonsiliasi', 'reconcile', None)],
+            [('⚙️ Pilih Server QRIS', 'servers', None)],
             [('⚙️ Pilih Provider', 'providers', None)], [('⬅️ Pengaturan Pembayaran', 'back', None)]]
+        await self.host.safe_edit_or_answer(call, text, parse_mode='HTML', reply_markup=self.owner_keyboard(controls))
+
+    async def owner_server_menu(self, call):
+        self.require_owner(call.from_user.id)
+        try:
+            server = str(self.selected_server())
+        except GatewayError:
+            server = 'belum valid'
+        text = ('⚙️ <b>SERVER QRIS PAYINAJA</b>\n\nPilihan saat ini: ' + server + '\n'
+                'Server 1: POST /qris/create\nServer 2: POST /qris/create2\n\n'
+                'Pilihan bot disimpan dan diutamakan untuk invoice baru. Ikuti Hosting menghapus pilihan bot. '
+                'Memilih server tidak membuat invoice atau mengaktifkan pembayaran. '
+                'Invoice lama tetap memakai server asal dan tetap direkonsiliasi; tidak ada fallback otomatis.\n\n'
+                'HTTP 500 berarti create belum berhasil. Server lain belum dijamin tersedia; '
+                'QR hanya dikirim setelah API mengembalikan invoice dan sumber QR yang sah.')
+        controls = [[('Gunakan Server 1', 'server', '1'), ('Gunakan Server 2', 'server', '2')],
+                    [('Ikuti Hosting', 'server', 'env')], [('⬅️ QRIS Otomatis', 'menu', None)]]
         await self.host.safe_edit_or_answer(call, text, parse_mode='HTML', reply_markup=self.owner_keyboard(controls))
 
     async def owner_hosting_ip(self, call):
@@ -2574,6 +2652,13 @@ def register(router, gateway):
                 return
             if action == 'menu':
                 await gateway.owner_panel(call)
+            elif action == 'servers':
+                await gateway.owner_server_menu(call)
+            elif action == 'server':
+                if value not in {'1', '2', 'env'}:
+                    raise GatewayError('INPUT')
+                gateway.set_server(call.from_user.id, None if value == 'env' else int(value))
+                await gateway.owner_panel(call, note='Pilihan server untuk invoice baru disimpan. Tidak ada invoice dibuat.')
             elif action == 'connect':
                 await gateway.check_connection(call.from_user.id)
                 await gateway.owner_panel(call, note='Profil diperiksa; tidak ada invoice dibuat.')
