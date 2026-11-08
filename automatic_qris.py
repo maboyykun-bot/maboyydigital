@@ -12,7 +12,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from klikqris_gateway import GatewayError, buyer_error, environment_value
 
 METHODS = frozenset({'KLIKQRIS_AUTO', 'PAYINAJA_AUTO'})
-ADAPTER_VERSION = '17.52'
+ADAPTER_VERSION = '17.53'
 
 
 def checkout_callback(variant, qty):

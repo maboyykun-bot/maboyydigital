@@ -40,9 +40,117 @@ PREFIX = 'payi:'
 LABEL = '⚡ QRIS Otomatis'
 FINAL = {'SETTLED', 'SETTLED_BALANCE', 'FAILED', 'CANCELLED'}
 TX_PREFIX = 'payinaja.tx.'
-ADAPTER_VERSION = '17.52'
+ADAPTER_VERSION = '17.53'
 QR_BLOCKING_ERRORS = frozenset({'SCHEMA', 'MISMATCH', 'AUTH', 'ACCOUNT_CHANGED', 'DUPLICATE_REFERENCE'})
 DENIAL_LIMIT = 16384
+UPSTREAM_LIMIT = 16384
+
+
+async def upstream_context(response):
+    """Keep response-reported hints only, never the 5xx body or its values."""
+    result = dict(kind='unspecified', format='empty', source='http-status',
+                  origin_evidence='unproven', error_code='', shape={})
+    if str(response.headers.get('cf-mitigated', '')).casefold() == 'challenge':
+        result.update(kind='edge_challenge', format='unread', source='edge-header')
+        return result
+
+    async def read():
+        raw = bytearray()
+        async for chunk in response.content.iter_chunked(4096):
+            raw.extend(chunk[:UPSTREAM_LIMIT + 1 - len(raw)])
+            if len(raw) > UPSTREAM_LIMIT:
+                break
+        return bytes(raw)
+
+    try:
+        raw = await asyncio.wait_for(read(), timeout=3)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        result['format'] = 'unreadable'
+        return result
+    if len(raw) > UPSTREAM_LIMIT:
+        result['format'] = 'oversize'
+        return result
+    if not raw.strip():
+        return result
+    try:
+        data = json.loads(raw)
+    except RecursionError:
+        result['format'] = 'unreadable'
+        return result
+    except (ValueError, UnicodeError):
+        lower = raw.lower()
+        result['format'] = 'html' if b'<html' in lower or b'<!doctype html' in lower else 'text'
+        if result['format'] == 'html' and (b'challenge-platform' in lower or b'cf_chl_' in lower):
+            result.update(kind='edge_challenge', source='html-challenge')
+        return result
+    result['format'] = 'json'
+    if not isinstance(data, dict):
+        return result
+
+    def kind(value):
+        return ('null' if value is None else 'bool' if isinstance(value, bool) else
+                'string' if isinstance(value, str) else 'object' if isinstance(value, dict) else
+                'array' if isinstance(value, list) else 'number' if isinstance(value, (int, float)) else 'other')
+
+    result['shape'] = {name: kind(data[name]) for name in ('success', 'message', 'error', 'code', 'error_code', 'data') if name in data}
+    nested = data.get('error') if isinstance(data.get('error'), dict) else {}
+    for name in ('code', 'message'):
+        if name in nested:
+            result['shape']['error.' + name] = kind(nested[name])
+    mapping = {
+        'INVALID_API_KEY': 'credentials_rejected', 'API_KEY_INVALID': 'credentials_rejected',
+        'API_KEY_REVOKED': 'credentials_rejected', 'IP_NOT_ALLOWED': 'ip_restricted',
+        'IP_NOT_WHITELISTED': 'ip_restricted', 'IP_RESTRICTED': 'ip_restricted',
+        'MERCHANT_INACTIVE': 'merchant_restricted', 'MERCHANT_NOT_APPROVED': 'merchant_restricted',
+        'ACCOUNT_SUSPENDED': 'merchant_restricted', 'PERMISSION_DENIED': 'api_permission',
+        'PROVIDER_UNAVAILABLE': 'service_unavailable', 'SERVICE_UNAVAILABLE': 'service_unavailable',
+        'MAINTENANCE': 'service_unavailable', 'QRIS_GENERATION_FAILED': 'qr_generation_failed',
+        'QR_GENERATION_FAILED': 'qr_generation_failed', 'VALIDATION_ERROR': 'parameter_error',
+        'INVALID_AMOUNT': 'parameter_error', 'AMOUNT_TOO_LOW': 'parameter_error',
+        'INSUFFICIENT_BALANCE': 'balance_error', 'INSUFFICIENT_FUNDS': 'balance_error',
+        'DUPLICATE_REFERENCE': 'reference_conflict', 'REFERENCE_ALREADY_EXISTS': 'reference_conflict',
+    }
+    for value in (data.get('code'), data.get('error_code'), nested.get('code')):
+        if isinstance(value, str) and value.strip().upper() in mapping:
+            code = value.strip().upper()
+            result.update(kind=mapping[code], source='json-code', error_code=code)
+            return result
+    # A fixed phrase is a reported hint, never a conclusion about our key or
+    # the originating service. Unrecognized text is not persisted or displayed.
+    phrases = {
+        'qr_generation_failed': ('failed to generate qris', 'gagal membuat qris', 'qris generation failed'),
+        'service_unavailable': ('service unavailable', 'provider unavailable', 'under maintenance', 'sedang pemeliharaan'),
+        'credentials_rejected': ('invalid api key', 'api key tidak valid', 'api key revoked'),
+        'parameter_error': ('invalid parameter', 'parameter tidak valid', 'validation failed'),
+    }
+    for value in (data.get('message'), data.get('error'), nested.get('message')):
+        if isinstance(value, str):
+            text = value.casefold()
+            for category, values in phrases.items():
+                if any(phrase in text for phrase in values):
+                    result.update(kind=category, source='json-message')
+                    return result
+    return result
+
+
+def upstream_note(context):
+    notes = {
+        'credentials_rejected': 'Respons 5xx menyebut kesalahan kredensial; belum membuktikan API key bot salah.',
+        'ip_restricted': 'Respons 5xx menyebut pembatasan IP pada layanan pembayaran.',
+        'merchant_restricted': 'Respons 5xx menyebut pembatasan akun merchant.',
+        'api_permission': 'Respons 5xx menyebut izin akses pada layanan pembayaran.',
+        'service_unavailable': 'Respons 5xx menyebut layanan atau provider belum tersedia.',
+        'qr_generation_failed': 'Respons 5xx menyebut kegagalan pembuatan QRIS.',
+        'parameter_error': 'Respons 5xx menyebut parameter request tidak valid.',
+        'balance_error': 'Respons 5xx menyebut kendala saldo pada layanan pembayaran.',
+        'reference_conflict': 'Respons 5xx menyebut referensi sudah digunakan; hasilnya tetap direkonsiliasi.',
+        'edge_challenge': 'Respons memuat challenge; request belum diterima sebagai respons API normal.',
+    }
+    category = context.get('kind') if isinstance(context, dict) else None
+    return notes.get(category if isinstance(category, str) else None,
+                     'Respons 5xx tidak memberi alasan yang dapat diklasifikasikan dengan aman.')
 
 
 async def denial_context(response):
@@ -395,7 +503,9 @@ class Client:
                     self.cooldown_until = time.time() + delay
                     raise error('RATE_LIMIT', status, delay)
                 if status >= 500:
-                    raise error('UPSTREAM', status)
+                    exc = error('UPSTREAM', status)
+                    exc.upstream = await upstream_context(response)
+                    raise exc
                 if status in {401, 403}:
                     exc = error('AUTH', status)
                     exc.denial = await denial_context(response)
@@ -475,7 +585,8 @@ class Client:
         if type(server) is not int or server not in {1, 2}:
             raise GatewayError('CONFIG')
         path = '/qris/create2' if server == 2 else '/qris/create'
-        data = await self.request('POST', path, {'reference_id': ref, 'amount': amount})
+        data = await self.request('POST', path, {'reference_id': ref, 'amount': amount,
+                                               'customer_name': 'Pelanggan'})
         try:
             if not isinstance(data, dict):
                 raise GatewayError('SCHEMA')
@@ -820,6 +931,8 @@ class Gateway:
             data['denial'] = exc.denial
         if isinstance(getattr(exc, 'schema_hint', None), dict):
             data['schema'] = exc.schema_hint
+        if isinstance(getattr(exc, 'upstream', None), dict):
+            data['upstream'] = exc.upstream
         logging.warning('Payinaja stage=%s code=%s correlation_id=%s', stage, data['code'], data['correlation_id'])
         try:
             if conn is None:
@@ -1238,10 +1351,13 @@ class Gateway:
                                state='CANCELLED_LOCAL' if current['cancel_requested'] else 'PENDING')
                 self.retain_qr_source(current, result)
                 self.native_invoice(conn, current)
-                self.save(conn, current)
-                self.record_create_proof(conn, dict(success=True, error='', http_status=200, stage='create',
+                detail = dict(success=True, error='', code='OK', http_status=200, stage='create',
                     checked_at=time.time(), correlation_id=secrets.token_hex(8), transaction_id=ident,
-                    fingerprint=self.fingerprint(), endpoint='POST /qris/create' + ('2' if row['server'] == 2 else '')), row['server'])
+                    fingerprint=self.fingerprint(), server=row['server'],
+                    endpoint='POST /qris/create' + ('2' if row['server'] == 2 else ''))
+                current['create_diagnostic'] = detail
+                self.save(conn, current)
+                self.record_create_proof(conn, detail, row['server'])
             try:
                 await self.prepare_qr(ident)
             except sqlite3.Error as exc:
@@ -1265,6 +1381,7 @@ class Gateway:
                     detail = self.diagnostic(exc, 'create', conn=conn)
                     detail.update(error=detail['code'], success=False, transaction_id=ident, server=row['server'])
                     current['diagnostic'] = detail
+                    current['create_diagnostic'] = detail
                     self.save(conn, current)
                     self.record_create_proof(conn, detail, row['server'])
             if not isinstance(exc, Exception):
@@ -2470,6 +2587,10 @@ class Gateway:
                 block += access_note(detail['denial'], detail.get('http_status')) + '\n'
             if detail.get('schema'):
                 block += 'Bentuk respons (tanpa nilai privat): ' + html.escape(encoded(detail['schema'])) + '\n'
+            if detail.get('upstream'):
+                hint = upstream_note(detail['upstream']) + '\n'
+                block += hint + 'Konteks 5xx (tanpa nilai privat): ' + html.escape(encoded(detail['upstream'])) + '\n'
+                compact += hint
             # Keep complete HTML blocks below Telegram's message limit. Older
             # diagnostics remain stored; they must not make the button go silent.
             if len((text + block).encode('utf-16-le')) // 2 <= 3600:
@@ -2565,6 +2686,7 @@ class Gateway:
     async def owner_detail(self, call, ident, *, confirm=False):
         row = self.transaction(ident, call.from_user.id, admin=True)
         text = self.status_text(row) + '\nProvider: Payinaja\nRef: ' + html.escape(row['reference'])
+        text += '\nServer invoice: ' + str(row['server'])
         text += '\nID provider: ' + html.escape(row['provider_id'] or '-') + '\nKode: ' + html.escape(row['error'] or '-')
         text += '\nSumber QR: ' + ('tersedia' if self.has_qr(row) else 'belum tersedia')
         text += '\nPesan QR tercatat: ' + ('ada' if row['qr_messages'] else 'tidak ada')
@@ -2575,12 +2697,27 @@ class Gateway:
                      '\nWaktu: ' + self.host.payment_receipts.format_wib(qr_detail['checked_at'], compact=True) +
                      ' • ID: ' + html.escape(qr_detail['correlation_id']))
         detail = row.get('diagnostic')
+        create = row.get('create_diagnostic')
+        if create and (not row['error'] or not detail or create.get('correlation_id') != detail.get('correlation_id')):
+            text += ('\nHasil create invoice ini: ' + html.escape(create['code']) +
+                     ' • HTTP: ' + str(create.get('http_status') or '-') +
+                     '\nRequest: ' + html.escape(create.get('endpoint') or '-') +
+                     '\nWaktu: ' + self.host.payment_receipts.format_wib(create['checked_at'], compact=True) +
+                     ' • ID: ' + html.escape(create['correlation_id']))
+            if create.get('upstream'):
+                text += '\n' + upstream_note(create['upstream'])
+                text += '\nKonteks 5xx (tanpa nilai privat): ' + html.escape(encoded(create['upstream']))
         if detail and row['error']:
             text += ('\nTahap: ' + html.escape(detail['stage']) + ' • HTTP: ' + str(detail.get('http_status') or '-') +
                      '\nWaktu: ' + self.host.payment_receipts.format_wib(detail['checked_at'], compact=True) +
                      ' • ID: ' + html.escape(detail['correlation_id']))
+            if detail.get('endpoint'):
+                text += '\nRequest: ' + html.escape(detail['endpoint'])
             if detail.get('schema'):
                 text += '\nBentuk respons (tanpa nilai privat): ' + html.escape(encoded(detail['schema']))
+            if detail.get('upstream'):
+                text += '\n' + upstream_note(detail['upstream'])
+                text += '\nKonteks 5xx (tanpa nilai privat): ' + html.escape(encoded(detail['upstream']))
         if row['cancel_requested']:
             audit = row.get('cancel_audit')
             if audit:
