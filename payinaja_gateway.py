@@ -40,7 +40,7 @@ PREFIX = 'payi:'
 LABEL = '⚡ QRIS Otomatis'
 FINAL = {'SETTLED', 'SETTLED_BALANCE', 'FAILED', 'CANCELLED'}
 TX_PREFIX = 'payinaja.tx.'
-ADAPTER_VERSION = '17.53'
+ADAPTER_VERSION = '17.54'
 QR_BLOCKING_ERRORS = frozenset({'SCHEMA', 'MISMATCH', 'AUTH', 'ACCOUNT_CHANGED', 'DUPLICATE_REFERENCE'})
 DENIAL_LIMIT = 16384
 UPSTREAM_LIMIT = 16384
@@ -180,7 +180,7 @@ async def denial_context(response):
         return result
     try:
         data = json.loads(raw)
-    except (ValueError, UnicodeError):
+    except (ValueError, UnicodeError, RecursionError):
         lower = raw[:DENIAL_LIMIT].lower()
         result['format'] = 'html' if b'<html' in lower or b'<!doctype html' in lower else 'text'
         if result['format'] == 'html' and (b'challenge-platform' in lower or b'cf_chl_' in lower):
@@ -526,7 +526,7 @@ class Client:
                         raise error('SCHEMA', status)
                 try:
                     value = json.loads(raw.decode(), parse_float=Decimal)
-                except (ValueError, UnicodeError):
+                except (ValueError, UnicodeError, RecursionError):
                     raise error('JSON_INVALID', status) from None
                 if not isinstance(value, dict) or type(value.get('success')) is not bool:
                     exc = error('SCHEMA', status)
@@ -1327,15 +1327,26 @@ class Gateway:
         row = self.transaction(ident)
         if row['state'] != 'NEW':
             return row
-        if not self.ready():
-            raise GatewayError('NOT_READY')
-        profile = await self.ensure_profile()
-        if profile['account_binding'] != row['account_binding'] or row['origin'] != self.config.base_url:
-            raise GatewayError('ACCOUNT_CHANGED')
+        # An expired, unsubmitted draft needs no provider call to close it.
+        if row['expires_at'] > time.time():
+            if not self.ready():
+                raise GatewayError('NOT_READY')
+            profile = await self.ensure_profile()
+            if profile['account_binding'] != row['account_binding'] or row['origin'] != self.config.base_url:
+                raise GatewayError('ACCOUNT_CHANGED')
         token = secrets.token_hex(12)
         with self.connection(True) as conn:
             row = self.transaction(ident, conn=conn)
             if row['state'] != 'NEW':
+                return row
+            if row['request_started_at']:
+                row.update(state='CREATE_UNKNOWN', next_poll_at=time.time() + 15)
+                self.save(conn, row)
+                return row
+            if row['expires_at'] <= time.time():
+                self.expire_native(conn, row)
+                row.update(state='FAILED', error='EXPIRED', lease_owner=None, lease_until=0)
+                self.save(conn, row)
                 return row
             row.update(state='REQUESTING', lease_owner=token, lease_until=time.time() + self.config.create_timeout + 30,
                        request_started_at=time.time(), next_poll_at=time.time() + 15)
@@ -1464,11 +1475,13 @@ class Gateway:
         if row['state'] == 'PAID_VERIFIED':
             return await self.settle(ident)
         if row['state'] == 'REQUESTING':
-            if row['lease_until'] > time.time():
-                return row
             with self.connection(True) as conn:
                 row = self.transaction(ident, conn=conn)
-                if row['state'] == 'REQUESTING' and row['lease_until'] <= time.time():
+                if row['state'] == 'REQUESTING':
+                    if row['lease_until'] > time.time():
+                        row['next_poll_at'] = max(row['next_poll_at'], row['lease_until'])
+                        self.save(conn, row)
+                        return row
                     row.update(state='CREATE_UNKNOWN', lease_owner=None, lease_until=0)
                     self.save(conn, row)
         try:
@@ -1616,7 +1629,11 @@ class Gateway:
         token = secrets.token_hex(12)
         with self.connection(True) as conn:
             row = self.transaction(ident, conn=conn)
-            if row['state'] != 'PAID_VERIFIED' or row['lease_until'] > time.time():
+            if row['state'] != 'PAID_VERIFIED':
+                return row
+            if row['lease_until'] > time.time():
+                row['next_poll_at'] = max(row['next_poll_at'], row['lease_until'])
+                self.save(conn, row)
                 return row
             if not self.payment_authorized(conn, row['purpose'], row['entity_id']):
                 row.update(state='REVIEW', error='PAYMENT_PROOF_INVALID')
@@ -1628,7 +1645,8 @@ class Gateway:
                 row.update(state='REVIEW', error='PAYMENT_AFTER_CANCEL')
                 self.save(conn, row)
                 return row
-            row.update(lease_owner=token, lease_until=time.time() + 180)
+            row.update(lease_owner=token, lease_until=time.time() + 180,
+                       next_poll_at=time.time() + 180)
             self.save(conn, row)
         try:
             if row['purpose'] == 'topup':
@@ -1653,7 +1671,7 @@ class Gateway:
             with self.connection(True) as conn:
                 current = self.transaction(ident, conn=conn)
                 if current['lease_owner'] == token:
-                    current.update(lease_owner=None, lease_until=0)
+                    current.update(lease_owner=None, lease_until=0, next_poll_at=time.time() + 30)
                     self.save(conn, current)
         return self.transaction(ident)
 
