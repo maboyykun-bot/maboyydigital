@@ -40,7 +40,7 @@ PREFIX = 'payi:'
 LABEL = '⚡ QRIS Otomatis'
 FINAL = {'SETTLED', 'SETTLED_BALANCE', 'FAILED', 'CANCELLED'}
 TX_PREFIX = 'payinaja.tx.'
-ADAPTER_VERSION = '17.54'
+ADAPTER_VERSION = '17.55'
 QR_BLOCKING_ERRORS = frozenset({'SCHEMA', 'MISMATCH', 'AUTH', 'ACCOUNT_CHANGED', 'DUPLICATE_REFERENCE'})
 DENIAL_LIMIT = 16384
 UPSTREAM_LIMIT = 16384
@@ -700,11 +700,14 @@ class Client:
             raise GatewayError('CONFIG' if not self.config.valid() else 'IMAGE')
         if value.startswith(('data:image/png;base64,', 'data:image/jpeg;base64,', 'data:image/webp;base64,')):
             if len(value) > (QR_LIMIT * 4 // 3) + 128:
-                raise GatewayError('IMAGE_SIZE')
+                raise GatewayError('IMAGE_SIZE', endpoint='LOCAL {qris_image}')
             try:
                 return self.image_valid(base64.b64decode(value.split(',', 1)[1], validate=True))
             except (ValueError, TypeError):
-                raise GatewayError('IMAGE') from None
+                raise GatewayError('IMAGE', endpoint='LOCAL {qris_image}') from None
+            except GatewayError as exc:
+                exc.endpoint = 'LOCAL {qris_image}'
+                raise
         try:
             if not value or len(value) > 32768 or any(ord(c) < 33 for c in value):
                 raise ValueError
@@ -748,7 +751,11 @@ class Client:
                     raw.extend(chunk)
                     if len(raw) > QR_LIMIT:
                         raise GatewayError('IMAGE_SIZE', http_status=200, endpoint=endpoint)
-                return self.image_valid(bytes(raw))
+                try:
+                    return self.image_valid(bytes(raw))
+                except GatewayError as exc:
+                    exc.http_status, exc.endpoint = 200, endpoint
+                    raise
         except aiohttp.ClientSSLError:
             raise GatewayError('TLS', endpoint=endpoint) from None
         except aiohttp.ClientConnectorDNSError:
@@ -1239,9 +1246,13 @@ class Gateway:
         except GatewayError as exc:
             if exc.code in {'IMAGE', 'MISMATCH', 'SCHEMA'} or exc.code.startswith('QR_'):
                 exc.http_status = 200
+                exc.endpoint = 'LOCAL qris_source'
             exc.schema_hint = qr_source_shape(data)
             with self.connection(True) as conn:
                 row = self.transaction(ident, conn=conn)
+                if (exc.code in {'QR_URL_UNSUPPORTED', 'QR_SOURCE_MISSING'}
+                        and row.get('image_retry_at', 0) > time.time()):
+                    return  # Keep the actual image HTTP failure during its retry delay.
                 if row['state'] == 'PENDING' and row['error'] not in QR_BLOCKING_ERRORS and not self.has_qr(row) and not (row['error'] == 'IMAGE'
                         and row.get('diagnostic', {}).get('code') == exc.code
                         and row.get('diagnostic', {}).get('schema') == exc.schema_hint):
@@ -1254,8 +1265,7 @@ class Gateway:
         row = self.transaction(ident)
         if (row['state'] != 'PENDING' or row['cancel_requested'] or row.get('retention_done')
                 or row['error'] in QR_BLOCKING_ERRORS
-                or self.has_qr(row) or row['expires_at'] <= time.time()
-                or row.get('image_retry_at', 0) > time.time()):
+                or self.has_qr(row) or row['expires_at'] <= time.time()):
             return row
         profile = self.proof()
         if not profile.get('approved') or profile.get('account_binding') != row['account_binding'] or row['origin'] != self.config.base_url:
@@ -1279,12 +1289,14 @@ class Gateway:
         except GatewayError as exc:
             if exc.code not in {'QR_URL_UNSUPPORTED', 'QR_SOURCE_MISSING'} or not data.get('qris_image_url'):
                 return row
+        inline_image = data['qris_image_url'].startswith('data:image/')
         token = secrets.token_hex(12)
         with self.connection(True) as conn:
             current = self.transaction(ident, conn=conn)
             if (current['state'] != 'PENDING' or current['cancel_requested'] or self.has_qr(current)
                     or current['error'] in QR_BLOCKING_ERRORS
-                    or current.get('image_lease_until', 0) > time.time() or current.get('image_retry_at', 0) > time.time()):
+                    or current.get('image_lease_until', 0) > time.time()
+                    or (not inline_image and current.get('image_retry_at', 0) > time.time())):
                 return current
             current.update(image_lease_owner=token, image_lease_until=time.time() + self.config.timeout + 30)
             self.save(conn, current)
@@ -2714,6 +2726,20 @@ class Gateway:
                      ' • Kode: ' + html.escape(qr_detail['code']) + ' • HTTP: ' + str(qr_detail.get('http_status') or '-') +
                      '\nWaktu: ' + self.host.payment_receipts.format_wib(qr_detail['checked_at'], compact=True) +
                      ' • ID: ' + html.escape(qr_detail['correlation_id']))
+            endpoint = qr_detail.get('endpoint')
+            if isinstance(endpoint, str) and endpoint in {'LOCAL qris_source', 'LOCAL {qris_image}', 'GET {qris_image}'}:
+                text += '\nAsal pemrosesan QR: ' + html.escape(endpoint)
+            schema = qr_detail.get('schema')
+            if isinstance(schema, dict):
+                allowed = {
+                    'qris_string': {'missing', 'invalid-type', 'blank', 'present'},
+                    'qris_image_url': {'missing', 'invalid-type', 'blank', 'unsupported', 'inline',
+                                       'quickchart', 'official-api', 'official-image'},
+                }
+                safe_schema = {key: schema[key] for key, values in allowed.items()
+                               if isinstance(schema.get(key), str) and schema[key] in values}
+                if safe_schema:
+                    text += '\nBentuk sumber QR (tanpa nilai privat): ' + html.escape(encoded(safe_schema))
         detail = row.get('diagnostic')
         create = row.get('create_diagnostic')
         if create and (not row['error'] or not detail or create.get('correlation_id') != detail.get('correlation_id')):
