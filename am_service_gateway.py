@@ -18,18 +18,22 @@ import time
 from types import SimpleNamespace
 
 from aiogram import F
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
 
 from am_service_client import BASE_URL, AMServiceClient, AMServiceConfig, AMServiceError, _magic_link
 
 
-ADAPTER_VERSION = '17.60'
+ADAPTER_VERSION = '17.61'
 JOB_PREFIX = 'amservice.job.'
 DUE_PREFIX = 'amservice.due.'
+VIEW_PREFIX = 'amservice.view.'
 WORK_SECONDS = 90
 POLL_SECONDS = 5
 MAIL_RETRY_SECONDS = 15
+DISPLAY_RETRY_SECONDS = 5
+DISPLAY_TIMEOUT_SECONDS = 10
 MAX_MAIL_WATCH_SECONDS = 3600
 TERMINAL = {'PREMIUM_ACTIVE', 'FAILED', 'UNKNOWN', 'ACCOUNT_CHANGED'}
 SAFE_CODES = {
@@ -71,6 +75,12 @@ class Gateway:
         self._task = None
         self._views = {}  # Explicit requests in this process only; never persisted.
         self._rendered = {}
+        self._display_retry = {}
+        self._edit_only = set()
+        self._publishing = set()
+        self._view_tokens = {}
+        self._permanent_targets = set()
+        self._bot = None
 
     def fingerprint(self):
         values = [BASE_URL, self.config.api_key]
@@ -180,7 +190,7 @@ class Gateway:
             raise ValueError('MAILBOX_MISMATCH')
         return row
 
-    def _recover(self, job, *, code='LOCAL_ERROR'):
+    def _recover(self, job, *, code='LOCAL_ERROR', read_status=0):
         """A committed dispatch claim is never changed back to NEW on restart."""
         if job['mailbox_state'] == 'CLAIMED':
             return self._change(job, mailbox_state='UNKNOWN', status='UNKNOWN',
@@ -191,6 +201,15 @@ class Gateway:
         if job['send_state'] == 'CLAIMED':
             return self._change(job, send_state='UNKNOWN', status='WAITING',
                                 stage='WAITING_MAIL', code='SEND_UNKNOWN', retry_at=time.time() + MAIL_RETRY_SECONDS)
+        if code == 'INBOX_UNAVAILABLE':
+            delay = MAIL_RETRY_SECONDS
+            if read_status == 429:
+                until = getattr(self.host, '_TEMP_MAIL_GRABMAIL_RATE_UNTIL', 0)
+                if type(until) in {int, float}:
+                    delay = max(delay, min(3600, int(until - time.monotonic()) + 1))
+            return self._change(job, status='WAITING', stage='WAITING_MAIL', code=code,
+                                mail_checked_at=_stamp(), mail_scan_code='READ_UNAVAILABLE',
+                                mail_read_http=_status(read_status), retry_at=time.time() + delay)
         return self._change(job, status='WAITING', code=code, retry_at=time.time() + 60)
 
     def _reserve(self, job, email):
@@ -259,6 +278,7 @@ class Gateway:
         # addresses or magic links. HTTP 200 from send-link is not inbox proof.
         diagnostics = dict(mail_checked_at=_stamp(), mail_count=len(messages[:30]),
                            mail_candidate_count=0, mail_checked_details=0,
+                           mail_read_http=0,
                            mail_scan_code='EMPTY' if not messages else 'NO_MATCH')
         checked = set()
         for item in messages[:30]:
@@ -445,10 +465,12 @@ class Gateway:
             except Exception:
                 pass
             raise
-        except Exception:
+        except Exception as exc:
             latest = self.job(owner, ident)
             if latest['status'] not in TERMINAL:
-                return self._recover(latest, code='INBOX_UNAVAILABLE' if latest['send_state'] in {'DONE', 'UNKNOWN'} else 'LOCAL_ERROR')
+                return self._recover(latest,
+                    code='INBOX_UNAVAILABLE' if latest['send_state'] in {'DONE', 'UNKNOWN'} else 'LOCAL_ERROR',
+                    read_status=_status(getattr(exc, 'status', 0)))
             return latest
         finally:
             self._release(job)
@@ -535,7 +557,30 @@ class Gateway:
         rows.append([InlineKeyboardButton(text='⬅️ AM Auto Create', callback_data='amnew:menu')])
         return '\n'.join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
-    async def render(self, call, job):
+    async def _deliver(self, call, text, markup, *, edit_only=False):
+        if not edit_only:
+            return await self.host.safe_edit_or_answer(call, text, reply_markup=markup, parse_mode='HTML')
+        # A previous fallback-send timeout may already have sent a message.
+        # Repeating only the known original edit is idempotent and never sends
+        # another copy of private account details after an uncertain fallback.
+        edit = getattr(getattr(call, 'message', None), 'edit_text', None)
+        if not callable(edit):
+            return False
+        try:
+            await edit(text, reply_markup=markup, parse_mode='HTML')
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            detail = str(exc).lower()
+            if 'message is not modified' in detail:
+                return True
+            if isinstance(exc, TelegramForbiddenError) or (isinstance(exc, TelegramBadRequest) and any(
+                    value in detail for value in ('message to edit not found', "message can't be edited", 'chat not found'))):
+                self._permanent_targets.add((call.from_user.id, call.message.message_id))
+            return False
+
+    async def render(self, call, job, *, edit_only=False):
         # Recheck durable, actor-scoped evidence before exporting a saved result.
         if not self.host.is_owner(call.from_user.id):
             return await self.host.deny_owner_callback(call)
@@ -572,7 +617,7 @@ class Gateway:
                 pass
         if job['status'] == 'PREMIUM_ACTIVE':
             text, markup = self._success_view(job, mailbox)
-            return await self.host.safe_edit_or_answer(call, text, reply_markup=markup, parse_mode='HTML')
+            return await self._deliver(call, text, markup, edit_only=edit_only)
         notes = {'QUOTA': 'Kuota akun per jam habis. Pemeriksaan dijadwalkan kembali.',
                  'SEND_UNKNOWN': 'Pengiriman belum pasti. Bot hanya memeriksa inbox; pengiriman tidak diulang.',
                  'VERIFY_UNKNOWN': 'Verifikasi sudah dikirim. Hasil belum pasti; verifikasi tidak diulang.',
@@ -602,10 +647,13 @@ class Gateway:
                      'DETAIL_UNAVAILABLE': 'Detail email belum dapat dibaca; pemeriksaan akan diulang.',
                      'INBOX_MISMATCH': 'Identitas inbox tidak cocok; link tidak digunakan.',
                      'INBOX_INVALID': 'Format daftar email belum valid.',
+                     'READ_UNAVAILABLE': 'Pembacaan inbox belum berhasil; bot mencoba lagi otomatis.',
                      'LINK_FOUND': 'Magic Link ditemukan; verifikasi menunggu giliran.'}
             scan_code = job.get('mail_scan_code', '')
             if scan_code in scans:
                 text += '\n\n' + scans[scan_code]
+            if scan_code == 'READ_UNAVAILABLE' and _status(job.get('mail_read_http')):
+                text += '\nHTTP inbox: ' + str(job['mail_read_http'])
             checked_at = job.get('mail_checked_at', '')
             try:
                 checked = datetime.fromisoformat(checked_at.replace('Z', '+00:00'))
@@ -613,7 +661,7 @@ class Gateway:
                     text += '\nInbox terakhir diperiksa: ' + checked.astimezone(timezone.utc).strftime('%H:%M:%S UTC')
             except (ValueError, AttributeError):
                 pass
-            text += '\nBot memeriksa inbox otomatis; tidak perlu menekan Cek Job.'
+            text += '\nBot melanjutkan otomatis; hasil akhir akan memperbarui pesan ini.'
             try:
                 sent = datetime.fromisoformat(job['magic_sent_at'].replace('Z', '+00:00'))
                 remaining = max(0, MAX_MAIL_WATCH_SECONDS - (datetime.now(timezone.utc) - sent).total_seconds())
@@ -625,7 +673,131 @@ class Gateway:
         controls = [[('⬅️ AM Auto Create', 'amnew:menu')]]
         if mailbox is not None and mailbox.get('state') == 'ready':
             controls.insert(0, [('📬 Inbox Email', 'tm:inbox:' + str(mailbox['id']) + ':1')])
-        return await self.host.safe_edit_or_answer(call, text, reply_markup=self._keyboard(controls), parse_mode='HTML')
+        return await self._deliver(call, text, self._keyboard(controls), edit_only=edit_only)
+
+    @staticmethod
+    def _signature(job):
+        return (job['status'], job['stage'], job['code'], job['valid_until'],
+                job.get('http_status'), job.get('cause_code'), job.get('mail_scan_code'),
+                job.get('mail_count'), job.get('mail_read_http'), job.get('mail_checked_at', '')[:16])
+
+    def _bind_view(self, owner, ident, call):
+        message = getattr(call, 'message', None)
+        chat = getattr(message, 'chat', None)
+        message_id = getattr(message, 'message_id', 0)
+        if (not chat or str(chat.type) != 'private' or chat.id != owner
+                or type(message_id) is not int or message_id <= 0):
+            return
+        key = (owner, ident)
+        token = secrets.token_hex(8)
+        self._view_tokens[key] = token
+        self._rendered.pop(key, None)
+        value = json.dumps(dict(owner_id=owner, message_id=message_id, token=token), separators=(',', ':'))
+        with self._connection(True) as conn:
+            conn.execute('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                         (VIEW_PREFIX + ident, value))
+
+    def _forget_view(self, key, *, token=None):
+        if token is not None and self._view_tokens.get(key) != token:
+            return
+        with self._connection(True) as conn:
+            conn.execute('DELETE FROM settings WHERE key=?', (VIEW_PREFIX + key[1],))
+        self._views.pop(key, None)
+        self._view_tokens.pop(key, None)
+        self._display_retry.pop(key, None)
+        self._edit_only.discard(key)
+
+    def _restore_views(self):
+        if not callable(getattr(self._bot, 'edit_message_text', None)) or len(self._views) >= 64:
+            return
+        known = [VIEW_PREFIX + key[1] for key in self._views]
+        excluded = ' AND key NOT IN (' + ','.join('?' for _ in known) + ')' if known else ''
+        with self._connection() as conn:
+            rows = conn.execute('SELECT key,value FROM settings WHERE key LIKE ?' + excluded +
+                                ' ORDER BY rowid LIMIT ?', [VIEW_PREFIX + '%', *known, min(16, 64 - len(self._views))]).fetchall()
+        for row in rows:
+            ident = row['key'][len(VIEW_PREFIX):]
+            try:
+                value = json.loads(row['value'])
+                owner, message_id, token = value['owner_id'], value['message_id'], value['token']
+                if (type(owner) is not int or type(message_id) is not int or message_id <= 0
+                        or not isinstance(token, str) or not re.fullmatch('[0-9a-f]{16}', token)
+                        or not self.host.is_owner(owner) or not self.job(owner, ident)):
+                    raise ValueError
+            except (ValueError, TypeError, KeyError):
+                with self._connection(True) as conn:
+                    conn.execute('DELETE FROM settings WHERE key=?', (row['key'],))
+                continue
+            async def edit(text, *, _owner=owner, _message=message_id, **options):
+                return await self._bot.edit_message_text(chat_id=_owner, message_id=_message, text=text, **options)
+            async def answer(*args, **kwargs):
+                return False
+            key = (owner, ident)
+            self._views[key] = SimpleNamespace(from_user=SimpleNamespace(id=owner), data='amnew:view:' + ident,
+                answer=answer, bot=self._bot, message=SimpleNamespace(chat=SimpleNamespace(id=owner, type='private'),
+                    message_id=message_id, edit_text=edit))
+            self._view_tokens[key] = token
+            self._edit_only.add(key)
+
+    async def _publish(self, owner, ident, *, force=False, terminal_only=True):
+        key = (owner, ident)
+        call = self._views.get(key)
+        current = self.job(owner, ident)
+        if call is None or current is None or key in self._publishing:
+            return False
+        if terminal_only and current['status'] not in TERMINAL:
+            return False
+        signature = self._signature(current)
+        token = self._view_tokens.get(key)
+        if not force and (self._rendered.get(key) == signature or self._display_retry.get(key, 0) > time.monotonic()):
+            return False
+        self._publishing.add(key)
+        try:
+            try:
+                delivered = await asyncio.wait_for(
+                    self.render(call, current, edit_only=key in self._edit_only), DISPLAY_TIMEOUT_SECONDS)
+            except asyncio.CancelledError:
+                self._edit_only.add(key)
+                self._display_retry[key] = time.monotonic() + DISPLAY_RETRY_SECONDS
+                raise
+            except Exception:
+                delivered = False
+        finally:
+            self._publishing.discard(key)
+        if delivered:
+            if self._view_tokens.get(key) == token:
+                self._rendered[key] = signature
+                self._display_retry.pop(key, None)
+                if current['status'] in TERMINAL:
+                    self._forget_view(key, token=token)
+        else:
+            if (owner, getattr(call.message, 'message_id', 0)) in self._permanent_targets:
+                self._forget_view(key, token=token)
+                return False
+            self._edit_only.add(key)
+            self._display_retry[key] = time.monotonic() + DISPLAY_RETRY_SECONDS
+        return bool(delivered)
+
+    async def _flush_views(self):
+        # Terminal jobs leave the API work queue before Telegram succeeds.
+        # Keep their explicit, process-local views retryable independently.
+        attempted = 0
+        for key in list(self._views):
+            current = self.job(*key)
+            if not current:
+                continue
+            if current['status'] not in TERMINAL:
+                continue
+            if key in self._publishing or self._rendered.get(key) == self._signature(current) or self._display_retry.get(key, 0) > time.monotonic():
+                continue
+            await self._publish(*key)
+            # Rotate failed targets and use one bounded Telegram attempt per
+            # loop so stale/slow messages cannot starve inbox processing.
+            if key in self._views:
+                self._views[key] = self._views.pop(key)
+            attempted += 1
+            if attempted >= 1:
+                break
 
     async def callback(self, call, state=None):
         if call.data == 'amnew:menu':
@@ -645,25 +817,29 @@ class Gateway:
                 job = self._new(owner, ident)
             if not job:
                 return await self.host.safe_callback_notice(call, 'Job tidak ditemukan atau konfigurasi belum siap.', show_alert=True)
-            self._views[(owner, ident)] = call
+            key = (owner, ident)
+            if action == 'view' or (key not in self._views and self._rendered.get(key) != self._signature(job)):
+                self._views[key] = call
+                self._bind_view(owner, ident, call)
             if len(self._views) > 64:
                 oldest = next(iter(self._views))
                 self._views.pop(oldest, None)
                 self._rendered.pop(oldest, None)
-            await self.host.safe_callback_notice(call, 'Memeriksa aktivasi...')
+                self._display_retry.pop(oldest, None)
+                self._edit_only.discard(oldest)
+                self._view_tokens.pop(oldest, None)
+            await self.host.safe_callback_notice(call,
+                'Proses dimulai; hasil akhir ditampilkan otomatis.' if action != 'view' else 'Membuka riwayat aktivasi...')
             if action != 'view':
-                try:
-                    await self.render(call, job)
-                except Exception:
-                    pass
                 await self.process(owner, ident, call)
-            return await self.render(call, self.job(owner, ident))
+            return await self._publish(owner, ident, force=action == 'view', terminal_only=action != 'view')
         except asyncio.CancelledError:
             raise
         except Exception:
             return await self.host.safe_callback_notice(call, 'Job tetap disimpan. Buka kembali AM Auto Create untuk memeriksa.', show_alert=True)
 
     async def tick(self, bot=None):
+        self._restore_views()
         # Ordered next-attempt keys keep a leased/slow job from starving others.
         with self._connection() as conn:
             rows = conn.execute('SELECT key FROM settings WHERE key LIKE ? AND CAST(value AS REAL)<=? '
@@ -681,23 +857,14 @@ class Gateway:
             owner = job['owner_id']
             call = self._views.get((owner, ident))
             await self.process(owner, ident, call)
-            current = self.job(owner, ident)
-            # Empty inbox scans still make progress. Refresh a visible waiting
-            # view at most once per minute unless counts/reason/state changes.
-            signature = (current['status'], current['stage'], current['code'], current['valid_until'],
-                         current.get('mail_scan_code'), current.get('mail_count'),
-                         current.get('mail_checked_at', '')[:16])
-            if call is not None and self._rendered.get((owner, ident)) != signature:
-                try:
-                    await self.render(call, current)
-                    self._rendered[(owner, ident)] = signature
-                except Exception:
-                    pass
             break  # At most one worker budget; stale metadata above is cheap.
+        await self._flush_views()
 
     async def start(self, bot):
         if self._task is not None and not self._task.done():
             return []
+        self._bot = bot
+        self._restore_views()
         async def worker():
             while True:
                 try:
@@ -715,6 +882,13 @@ class Gateway:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
         self._views.clear()
+        self._rendered.clear()
+        self._display_retry.clear()
+        self._edit_only.clear()
+        self._publishing.clear()
+        self._view_tokens.clear()
+        self._permanent_targets.clear()
+        self._bot = None
         await self.client.close()
 
 

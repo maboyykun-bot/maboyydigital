@@ -27,7 +27,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from am_service_client import (BASE_URL, AMServiceClient, AMServiceConfig,
                                AMServiceError, _email, _magic_link)
 
-ADAPTER_VERSION = '17.60'
+ADAPTER_VERSION = '17.61'
 JOB_PREFIX = 'ammanual.flow.'
 FSM_KEY = 'ammanual_job_id'
 FORM_SECONDS = 15 * 60
@@ -171,6 +171,20 @@ class GatewayManual:
                 if job.get('active') and (ident is None or job['id'] == ident):
                     job.update(active=False, updated_at=time.time())
                     self._save(conn, job)
+
+    def _erase(self, actor, ident, nonce):
+        """Forget one cancelled form without resetting consumed request usage."""
+        with self._connection(True) as conn:
+            job = self._load(conn, ident)
+            if (not job or job['actor_id'] != actor or job['nonce'] != nonce
+                    or not job.get('active')):
+                return False
+            conn.execute('DELETE FROM settings WHERE key=?', (JOB_PREFIX + ident,))
+            # The request has already consumed provider allowance. Keep units
+            # and request outcomes, but remove the cancelled form's email.
+            conn.execute("UPDATE tool_account_quotas SET target_email='' WHERE owner_id=? AND quota_key=?",
+                         (actor, 'flow:ammanual:' + ident))
+            return True
 
     def _activate(self, actor, ident, nonce, *, resume=False):
         with self._connection(True) as conn:
@@ -338,16 +352,18 @@ class GatewayManual:
                    'Batas layanan bersama: <b>50 requests/hari</b>. '
                    'Satu aktivasi biasanya memakai 2 requests.\n\n')
         text = ('⚡ <b>' + self._title(actor) + '</b>\n\n' + details +
-                'Gunakan email milik Anda, lalu tempel Magic Link dari inbox email yang sama. '
-                'Premium aktif hanya ditampilkan setelah bukti lengkap terkonfirmasi.\n'
-                'Form berlaku 15 menit. Kuota /tools mengikuti aturan akun Anda.')
+                '1. Masukkan email milik Anda.\n'
+                '2. Kirim Magic Link ke email tersebut.\n'
+                '3. Salin tautan dari email, lalu tempel ke bot.\n\n'
+                'Form berlaku 15 menit.')
         owner = self.host.is_owner(actor)
         if not owner:
             text = ('📧 <b>AKTIVASI AM PRO</b>\n\n'
                     '<b>Langkah 1/3 — Masukkan email</b>\n'
-                    'Gunakan alamat email milik Anda. Setelah permintaan kirim diterima, '
-                    'buka inbox atau spam lalu kirim Magic Link dari email tersebut ke bot.\n\n'
-                    'Form berlaku 15 menit. Status Premium ditampilkan setelah verifikasi berhasil.')
+                    '1. Masukkan email milik Anda.\n'
+                    '2. Kirim Magic Link ke email tersebut.\n'
+                    '3. Salin tautan dari email, lalu tempel ke bot.\n\n'
+                    'Form berlaku 15 menit.')
         if history_only:
             text = ('📋 <b>RIWAYAT AKTIVASI</b>\n\n'
                     'Pilih proses untuk melihat hasil atau melanjutkan input tautan dari email Anda.'
@@ -368,6 +384,8 @@ class GatewayManual:
             return await self._ui(call, text, rows)
 
     async def _render(self, event, state, job, *, session=False):
+        if not job:
+            return
         if not await self._access(event, state):
             return
         current = self.job(int(event.from_user.id), job['id'])
@@ -398,14 +416,10 @@ class GatewayManual:
             if current['send_state'] == 'NEW' and not self._expired(current):
                 rows.append([('📨 Kirim Magic Link', self._button('send', current))])
         elif current['status'] == 'WAIT_LINK':
-            text += ('\n<b>Jika email sudah masuk:</b>\n'
-                     '1. Buka email dari Alight di inbox atau spam.\n'
-                     '2. Tekan lama tombol Sign in / Masuk, lalu pilih Salin Tautan.\n'
-                     '3. Tempel URL lengkap tersebut sebagai pesan ke bot ini.\n\n'
-                     '<b>Jika email belum masuk:</b> periksa alamat di atas dan folder Spam/Promosi. '
-                     'Permintaan diterima layanan belum membuktikan email sudah sampai. '
-                     'Bot tidak dapat membaca inbox email pribadi Anda. Hubungi owner bila email tetap tidak diterima.\n'
-                     'Jangan kirim password atau token akun.')
+            text += ('\n1. Buka Inbox/Spam.\n'
+                     '2. Salin tautan tombol Masuk / Sign in di email.\n'
+                     '3. Tekan <b>Masukkan Magic Link</b>, lalu tempel URL ke bot.\n\n'
+                     'Belum masuk? Periksa alamat/Spam atau hubungi owner.')
             if not self._expired(current):
                 rows.append([('🔗 Masukkan Magic Link', self._button('resume', current))])
         elif current['status'] == 'PREMIUM_ACTIVE':
@@ -433,7 +447,7 @@ class GatewayManual:
         if current.get('retry_at', 0) > time.time():
             text += '\nCoba manual lagi setelah: ' + datetime.fromtimestamp(
                 current['retry_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        if current.get('active'):
+        if current.get('active') and current['status'] not in TERMINAL:
             rows.append([('✖️ Batalkan Form', self._button('cancel', current))])
         rows.append([('⬅️ Aktivasi AM Pro', 'amman:menu')])
         if self._live(event):
@@ -497,6 +511,12 @@ class GatewayManual:
     def _release(self, job):
         with self._connection(True) as conn:
             current = self._load(conn, job['id'])
+            if current is None:
+                # Another process may cancel after our last session check but
+                # before metering commits. Do not let that reservation restore
+                # the deleted form's plaintext email.
+                conn.execute("UPDATE tool_account_quotas SET target_email='' WHERE owner_id=? AND quota_key=?",
+                             (job['actor_id'], 'flow:ammanual:' + job['id']))
             if current and current.get('lease_token') == job.get('lease_token'):
                 current.update(lease_token='', lease_until=0)
                 self._save(conn, current)
@@ -716,8 +736,7 @@ class GatewayManual:
             if not await self._access(call, state) or not await self._session(call, state, job):
                 return
             return await self._ui(call,
-                '📧 <b>EMAIL AM MANUAL</b>\n\nKirim alamat email milik Anda. '
-                'Contoh: nama@example.test\nJangan kirim password, API key, atau token.\nForm berlaku 15 menit.',
+                '📧 <b>EMAIL AKTIVASI</b>\n\nKirim alamat email milik Anda.\nForm berlaku 15 menit.',
                 [[('✖️ Batalkan Form', self._button('cancel', job))]])
         if action == 'resume':
             async with self._lock(actor):
@@ -735,10 +754,14 @@ class GatewayManual:
         if not await self._session(call, state, job):
             return await self._notice(call, 'Tombol berasal dari form yang sudah ditinggalkan.')
         if action == 'cancel':
-            self._deactivate(actor, ident)
             async with self._lock(actor):
+                if not await self._session(call, state, job) or not self._erase(actor, ident, nonce):
+                    return await self._notice(call, 'Form sudah tidak aktif.')
                 await self._clear_manual(state, ident=ident)
-            return await self.menu(call, state)
+            if not await self._access(call, state):
+                return
+            return await self._ui(call, '✖️ <b>FORM DIBATALKAN</b>\n\nRiwayat form ini telah dihapus.',
+                                  [[self._back(actor)]])
         if action == 'send' and job['status'] in {'CONFIRM_SEND', 'WAIT_LINK', 'RUNNING'}:
             return await self._post(call, state, job)
         return await self._notice(call, 'Tahap form ini tidak sesuai.')

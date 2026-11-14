@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.60"
+BOT_VERSION = "17.61"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -14437,7 +14437,7 @@ def _reserve_tool_provider_request(owner_id: int, method: str, *, target_email="
         if count_account:
             reserved=_tools_account_reservation(conn,owner_id,email,correlation_id,start_utc,next_utc,scope=scope)
             if not reserved:
-                if _tools_account_usage(conn,owner_id,start_utc,next_utc,scope=scope)>=TOOLS_PROVIDER_HOURLY_LIMIT:
+                if scope == 'legacy' and _tools_account_usage(conn,owner_id,start_utc,next_utc,scope=scope)>=TOOLS_PROVIDER_HOURLY_LIMIT:
                     conn.rollback();return 0
                 conn.execute("INSERT INTO tool_account_quotas(owner_id,quota_key,target_email,created_ts) VALUES(?,?,?,?)",
                              (int(owner_id),_tools_account_key(email,correlation_id,start_utc),email,int(time.time())))
@@ -16066,27 +16066,11 @@ TOOLS_CLEANUP_PREVIEW_SECONDS = 300
 
 
 def owner_tools_home_text(owner_id: int) -> str:
-    try:
-        stats=tools_stats_snapshot(owner_id)
-        quota = f"{stats['used_accounts']}/{TOOLS_PROVIDER_HOURLY_LIMIT} akun/jam • reset {stats['reset_at']}"
-    except sqlite3.Error:
-        quota = "belum tersedia"
-    try:
-        service_stats=tools_stats_snapshot(owner_id,scope='am_service')
-        service_quota=f"{service_stats['used_accounts']}/{service_stats['hourly_limit']} akun/jam • reset {service_stats['reset_at']}"
-    except sqlite3.Error:
-        service_quota="belum tersedia"
     return (
         "🧰 <b>OWNER TOOLS</b>\n"
-        "Gunakan fitur dengan bijak.\n\n"
-        "Pilih website untuk membuka alur AM masing-masing.\n\n"
-        f"{html.escape(tools_legacy_website_name())}: <b>{html.escape(tools_provider_status_text())}</b>\n"
-        "am-api-service.vercel.app: Auto Create atau aktivasi manual.\n"
-        "Paket Free API baru: <b>50 request/hari per API key</b>; biasanya 2 request per aktivasi.\n"
-        f"Pemakaian layanan lama: <b>{quota}</b>\n"
-        f"Pemakaian layanan baru: <b>{service_quota}</b>\n"
-        "Pencatatan kedua layanan terpisah.\n"
-        "Temp Mail: <b>Tanpa batas pembuatan di bot</b>"
+        "\nPilih layanan untuk membuka Auto Create atau aktivasi manual.\n\n"
+        "Temp Mail dan Auto Create menggunakan <b>Grabmail</b>.\n"
+        "Aktivasi manual memakai email milik Anda."
     )
 
 
@@ -16413,21 +16397,22 @@ def tools_stats_snapshot(owner_id: int, *, scope="legacy") -> dict:
     success=int(lifetime.get("success",0)); failed=int(lifetime.get("failed",0))
     cost=2 if scope == "am_service" else max(1,int(TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT))
     used=sum(totals.values())+legacy*cost
-    remaining=max(0,TOOLS_PROVIDER_HOURLY_LIMIT-used_accounts)
+    hourly_limit=int(TOOLS_PROVIDER_HOURLY_LIMIT) if scope == 'legacy' else None
+    remaining=max(0,hourly_limit-used_accounts) if hourly_limit is not None else None
     reset=max(0,int((next_wib-now_wib).total_seconds()))
     return {
         "hour_success":totals.get("success",0),
         "hour_failed":totals.get("failed",0),
         "hour_pending":totals.get("pending",0)+totals.get("unknown",0),
         "hour_attempts":sum(totals.values())+legacy,
-        "used_requests":used,"remaining_requests":remaining*cost,
+        "used_requests":used,"remaining_requests":remaining*cost if remaining is not None else None,
         "used_accounts":used_accounts,"remaining_accounts":remaining,
-        "hourly_limit":int(TOOLS_PROVIDER_HOURLY_LIMIT),"request_cost":cost,
+        "hourly_limit":hourly_limit,"request_cost":cost,
         "lifetime_total":sum(lifetime.values()),"lifetime_success":success,
         "lifetime_failed":failed,
         "success_rate":success/(success+failed)*100.0 if success+failed else 0.0,
-        "reset_at":next_wib.strftime("%H:00 WIB"),
-        "reset_countdown":f"{reset//60:02d}m {reset%60:02d}d",
+        "reset_at":next_wib.strftime("%H:00 WIB") if scope == 'legacy' else None,
+        "reset_countdown":f"{reset//60:02d}m {reset%60:02d}d" if scope == 'legacy' else None,
     }
 
 
@@ -16467,6 +16452,11 @@ def tools_stats_text(owner_id: int) -> str:
 def tools_quota_can_process(owner_id: int, *, requests_needed=None, target_email="", correlation_id="") -> tuple[bool,dict]:
     scope=_tools_scope(correlation_id)
     stats=tools_stats_snapshot(owner_id,scope=scope)
+    if scope == 'am_service':
+        # The new service enforces its own request allowance (HTTP 429). Keep
+        # audit counts separate without importing the legacy account/hour cap
+        # or guessing an undocumented provider daily reset/remaining balance.
+        return True,stats
     if target_email or correlation_id:
         _,_,_,start_utc,next_utc=tools_hour_window()
         conn=db()
@@ -18188,15 +18178,11 @@ def tools_user_menu(user_id: int):
 
 def tools_user_login_guide_text() -> str:
     return (
-        "📖 <b>PANDUAN LOGIN AM VIA EMAIL</b>\n\n"
-        "1. Buka aplikasi <b>Alight Motion</b>, lalu masuk ke menu akun/profil.\n\n"
-        "2. Pilih <b>Masuk/Login</b> dan metode email yang tersedia.\n\n"
-        "3. Masukkan <b>email yang sama</b> dengan email aktivasi premium di /tools.\n\n"
-        "4. Ikuti instruksi login dari aplikasi. Jika ada email login, cek <b>Inbox/Spam</b> "
-        "lalu buka <b>link terbaru</b> pada perangkat yang dipakai untuk Alight Motion.\n\n"
-        "5. Setelah masuk, periksa alamat email akun dan status premium/keanggotaan.\n\n"
-        "Jika premium belum tampil setelah aktivasi berhasil di bot, buka ulang aplikasi "
-        "dengan email yang sama atau hubungi owner."
+        "📖 <b>PANDUAN LOGIN</b>\n\n"
+        "1. Buka <b>Alight Motion → Akun → Masuk</b>.\n"
+        "2. Gunakan email yang sudah diaktifkan melalui bot.\n"
+        "3. Ikuti petunjuk email masuk, lalu periksa status Premium.\n\n"
+        "Email belum terlihat? Periksa Inbox/Spam."
     )
 
 
@@ -18234,13 +18220,11 @@ def tools_user_welcome_text(user_id: int = 0) -> str:
 
 
 def tools_user_limits_text(user_id: int) -> str:
-    stats=tools_stats_snapshot(user_id,scope='am_service')
     return ("📊 <b>BATAS PENGGUNAAN</b>\n\n"
-            f"Batas akun Anda: <b>{stats['used_accounts']}/{stats['hourly_limit']} aktivasi per jam</b>\n"
-            f"Periode berikutnya: <b>{stats['reset_at']}</b>\n\n"
             "Kapasitas layanan bersama: <b>50 request per hari</b>.\n"
             "Satu aktivasi biasanya memakai 2 request: kirim email dan verifikasi.\n"
-            "Batas request harian digunakan bersama; angka ini bukan jumlah akun atau sisa kuota harian Anda.")
+            "Batas harian digunakan bersama dan diterapkan oleh layanan.\n\n"
+            "Ini bukan jumlah akun atau sisa kuota Anda. Jika batas tercapai, waktu mencoba kembali mengikuti respons layanan.")
 
 
 def tools_user_flow_key(data: str, action: str):
@@ -36881,7 +36865,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.60"
+EXPECTED_SOURCE_VERSION = "17.61"
 
 
 def source_integrity_self_test():
