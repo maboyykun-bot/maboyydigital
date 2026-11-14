@@ -1632,8 +1632,8 @@ class OwnerFormatter:
             f"⚙️ Mode harga: {escape(settings['mode'])}\n"
             f"⚠️ Refund perlu rekonsiliasi: {stats['refund_review']}\n⏳ Pembelian belum pasti: {attempts}\n"
             f"📩 Notifikasi pending/gagal: {notifications}\n🛍 Toko: {'ON' if settings['enabled'] else 'OFF'}\n"
-            f"📦 Limit aktif: {settings['max_active']}/user\n🕒 Poll terakhir: {settings['last_poll_at'] or 'belum'}\n"
-            f"Webhook terakhir: {settings['last_webhook_at'] or 'belum'}\n"
+            f"📦 Limit aktif: {settings['max_active']}/user\n🕒 Poll terakhir: {payment_receipts.format_wib(settings['last_poll_at'],seconds=True,compact=True,missing='belum') if settings['last_poll_at'] else 'belum'}\n"
+            f"Webhook terakhir: {payment_receipts.format_wib(settings['last_webhook_at'],seconds=True,compact=True,missing='belum') if settings['last_webhook_at'] else 'belum'}\n"
             f"Worker: {escape(worker_errors or settings['last_worker_error']) or 'Tidak ada error tercatat'}\n"
             f"Config: {escape(config_error) or 'valid'}\n"
             "OTP dan isi SMS user tidak ditampilkan di dashboard.")

@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.62"
+BOT_VERSION = "17.63"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -11110,13 +11110,20 @@ class CommandKeyboardMiddleware(BaseMiddleware):
             return await handler(event,data)
         data["command_keyboard_handled"]=True
         await prepare_command_keyboard(event)
-        result=await handler(event,data)
+        # ReplyKeyboardRemove sent after this input callback would dismiss
+        # its new ForceReply composer. Clean up before that exact route only.
+        input_reply=bool(isinstance(event,CallbackQuery) and re.fullmatch(
+            r'amman:resume:[0-9a-f]{16}:[0-9a-f]{16}',str(event.data or '')))
+        if not input_reply:
+            result=await handler(event,data)
         try:
             # A slow/rejected auxiliary reset/delete must not hide a command's
             # response, delay it behind Telegram cleanup, or replay its handler.
             await asyncio.wait_for(hide_shop_keyboard_for_callback(event),timeout=2)
         except Exception as exc:
             logging.warning("Command keyboard cleanup deferred (%s)",type(exc).__name__)
+        if input_reply:
+            result=await handler(event,data)
         return result
 
 
@@ -19464,7 +19471,8 @@ async def owner_tools_verify_link_input(message: Message,state: FSMContext):
 async def tools_verification_link_recovery_filter(message: Message, state: FSMContext) -> bool:
     raw=str(message.text or "").strip()
     if (not raw.startswith(("https://","http://")) or await state.get_state()
-            or message.chat.type!="private" or message.chat.id!=message.from_user.id):
+            or message.chat.type!="private" or message.chat.id!=message.from_user.id
+            or am_service_manual.input_reply_form(message)):
         return False
     data=await state.get_data()
     owner=is_owner(message.from_user.id)
@@ -21288,7 +21296,7 @@ async def owner_tools_token_status(call: CallbackQuery,state: FSMContext):
         f"Email: <b>{html.escape(email or '-')}</b>",
     ]
     if token_at:
-        lines.append(f"Session: <b>{html.escape(token_at)}</b>")
+        lines.append(f"Session: <b>{html.escape(format_wib_datetime(token_at,seconds=True,compact=True))}</b>")
     lines += [
         "",
         "Token penuh tidak ditampilkan atau dikirim ke Telegram.",
@@ -35372,7 +35380,7 @@ async def owner_customer_profile_input(message: Message,state: FSMContext):
         f"💵 Total belanja: <b>{rupiah(int(orders['total_spent'] or 0))}</b>",
         f"⭐ Rating diberikan: <b>{profile['reviews']}</b>",
         f"🛡️ Status: <b>{'BLOKIR' if blocked else 'AKTIF'}</b>",
-        f"🕒 Order terakhir: <b>{html.escape(str(orders['last_order_at'] or '-'))}</b>",
+        f"🕒 Order terakhir: <b>{html.escape(format_wib_datetime(orders['last_order_at'],seconds=True,compact=True))}</b>",
     ]
     if latest:
         lines += ["","📚 <b>5 ORDER TERAKHIR</b>"]
@@ -36865,7 +36873,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.62"
+EXPECTED_SOURCE_VERSION = "17.63"
 
 
 def source_integrity_self_test():

@@ -22,12 +22,12 @@ from urllib.parse import parse_qsl, urlsplit
 from Crypto.Cipher import AES
 from aiogram import F
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup
 
 from am_service_client import (BASE_URL, AMServiceClient, AMServiceConfig,
                                AMServiceError, _email, _magic_link)
 
-ADAPTER_VERSION = '17.62'
+ADAPTER_VERSION = '17.63'
 JOB_PREFIX = 'ammanual.flow.'
 FSM_KEY = 'ammanual_job_id'
 FORM_SECONDS = 15 * 60
@@ -67,16 +67,28 @@ def _keyboard(rows):
         for row in rows])
 
 
+def input_reply_form(message):
+    """Identify our input prompt without storing the private reply or link."""
+    reply = getattr(message, 'reply_to_message', None)
+    text = str(getattr(reply, 'text', '') or '')
+    if not text.startswith('🔗 MASUKKAN MAGIC LINK\n'):
+        return None
+    match = re.search(r'\nForm AM: (' + IDENT + r')\Z', text)
+    return match[1] if match else None
+
+
 class GatewayManual:
     def __init__(self, host, config=None):
         self.host = host
         self.config = config if config is not None else AMServiceConfig.from_env()
         self.client = AMServiceClient(self.config)
         self._state_locks = {}
+        self._input_callbacks = {}
 
     async def close(self):
         await self.client.close()
         self._state_locks.clear()
+        self._input_callbacks.clear()
 
     def configured(self):
         return self.config.enabled is True and self.config.valid()
@@ -198,7 +210,11 @@ class GatewayManual:
                 # An old history button must never hijack a newer input session.
                 if others or job['status'] != 'WAIT_LINK':
                     return None
-                job['nonce'] = secrets.token_hex(8)
+                # Keep an active card usable when Telegram rejects its edit.
+                # Reopening an abandoned history form still invalidates its
+                # previous buttons before starting a new input session.
+                if not job.get('active'):
+                    job['nonce'] = secrets.token_hex(8)
             else:
                 if job['status'] != 'DRAFT' or any(row['created_at'] > job['created_at'] for row in others):
                     return None
@@ -423,7 +439,8 @@ class GatewayManual:
             if not self._expired(current):
                 rows.append([('🔗 Masukkan Magic Link', self._button('resume', current))])
         elif current['status'] == 'PREMIUM_ACTIVE':
-            text += 'Berlaku sampai: <b>' + html.escape(current['valid_until']) + '</b>\n'
+            text += 'Berlaku sampai: <b>' + html.escape(self.host.format_wib_datetime(
+                current['valid_until'], seconds=True, compact=True)) + '</b>\n'
             if current.get('plan_name'):
                 plan = current['plan_name'] if self.host.is_owner(event.from_user.id) else 'Alight Motion Pro'
                 text += 'Paket: ' + html.escape(plan) + '\n'
@@ -445,8 +462,8 @@ class GatewayManual:
         if _http(current.get('http_status')):
             text += '\nHTTP: ' + str(current['http_status'])
         if current.get('retry_at', 0) > time.time():
-            text += '\nCoba manual lagi setelah: ' + datetime.fromtimestamp(
-                current['retry_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+            text += '\nCoba manual lagi setelah: ' + self.host.format_wib_datetime(
+                current['retry_at'], seconds=True, compact=True)
         if current.get('active') and current['status'] not in TERMINAL:
             rows.append([('✖️ Batalkan Form', self._button('cancel', current))])
         rows.append([('⬅️ Aktivasi AM Pro', 'amman:menu')])
@@ -748,9 +765,17 @@ class GatewayManual:
                 if job:
                     await state.update_data(**{FSM_KEY: ident})
                     await state.set_state(ManualState.link)
+                    # A Telegram redelivery of the same callback must not
+                    # create repeated prompts. A deliberate later click may
+                    # reopen the reply composer without resending any email.
+                    key = (actor, ident, job['nonce'], str(call.id))
+                    prompt = key not in self._input_callbacks
+                    self._input_callbacks[key] = True
+                    if len(self._input_callbacks) > 256:
+                        self._input_callbacks.pop(next(iter(self._input_callbacks)))
             if not job:
                 return await self._notice(call, 'Sesi lain sedang aktif atau form sudah kedaluwarsa.')
-            return await self._render(call, state, job, session=True)
+            return await self._link_prompt(call, state, job, prompt=prompt)
         if not await self._session(call, state, job):
             return await self._notice(call, 'Tombol berasal dari form yang sudah ditinggalkan.')
         if action == 'cancel':
@@ -766,9 +791,58 @@ class GatewayManual:
             return await self._post(call, state, job)
         return await self._notice(call, 'Tahap form ini tidak sesuai.')
 
+    async def _link_prompt(self, call, state, job, *, prompt=True):
+        if not prompt:
+            return
+        if not await self._access(call, state) or not await self._session(call, state, job):
+            return
+        current = self.job(job['actor_id'], job['id'])
+        if not current or current['nonce'] != job['nonce'] or not current.get('active'):
+            return
+        current, ready = self._ready_job(current)
+        if (not ready or current['status'] != 'WAIT_LINK'
+                or current.get('verify_state') != 'NEW'
+                or current.get('send_state') not in {'DONE', 'UNKNOWN'}):
+            return await self._render(call, state, current, session=True)
+        text = ('🔗 <b>MASUKKAN MAGIC LINK</b>\n\n'
+                'Tempel tautan tombol <b>Masuk / Sign in</b> dari email sebagai balasan ke bot.')
+        try:
+            await self._ui(call, text, [
+                [('✖️ Batalkan Form', self._button('cancel', job))],
+                [('⬅️ Aktivasi AM Pro', 'amman:menu')]])
+        except Exception:
+            # The explicit reply prompt can still open input if a card edit
+            # fails. Never resend a provider request to repair Telegram UI.
+            pass
+        if not await self._access(call, state) or not await self._session(call, state, job):
+            return
+        current = self.job(job['actor_id'], job['id'])
+        if not current or current['nonce'] != job['nonce'] or not current.get('active'):
+            return
+        current, ready = self._ready_job(current)
+        if (not ready or current['status'] != 'WAIT_LINK'
+                or current.get('verify_state') != 'NEW'
+                or current.get('send_state') not in {'DONE', 'UNKNOWN'}):
+            # Link submission may complete while the card edit is in flight.
+            # Restore that result instead of asking for another private link.
+            return await self._render(call, state, current, session=True)
+        try:
+            await call.message.answer(
+                '🔗 <b>MASUKKAN MAGIC LINK</b>\n\n'
+                'Balas pesan ini dengan tautan tombol Masuk / Sign in dari email.\n'
+                'Form AM: ' + job['id'], parse_mode='HTML',
+                reply_markup=ForceReply(force_reply=True, selective=False,
+                                       input_field_placeholder='Tempel Magic Link dari email'))
+        except Exception:
+            # Sending may have succeeded despite a timeout. No automatic
+            # resend; input remains active and the card tells how to paste.
+            return await self._notice(call, 'Input sudah aktif. Tempel Magic Link dari email ke chat bot.')
+
     async def email_input(self, message, state):
         if not await self._access(message, state):
             return
+        if input_reply_form(message):
+            return await self._notice(message, 'Balasan berasal dari langkah Magic Link lama. Masukkan email pada form saat ini.')
         data = await state.get_data()
         job = self.job(int(message.from_user.id), data.get(FSM_KEY))
         if not job or job['status'] != 'EMAIL' or not await self._session(message, state, job):
@@ -797,6 +871,9 @@ class GatewayManual:
         job = self.job(int(message.from_user.id), data.get(FSM_KEY))
         if not job or not await self._session(message, state, job):
             return await self._notice(message, 'Sesi Magic Link tidak aktif. Buka AM Manual lagi.')
+        reply_form = input_reply_form(message)
+        if reply_form and reply_form != job['id']:
+            return await self._notice(message, 'Balasan berasal dari form lama. Gunakan Magic Link untuk form yang sedang aktif.')
         job = self._recover(job)
         if not job:
             return await self._notice(message, 'Sesi Magic Link sudah berubah. Buka AM Manual lagi.')

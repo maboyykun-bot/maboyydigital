@@ -25,7 +25,7 @@ from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMa
 from am_service_client import BASE_URL, AMServiceClient, AMServiceConfig, AMServiceError, _magic_link
 
 
-ADAPTER_VERSION = '17.62'
+ADAPTER_VERSION = '17.63'
 JOB_PREFIX = 'amservice.job.'
 DUE_PREFIX = 'amservice.due.'
 VIEW_PREFIX = 'amservice.view.'
@@ -714,7 +714,8 @@ class Gateway:
             try:
                 checked = datetime.fromisoformat(checked_at.replace('Z', '+00:00'))
                 if checked.tzinfo is not None:
-                    text += '\nInbox terakhir diperiksa: ' + checked.astimezone(timezone.utc).strftime('%H:%M:%S UTC')
+                    text += '\nInbox terakhir diperiksa: ' + self.host.format_wib_datetime(
+                        checked, seconds=True, compact=True)
             except (ValueError, AttributeError):
                 pass
             text += '\nBot melanjutkan otomatis; hasil akhir akan memperbarui pesan ini.'
