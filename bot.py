@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.55"
+BOT_VERSION = "17.57"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -333,6 +333,9 @@ PAYINAJA_GATEWAY = payinaja_gateway.Gateway(_otp_sys.modules[__name__])
 automatic_qris.register(router, _otp_sys.modules[__name__])
 KLIKQRIS_GATEWAY = klikqris_gateway.register(router, klikqris_gateway.Gateway(_otp_sys.modules[__name__]))
 payinaja_gateway.register(router, PAYINAJA_GATEWAY)
+import am_service_client
+import am_service_gateway
+AM_SERVICE_GATEWAY = am_service_gateway.register(router, am_service_gateway.Gateway(_otp_sys.modules[__name__]))
 import bot_api
 PARTNER_API = bot_api.register(router, bot_api.Manager(_otp_sys.modules[__name__]))
 START_TIME = time.time()
@@ -10294,6 +10297,7 @@ class OwnerState(StatesGroup):
     voucher_code = State()
     voucher_discount = State()
     voucher_min_spend = State()
+    voucher_edit_min_spend = State()
     voucher_quota = State()
     set_bank_name = State()
     set_bank_account = State()
@@ -15652,10 +15656,14 @@ async def temp_mail_resume_account(owner_id: int, mailbox_id: int) -> dict:
         return temp_mail_public_mailbox(await temp_mail_resume_locked(temp_mail_owned_row(owner_id, mailbox_id)))
 
 
-async def temp_mail_create_account(owner_id: int, *, auto_job_id=0) -> dict:
+async def temp_mail_create_account(owner_id: int, *, auto_job_id=0, provider=None) -> dict:
     temp_mail_assert_owner(owner_id)
     # Existing jobs retain their persisted mailbox; only new jobs choose a provider.
-    provider = auto_am_mail_provider() if auto_job_id else temp_mail_selected_provider()
+    if provider is not None and auto_job_id:
+        raise TempMailError("Provider job existing tidak boleh ditimpa.", status=409)
+    provider = (auto_am_mail_provider() if auto_job_id else temp_mail_selected_provider()) if provider is None else provider
+    if provider not in {"grabmail", "guerrilla", "mailtm", "maildrop"}:
+        raise TempMailError("Provider email tidak didukung.", status=503)
     if provider in {"mailtm", "guerrilla"}:
         temp_mail_encryption_key()
     async with temp_mail_async_locks(owner_id):
@@ -15995,6 +16003,7 @@ async def temp_mail_read_message(owner_id: int, mailbox_id: int, message_id: str
 def owner_tools_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚡ AM Pro Otomatis • 1 Tahun", callback_data=auto_am_start_token())],
+        [InlineKeyboardButton(text="⚡ AM Auto Create • API Baru", callback_data="amnew:menu")],
         [InlineKeyboardButton(text="✅ Magic Link / Verifikasi",callback_data="tools:verification")],
         [InlineKeyboardButton(text="🚀 Apply Premium",callback_data="tools:pro_license"),
          InlineKeyboardButton(text="📋 Hasil Provider",callback_data="tools:final_result")],
@@ -30019,9 +30028,44 @@ async def render_owner_voucher_detail(call,ident,*,created=False):
            f"Status: {'Aktif' if row['active'] else 'Nonaktif'}\n"
            'Produk yang tidak sesuai otomatis ditolak saat checkout.')
     await safe_edit_or_answer(call,text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='✏️ Minimal Pembelian',callback_data=f'ownervoucher:min:{ident}')],
         [InlineKeyboardButton(text='📦 Atur Produk Voucher',callback_data=f'ownervoucher:products:{ident}:1')],
         [InlineKeyboardButton(text='⬅️ Daftar Voucher',callback_data='ownervoucher:list:1')],
         [InlineKeyboardButton(text='🏠 Menu Voucher',callback_data='owner:vouchers')]]),parse_mode='HTML')
+
+
+async def voucher_min_edit_data(event,state,token=None):
+    draft=(await state.get_data()).get('voucher_min_edit',{})
+    if (await state.get_state()!=OwnerState.voucher_edit_min_spend.state or not isinstance(draft,dict) or not draft
+            or draft.get('actor')!=event.from_user.id
+            or not 0<=time.time()-float(draft.get('created_at',0))<=VOUCHER_WIZARD_SECONDS
+            or (token is not None and token!=draft.get('token'))):
+        raise ValueError('Form minimal pembelian sudah berubah/kedaluwarsa. Buka detail voucher kembali.')
+    return draft
+
+
+@router.message(OwnerState.voucher_edit_min_spend)
+async def voucher_min_edit_input(message: Message,state: FSMContext):
+    if not await voucher_owner_guard(message):return
+    try:
+        draft=await voucher_min_edit_data(message,state)
+        raw=str(message.text or '').strip()
+        if len(raw)>64 or not re.fullmatch(r'(?:rp\s*)?(?:[0-9]+|[0-9]{1,3}(?:[., ][0-9]{3})+)',raw,re.I):
+            raise ValueError('Kirim nominal berupa angka, misalnya 25000 atau Rp25.000. Angka 0 berarti tanpa minimum.')
+        minimum=int(re.sub(r'\D','',raw))
+        if minimum>1000000000:raise ValueError('Minimal pembelian harus antara 0 dan Rp1.000.000.000.')
+        draft=dict(draft,new_min=minimum,token=secrets.token_hex(6))
+        await state.update_data(voucher_min_edit=draft)
+        await message.answer('✏️ <b>KONFIRMASI MINIMAL PEMBELIAN</b>\n\n'
+            f"Kode: <code>{html.escape(draft['code'])}</code>\n"
+            f"Lama: {rupiah(draft['old_min'])}\nBaru: {rupiah(minimum)}\n\n"
+            'Dihitung dari subtotal belanja sebelum diskon. Angka 0 berarti tanpa minimum.\n'
+            'Invoice yang sudah dibuat tetap memakai nominal yang tercatat.',parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text='✅ Simpan Minimal Pembelian',callback_data='ownervoucher:minsave:'+draft['token'])],
+                [InlineKeyboardButton(text='❌ Batal',callback_data=f"ownervoucher:detail:{draft['id']}")]]))
+    except (ValueError,TypeError,OverflowError) as exc:
+        await message.answer(str(exc) if isinstance(exc,ValueError) else 'Form voucher tidak valid. Buka detail voucher kembali.')
 
 
 @router.callback_query((F.data=='owner:vouchers') | F.data.startswith('ownervoucher:'))
@@ -30029,12 +30073,15 @@ async def owner_voucher_management(call: CallbackQuery,state: FSMContext):
     if not await voucher_owner_guard(call):return
     parts=str(call.data or '').split(':')
     try:
+        if (await state.get_state()==OwnerState.voucher_edit_min_spend.state
+                and not (len(parts)==3 and parts[1]=='minsave')):
+            await state.clear()
         if call.data=='owner:vouchers':
             clear_owner_input_session(call.from_user.id);await state.clear()
-            await safe_edit_or_answer(call,'🎁 <b>VOUCHER PRODUK</b>\n\nBuat voucher khusus produk atau tentukan produk untuk voucher yang sudah ada.',
+            await safe_edit_or_answer(call,'🎁 <b>VOUCHER PRODUK</b>\n\nBuat voucher atau atur produk dan minimal pembelian voucher yang sudah ada.',
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text='➕ Buat Voucher',callback_data='owner:add_voucher')],
-                    [InlineKeyboardButton(text='📋 Daftar & Atur Produk',callback_data='ownervoucher:list:1')],
+                    [InlineKeyboardButton(text='📋 Daftar & Edit Voucher',callback_data='ownervoucher:list:1')],
                     [InlineKeyboardButton(text='⬅️ Promo & Voucher',callback_data='owner:promo_menu')]]),parse_mode='HTML')
         elif len(parts)==3 and parts[1]=='list':
             page=max(1,min(100000,int(parts[2])));await state.clear();conn=db()
@@ -30052,6 +30099,37 @@ async def owner_voucher_management(call: CallbackQuery,state: FSMContext):
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),parse_mode='HTML')
         elif len(parts)==3 and parts[1]=='detail':
             await state.clear();await render_owner_voucher_detail(call,int(parts[2]))
+        elif len(parts)==3 and parts[1]=='min':
+            ident=int(parts[2]);conn=db()
+            try:row=conn.execute('SELECT id,code,min_spend FROM vouchers WHERE id=?',(ident,)).fetchone()
+            finally:conn.close()
+            if not row:raise ValueError('Voucher tidak ditemukan.')
+            clear_owner_input_session(call.from_user.id)
+            await state.clear()
+            await state.set_data({'voucher_min_edit':{'id':row['id'],'code':row['code'],'old_min':int(row['min_spend'] or 0),
+                'actor':call.from_user.id,'created_at':time.time()}})
+            await state.set_state(OwnerState.voucher_edit_min_spend)
+            await safe_edit_or_answer(call,'✏️ <b>EDIT MINIMAL PEMBELIAN</b>\n\n'
+                f"Kode: <code>{html.escape(row['code'])}</code>\nSaat ini: {rupiah(row['min_spend'])}\n\n"
+                'Kirim nominal baru, misalnya <code>25000</code> atau <code>Rp25.000</code>.\n'
+                'Kirim <code>0</code> untuk tanpa minimum. Dihitung dari subtotal sebelum diskon.',
+                parse_mode='HTML',reply_markup=back_owner(f'ownervoucher:detail:{ident}'))
+        elif len(parts)==3 and parts[1]=='minsave':
+            draft=await voucher_min_edit_data(call,state,parts[2])
+            if 'new_min' not in draft or not re.fullmatch(r'[a-f0-9]{12}',parts[2]):
+                raise ValueError('Konfirmasi minimal pembelian tidak valid.')
+            conn=db()
+            try:
+                begin_immediate_retry(conn)
+                changed=conn.execute('UPDATE vouchers SET min_spend=? WHERE id=? AND min_spend=?',
+                    (draft['new_min'],draft['id'],draft['old_min'])).rowcount
+                if not changed:raise ValueError('Voucher sudah berubah atau dihapus. Buka detail voucher kembali.')
+                conn.commit()
+            except Exception:conn.rollback();raise
+            finally:conn.close()
+            await state.clear()
+            await render_owner_voucher_detail(call,draft['id'])
+            return await safe_callback_notice(call,'Minimal pembelian voucher disimpan.')
         elif len(parts)==4 and parts[1]=='products':
             ident=int(parts[2]);page=max(1,min(100000,int(parts[3])));conn=db()
             try:
@@ -36736,7 +36814,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.55"
+EXPECTED_SOURCE_VERSION = "17.57"
 
 
 def source_integrity_self_test():
@@ -36851,6 +36929,10 @@ async def main():
     ]
     background_tasks.extend(PAYMENT_RECEIPTS.start(bot))
     try:
+        background_tasks.extend(await AM_SERVICE_GATEWAY.start(bot))
+    except Exception as exc:
+        logging.warning("AM service worker startup failed: %s", type(exc).__name__)
+    try:
         background_tasks.extend(await OTP_STORE.start(bot))
     except Exception as exc:
         # Integration startup failure must not stop existing shop commands.
@@ -36917,6 +36999,11 @@ async def main():
                 await gateway.close()
             except Exception:
                 logging.warning("Automatic payment client cleanup failed.")
+
+        try:
+            await AM_SERVICE_GATEWAY.close()
+        except Exception:
+            logging.warning("AM service client cleanup failed.")
 
         try:
             await runner.cleanup()
