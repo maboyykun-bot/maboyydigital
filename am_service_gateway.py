@@ -25,7 +25,7 @@ from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMa
 from am_service_client import BASE_URL, AMServiceClient, AMServiceConfig, AMServiceError, _magic_link
 
 
-ADAPTER_VERSION = '17.61'
+ADAPTER_VERSION = '17.62'
 JOB_PREFIX = 'amservice.job.'
 DUE_PREFIX = 'amservice.due.'
 VIEW_PREFIX = 'amservice.view.'
@@ -73,11 +73,12 @@ class Gateway:
         self.config = config if config is not None else AMServiceConfig.from_env()
         self.client = AMServiceClient(self.config)
         self._task = None
-        self._views = {}  # Explicit requests in this process only; never persisted.
+        self._views = {}  # Live handles; only owner/message bindings are persisted.
         self._rendered = {}
         self._display_retry = {}
         self._edit_only = set()
         self._publishing = set()
+        self._started = set()
         self._view_tokens = {}
         self._permanent_targets = set()
         self._bot = None
@@ -490,12 +491,6 @@ class Gateway:
         await self.host.safe_callback_notice(call)
         if state is not None:
             await state.set_state(None)
-        owner = int(call.from_user.id)
-        with self._connection() as conn:
-            rows = conn.execute('SELECT value FROM settings WHERE key LIKE ? ORDER BY rowid DESC LIMIT 30',
-                                (JOB_PREFIX + '%',)).fetchall()
-        jobs = [json.loads(row['value']) for row in rows]
-        jobs = [job for job in jobs if job.get('owner_id') == owner][:5]
         status = 'Konfigurasi tersedia' if self.configured() else 'DISABLED' if not self.config.enabled else 'CONFIG'
         text = ('⚡ <b>am-api-service.vercel.app</b>\n\nStatus: <b>' + status + '</b>\n'
                 'Auto Create membuat email melalui Grabmail. Manual memakai email Anda sendiri.\n'
@@ -507,9 +502,70 @@ class Gateway:
         controls = [[('✉️ Aktivasi Manual • Email Sendiri', 'amman:menu')]]
         if self.configured() and self.host.TEMPMAIL_ENABLED:
             controls.append([('⚡ Buat AM Pro', 'amnew:new:' + secrets.token_hex(8))])
-        controls += [[('📋 ' + job['id'] + ' • ' + job['status'], 'amnew:view:' + job['id'])] for job in jobs]
+        controls.append([('📋 Riwayat Aktivasi', 'amnew:history:1')])
         controls.append([('⬅️ Owner Tools', 'tools:home')])
         return await self.host.safe_edit_or_answer(call, text, reply_markup=self._keyboard(controls), parse_mode='HTML')
+
+    async def history(self, call, page=1, state=None):
+        if not self.host.is_owner(call.from_user.id):
+            return await self.host.deny_owner_callback(call)
+        if not await self.host.tools_vip_public_guard(call):
+            return
+        await self.host.safe_callback_notice(call)
+        if state is not None:
+            await state.set_state(None)
+        if type(page) is not int or page < 1:
+            return await self.host.safe_callback_notice(call, 'Halaman riwayat tidak valid.', show_alert=True)
+        owner = int(call.from_user.id)
+        jobs = []
+        with self._connection() as conn:
+            rows = conn.execute('SELECT key FROM settings WHERE key LIKE ? ORDER BY rowid DESC',
+                                (JOB_PREFIX + '%',)).fetchall()
+            for row in rows:
+                ident = row['key'][len(JOB_PREFIX):]
+                if not re.fullmatch('[0-9a-f]{16}', ident):
+                    continue
+                job = self._load(conn, ident)
+                if (job and type(job.get('owner_id')) is int and job['owner_id'] == owner
+                        and job.get('status') in TERMINAL | {'WAITING', 'RUNNING'}):
+                    jobs.append(job)
+        pages = max(1, (len(jobs) + 4) // 5)
+        page = min(page, pages)
+        text = '📋 <b>RIWAYAT AUTO CREATE AM</b>\n\nHalaman ' + str(page) + '/' + str(pages)
+        if not jobs:
+            text += '\nBelum ada proses tersimpan.'
+        controls = [[('📋 ' + job['id'] + ' • ' + job['status'], 'amnew:view:' + job['id'])]
+                    for job in jobs[(page - 1) * 5:page * 5]]
+        nav = []
+        if page > 1:
+            nav.append(('⬅️ Sebelumnya', 'amnew:history:' + str(page - 1)))
+        if page < pages:
+            nav.append(('Berikutnya ➡️', 'amnew:history:' + str(page + 1)))
+        if nav:
+            controls.append(nav)
+        controls.append([('⬅️ AM Auto Create', 'amnew:menu')])
+        return await self.host.safe_edit_or_answer(call, text, reply_markup=self._keyboard(controls), parse_mode='HTML')
+
+    async def _show_start(self, owner, ident):
+        """Acknowledge the click in-place without another message or API action."""
+        key = (owner, ident)
+        job = self.job(owner, ident)
+        call = self._views.get(key)
+        if (call is None or job is None or job['status'] in TERMINAL
+                or key in self._started or key in self._publishing):
+            return False
+        self._started.add(key)
+        self._publishing.add(key)
+        try:
+            return await asyncio.wait_for(self._deliver(call,
+                '⏳ <b>Membuat AM Pro…</b>\n\nProses berjalan otomatis. Hasil akhir akan mengganti pesan ini.',
+                self._keyboard([]), edit_only=True), DISPLAY_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        finally:
+            self._publishing.discard(key)
 
     def _success_view(self, job, mailbox):
         """Export only the requested email/public inbox, never login credentials."""
@@ -706,6 +762,7 @@ class Gateway:
         self._view_tokens.pop(key, None)
         self._display_retry.pop(key, None)
         self._edit_only.discard(key)
+        self._started.discard(key)
 
     def _restore_views(self):
         if not callable(getattr(self._bot, 'edit_message_text', None)) or len(self._views) >= 64:
@@ -802,7 +859,12 @@ class Gateway:
     async def callback(self, call, state=None):
         if call.data == 'amnew:menu':
             return await self.menu(call, state)
-        if not await self.host.temp_mail_require_owner(call):
+        history = re.fullmatch(r'amnew:history:([1-9][0-9]{0,5})', str(call.data or ''))
+        if history:
+            return await self.history(call, int(history[1]), state)
+        if not self.host.is_owner(call.from_user.id):
+            return await self.host.deny_owner_callback(call)
+        if not await self.host.tools_vip_public_guard(call):
             return
         if state is not None:
             await state.set_state(None)
@@ -810,6 +872,8 @@ class Gateway:
         if not match:
             return await self.host.safe_callback_notice(call, 'Tombol tidak valid.', show_alert=True)
         action, ident = match.groups()
+        if action != 'view' and not await self.host.temp_mail_require_owner(call):
+            return
         owner = int(call.from_user.id)
         try:
             job = self.job(owner, ident)
@@ -828,9 +892,11 @@ class Gateway:
                 self._display_retry.pop(oldest, None)
                 self._edit_only.discard(oldest)
                 self._view_tokens.pop(oldest, None)
+                self._started.discard(oldest)
             await self.host.safe_callback_notice(call,
                 'Proses dimulai; hasil akhir ditampilkan otomatis.' if action != 'view' else 'Membuka riwayat aktivasi...')
             if action != 'view':
+                await self._show_start(owner, ident)
                 await self.process(owner, ident, call)
             return await self._publish(owner, ident, force=action == 'view', terminal_only=action != 'view')
         except asyncio.CancelledError:
@@ -886,6 +952,7 @@ class Gateway:
         self._display_retry.clear()
         self._edit_only.clear()
         self._publishing.clear()
+        self._started.clear()
         self._view_tokens.clear()
         self._permanent_targets.clear()
         self._bot = None
