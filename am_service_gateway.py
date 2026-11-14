@@ -24,7 +24,7 @@ from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMa
 from am_service_client import BASE_URL, AMServiceClient, AMServiceConfig, AMServiceError, _magic_link
 
 
-ADAPTER_VERSION = '17.59'
+ADAPTER_VERSION = '17.60'
 JOB_PREFIX = 'amservice.job.'
 DUE_PREFIX = 'amservice.due.'
 WORK_SECONDS = 90
@@ -622,7 +622,7 @@ class Gateway:
                 pass
             if job.get('send_state') == 'DONE':
                 text += '\nHTTP send-link hanya membuktikan permintaan diterima API; bukan email sudah sampai.'
-        controls = [[('🔄 Cek Job', 'amnew:resume:' + job['id'])], [('⬅️ AM Auto Create', 'amnew:menu')]]
+        controls = [[('⬅️ AM Auto Create', 'amnew:menu')]]
         if mailbox is not None and mailbox.get('state') == 'ready':
             controls.insert(0, [('📬 Inbox Email', 'tm:inbox:' + str(mailbox['id']) + ':1')])
         return await self.host.safe_edit_or_answer(call, text, reply_markup=self._keyboard(controls), parse_mode='HTML')

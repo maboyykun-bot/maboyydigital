@@ -27,7 +27,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from am_service_client import (BASE_URL, AMServiceClient, AMServiceConfig,
                                AMServiceError, _email, _magic_link)
 
-ADAPTER_VERSION = '17.59'
+ADAPTER_VERSION = '17.60'
 JOB_PREFIX = 'ammanual.flow.'
 FSM_KEY = 'ammanual_job_id'
 FORM_SECONDS = 15 * 60
@@ -316,7 +316,7 @@ class GatewayManual:
     def _title(self, actor):
         return 'AM MANUAL • API BARU' if self.host.is_owner(actor) else 'AKTIVASI AM PRO'
 
-    async def menu(self, call, state):
+    async def menu(self, call, state, *, history_only=False):
         if not await self._access(call, state):
             return
         if hasattr(call, 'data'):
@@ -341,16 +341,28 @@ class GatewayManual:
                 'Gunakan email milik Anda, lalu tempel Magic Link dari inbox email yang sama. '
                 'Premium aktif hanya ditampilkan setelah bukti lengkap terkonfirmasi.\n'
                 'Form berlaku 15 menit. Kuota /tools mengikuti aturan akun Anda.')
+        owner = self.host.is_owner(actor)
+        if not owner:
+            text = ('📧 <b>AKTIVASI AM PRO</b>\n\n'
+                    '<b>Langkah 1/3 — Masukkan email</b>\n'
+                    'Gunakan alamat email milik Anda. Setelah permintaan kirim diterima, '
+                    'buka inbox atau spam lalu kirim Magic Link dari email tersebut ke bot.\n\n'
+                    'Form berlaku 15 menit. Status Premium ditampilkan setelah verifikasi berhasil.')
+        if history_only:
+            text = ('📋 <b>RIWAYAT AKTIVASI</b>\n\n'
+                    'Pilih proses untuk melihat hasil atau melanjutkan input tautan dari email Anda.'
+                    if jobs else '📋 <b>RIWAYAT AKTIVASI</b>\n\nBelum ada proses aktivasi tersimpan.')
         rows = []
-        if self.configured():
+        if self.configured() and not history_only:
             try:
                 draft = self._draft(actor)
                 rows.append([('📧 Mulai dengan Email', self._button('new', draft))])
             except Exception:
                 text += '\n\nStatus: CONFIG'
-        else:
+        elif not history_only:
             text += '\n\nStatus: ' + ('DISABLED' if not self.config.enabled else 'CONFIG')
-        rows += [[('📋 ' + job['id'] + ' • ' + job['status'], self._button('view', job))] for job in jobs]
+        if owner or history_only:
+            rows += [[('📋 ' + job['id'] + ' • ' + job['status'], self._button('view', job))] for job in jobs]
         rows.append([self._back(actor)])
         if self._live(call):
             return await self._ui(call, text, rows)
@@ -368,6 +380,9 @@ class GatewayManual:
                   'PREMIUM_ACTIVE': '✅ PREMIUM ACTIVE', 'UNKNOWN': 'Hasil belum terkonfirmasi',
                   'FAILED': 'Belum berhasil', 'ACCOUNT_CHANGED': 'Konfigurasi akun berubah',
                   'EXPIRED': 'Form kedaluwarsa'}
+        if not self.host.is_owner(event.from_user.id):
+            labels['WAIT_LINK'] = 'Langkah 2/3 — Kirim Magic Link'
+            labels['CONFIRM_SEND'] = 'Langkah 1/3 — Konfirmasi email'
         text = ('⚡ <b>' + self._title(int(event.from_user.id)) + '</b>\n\nCID: <code>' + current['id']
                 + '</code>\nStatus: <b>' + labels.get(current['status'], 'Menunggu') + '</b>\n')
         try:
@@ -383,11 +398,16 @@ class GatewayManual:
             if current['send_state'] == 'NEW' and not self._expired(current):
                 rows.append([('📨 Kirim Magic Link', self._button('send', current))])
         elif current['status'] == 'WAIT_LINK':
-            text += '\nBuka inbox email yang sama, lalu tempel URL Magic Link lengkap di chat ini. '
-            text += 'Contoh format: https://alightcreative.com/__/auth/action?oobCode=CONTOH\n'
-            text += 'Jangan kirim password, API key, ID token, atau refresh token.'
-            if not session and not self._expired(current):
-                rows.append([('🔗 Lanjutkan Input Link', self._button('resume', current))])
+            text += ('\n<b>Jika email sudah masuk:</b>\n'
+                     '1. Buka email dari Alight di inbox atau spam.\n'
+                     '2. Tekan lama tombol Sign in / Masuk, lalu pilih Salin Tautan.\n'
+                     '3. Tempel URL lengkap tersebut sebagai pesan ke bot ini.\n\n'
+                     '<b>Jika email belum masuk:</b> periksa alamat di atas dan folder Spam/Promosi. '
+                     'Permintaan diterima layanan belum membuktikan email sudah sampai. '
+                     'Bot tidak dapat membaca inbox email pribadi Anda. Hubungi owner bila email tetap tidak diterima.\n'
+                     'Jangan kirim password atau token akun.')
+            if not self._expired(current):
+                rows.append([('🔗 Masukkan Magic Link', self._button('resume', current))])
         elif current['status'] == 'PREMIUM_ACTIVE':
             text += 'Berlaku sampai: <b>' + html.escape(current['valid_until']) + '</b>\n'
             if current.get('plan_name'):
@@ -415,7 +435,7 @@ class GatewayManual:
                 current['retry_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         if current.get('active'):
             rows.append([('✖️ Batalkan Form', self._button('cancel', current))])
-        rows.append([('⬅️ AM Manual', 'amman:menu')])
+        rows.append([('⬅️ Aktivasi AM Pro', 'amman:menu')])
         if self._live(event):
             return await self._ui(event, text, rows)
 
@@ -661,6 +681,8 @@ class GatewayManual:
     async def callback(self, call, state):
         if call.data == 'amman:menu':
             return await self.menu(call, state)
+        if call.data == 'amman:history':
+            return await self.menu(call, state, history_only=True)
         if not await self._access(call, state):
             return
         await self.host.safe_callback_notice(call)

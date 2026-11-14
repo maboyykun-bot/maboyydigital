@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.59"
+BOT_VERSION = "17.60"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -11163,7 +11163,7 @@ class PurchaseRatingMiddleware(BaseMiddleware):
                 'usercancel:','topupcancel:','proofsubmit:','userproofback:','proofback:',
                 'resendorder:','loginproof:','usercomplaint:','usercomplaintcancel:',
                 'preorderdetail:','aqris:u:check:','aqris:u:qr:','aqris:u:cancel:',
-                'amman:view:','amman:resume:','amman:cancel:')) or value in {'my_orders','verify_join','contact_owner','amman:menu'}
+                'amman:view:','amman:resume:','amman:cancel:')) or value in {'my_orders','verify_join','contact_owner','amman:menu','amman:history','utools:limits'}
             try:
                 if value.startswith(otp_smscode.PREFIX):
                     action,_=OTP_STORE.read_token(user,value[len(otp_smscode.PREFIX):])
@@ -14375,12 +14375,29 @@ def provider_response_state(result, *, http_status=200, require_evidence=False) 
     return "unknown" if require_evidence else "success"
 
 
-def _tools_request_totals(conn, owner_id, start_utc, next_utc):
+def _tools_scope(correlation_id="") -> str:
+    return "am_service" if isinstance(correlation_id, str) and re.fullmatch(
+        r"(?:amservice|ammanual):[0-9a-f]{16}", correlation_id) else "legacy"
+
+
+def _tools_quota_scope_sql(scope: str) -> str:
+    if scope not in {"legacy", "am_service"}:
+        raise ValueError("Unknown Tools quota scope")
+    # The exact persisted flow keys also classify pre-update account rows.
+    # No rows are rewritten, deleted, or attributed by email/provider guesses.
+    digits = "[0-9a-f]" * 16
+    clause = "(quota_key GLOB 'flow:amservice:" + digits + "' OR quota_key GLOB 'flow:ammanual:" + digits + "')"
+    return clause if scope == "am_service" else "NOT " + clause
+
+
+def _tools_request_totals(conn, owner_id, start_utc, next_utc, *, scope="legacy"):
+    _tools_quota_scope_sql(scope)  # Validate the scope before selecting SQL.
+    method_filter = "method='AM_SERVICE_POST'" if scope == "am_service" else "method!='AM_SERVICE_POST'"
     bounds=(int(owner_id),start_utc.isoformat(timespec="seconds"),next_utc.isoformat(timespec="seconds"))
     rows=conn.execute("""SELECT status,COUNT(*) AS n FROM tool_provider_requests
-                         WHERE owner_id=? AND created_at>=? AND created_at<? GROUP BY status""",bounds).fetchall()
+                         WHERE owner_id=? AND created_at>=? AND created_at<? AND """ + method_filter + " GROUP BY status",bounds).fetchall()
     totals={str(row["status"]):int(row["n"] or 0) for row in rows}
-    legacy=int(conn.execute("""SELECT COUNT(*) AS n FROM tool_provision_logs
+    legacy=0 if scope == "am_service" else int(conn.execute("""SELECT COUNT(*) AS n FROM tool_provision_logs
                               WHERE owner_id=? AND created_at>=? AND created_at<? AND request_metered=0""",
                             bounds).fetchone()["n"] or 0)
     return totals,legacy
@@ -14394,18 +14411,18 @@ def _tools_account_key(email: str, correlation_id: str, start_utc) -> str:
     return 'request:'+secrets.token_hex(16)
 
 
-def _tools_account_reservation(conn, owner_id, email, correlation_id, start_utc, next_utc):
+def _tools_account_reservation(conn, owner_id, email, correlation_id, start_utc, next_utc, *, scope="legacy"):
     key=_tools_account_key(email,correlation_id,start_utc)
     start_ts=int(start_utc.replace(tzinfo=timezone.utc).timestamp())
     next_ts=int(next_utc.replace(tzinfo=timezone.utc).timestamp())
-    return conn.execute("""SELECT * FROM tool_account_quotas WHERE owner_id=? AND
+    return conn.execute("""SELECT * FROM tool_account_quotas WHERE owner_id=? AND """ + _tools_quota_scope_sql(scope) + """ AND
         (quota_key=? OR (target_email=? AND target_email!='' AND created_ts>=? AND created_ts<?))
         ORDER BY units DESC LIMIT 1""",(int(owner_id),key,email,start_ts,next_ts)).fetchone()
 
 
-def _tools_account_usage(conn, owner_id, start_utc, next_utc) -> int:
+def _tools_account_usage(conn, owner_id, start_utc, next_utc, *, scope="legacy") -> int:
     return int(conn.execute("""SELECT COALESCE(SUM(units),0) FROM tool_account_quotas
-        WHERE owner_id=? AND created_ts>=? AND created_ts<?""",
+        WHERE owner_id=? AND created_ts>=? AND created_ts<? AND """ + _tools_quota_scope_sql(scope),
         (int(owner_id),int(start_utc.replace(tzinfo=timezone.utc).timestamp()),
          int(next_utc.replace(tzinfo=timezone.utc).timestamp()))).fetchone()[0])
 
@@ -14416,10 +14433,11 @@ def _reserve_tool_provider_request(owner_id: int, method: str, *, target_email="
     conn=db(); begin_immediate_retry(conn)
     try:
         email=str(target_email or '').strip().lower()
+        scope=_tools_scope(correlation_id)
         if count_account:
-            reserved=_tools_account_reservation(conn,owner_id,email,correlation_id,start_utc,next_utc)
+            reserved=_tools_account_reservation(conn,owner_id,email,correlation_id,start_utc,next_utc,scope=scope)
             if not reserved:
-                if _tools_account_usage(conn,owner_id,start_utc,next_utc)>=TOOLS_PROVIDER_HOURLY_LIMIT:
+                if _tools_account_usage(conn,owner_id,start_utc,next_utc,scope=scope)>=TOOLS_PROVIDER_HOURLY_LIMIT:
                     conn.rollback();return 0
                 conn.execute("INSERT INTO tool_account_quotas(owner_id,quota_key,target_email,created_ts) VALUES(?,?,?,?)",
                              (int(owner_id),_tools_account_key(email,correlation_id,start_utc),email,int(time.time())))
@@ -14429,7 +14447,8 @@ def _reserve_tool_provider_request(owner_id: int, method: str, *, target_email="
                 conn.execute("INSERT OR IGNORE INTO tool_account_quotas(owner_id,quota_key,target_email,created_ts,units) VALUES(?,?,?,?,0)",
                     (int(owner_id),_tools_account_key(email,correlation_id,start_utc),email,int(reserved['created_ts'])))
         cur=conn.execute("INSERT INTO tool_provider_requests(owner_id,method,created_at) VALUES(?,?,?)",
-                         (int(owner_id),method,datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")))
+                         (int(owner_id),'AM_SERVICE_POST' if scope == 'am_service' else method,
+                          datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")))
         conn.commit();return int(cur.lastrowid)
     except Exception:conn.rollback();raise
     finally:conn.close()
@@ -16052,6 +16071,11 @@ def owner_tools_home_text(owner_id: int) -> str:
         quota = f"{stats['used_accounts']}/{TOOLS_PROVIDER_HOURLY_LIMIT} akun/jam • reset {stats['reset_at']}"
     except sqlite3.Error:
         quota = "belum tersedia"
+    try:
+        service_stats=tools_stats_snapshot(owner_id,scope='am_service')
+        service_quota=f"{service_stats['used_accounts']}/{service_stats['hourly_limit']} akun/jam • reset {service_stats['reset_at']}"
+    except sqlite3.Error:
+        service_quota="belum tersedia"
     return (
         "🧰 <b>OWNER TOOLS</b>\n"
         "Gunakan fitur dengan bijak.\n\n"
@@ -16059,7 +16083,9 @@ def owner_tools_home_text(owner_id: int) -> str:
         f"{html.escape(tools_legacy_website_name())}: <b>{html.escape(tools_provider_status_text())}</b>\n"
         "am-api-service.vercel.app: Auto Create atau aktivasi manual.\n"
         "Paket Free API baru: <b>50 request/hari per API key</b>; biasanya 2 request per aktivasi.\n"
-        f"Aktivasi premium: <b>{quota}</b>\n"
+        f"Pemakaian layanan lama: <b>{quota}</b>\n"
+        f"Pemakaian layanan baru: <b>{service_quota}</b>\n"
+        "Pencatatan kedua layanan terpisah.\n"
         "Temp Mail: <b>Tanpa batas pembuatan di bot</b>"
     )
 
@@ -16364,15 +16390,19 @@ def tools_hour_window():
     return now_wib,start_wib,next_wib,start_utc,next_utc
 
 
-def tools_stats_snapshot(owner_id: int) -> dict:
+def tools_stats_snapshot(owner_id: int, *, scope="legacy") -> dict:
     now_wib,start_wib,next_wib,start_utc,next_utc=tools_hour_window()
     conn=db()
     try:
-        totals,legacy=_tools_request_totals(conn,owner_id,start_utc,next_utc)
-        used_accounts=_tools_account_usage(conn,owner_id,start_utc,next_utc)
-        lifetime_rows=conn.execute(
+        totals,legacy=_tools_request_totals(conn,owner_id,start_utc,next_utc,scope=scope)
+        used_accounts=_tools_account_usage(conn,owner_id,start_utc,next_utc,scope=scope)
+        if scope == "am_service":
+            lifetime_rows=conn.execute("""SELECT status,COUNT(*) AS n FROM tool_provider_requests
+                WHERE owner_id=? AND method='AM_SERVICE_POST' GROUP BY status""",(int(owner_id),)).fetchall()
+        else:
+            lifetime_rows=conn.execute(
             """SELECT status,COUNT(*) AS n FROM (
-                SELECT status FROM tool_provider_requests WHERE owner_id=?
+                SELECT status FROM tool_provider_requests WHERE owner_id=? AND method!='AM_SERVICE_POST'
                 UNION ALL SELECT status FROM tool_provision_logs
                 WHERE owner_id=? AND request_metered=0
             ) GROUP BY status""",(int(owner_id),int(owner_id))
@@ -16381,7 +16411,7 @@ def tools_stats_snapshot(owner_id: int) -> dict:
         conn.close()
     lifetime={str(row["status"]):int(row["n"] or 0) for row in lifetime_rows}
     success=int(lifetime.get("success",0)); failed=int(lifetime.get("failed",0))
-    cost=max(1,int(TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT))
+    cost=2 if scope == "am_service" else max(1,int(TOOLS_PROVIDER_REQUESTS_PER_ACCOUNT))
     used=sum(totals.values())+legacy*cost
     remaining=max(0,TOOLS_PROVIDER_HOURLY_LIMIT-used_accounts)
     reset=max(0,int((next_wib-now_wib).total_seconds()))
@@ -16435,12 +16465,13 @@ def tools_stats_text(owner_id: int) -> str:
 
 
 def tools_quota_can_process(owner_id: int, *, requests_needed=None, target_email="", correlation_id="") -> tuple[bool,dict]:
-    stats=tools_stats_snapshot(owner_id)
+    scope=_tools_scope(correlation_id)
+    stats=tools_stats_snapshot(owner_id,scope=scope)
     if target_email or correlation_id:
         _,_,_,start_utc,next_utc=tools_hour_window()
         conn=db()
         try:
-            if _tools_account_reservation(conn,owner_id,str(target_email or '').strip().lower(),correlation_id,start_utc,next_utc):
+            if _tools_account_reservation(conn,owner_id,str(target_email or '').strip().lower(),correlation_id,start_utc,next_utc,scope=scope):
                 return True,stats
         finally:
             conn.close()
@@ -18140,11 +18171,14 @@ def tools_user_success_flow(user_id: int, correlation_id: str=""):
 
 
 def tools_user_menu(user_id: int):
-    rows=[[InlineKeyboardButton(text='👑 VIP • Rp20.000 / bulan',callback_data='utools:vip')]]
+    rows=[[InlineKeyboardButton(text='👑 Aktifkan VIP • Rp20.000 / bulan',callback_data='utools:vip')]]
     if tools_user_allowed(user_id):
-        rows[0:0]=[
-            [InlineKeyboardButton(text="📧 Aktivasi AM Pro",callback_data="amman:menu")],
-            [InlineKeyboardButton(text="📖 Panduan Login AM via Email",callback_data="utools:login_guide")],
+        rows=[
+            [InlineKeyboardButton(text="📧 Mulai Aktivasi",callback_data="amman:menu")],
+            [InlineKeyboardButton(text="📋 Riwayat Aktivasi",callback_data="amman:history")],
+            [InlineKeyboardButton(text="📖 Panduan Login",callback_data="utools:login_guide"),
+             InlineKeyboardButton(text="📊 Batas Penggunaan",callback_data="utools:limits")],
+            [InlineKeyboardButton(text='👑 Kelola VIP',callback_data='utools:vip')],
         ]
     success=tools_user_success_flow(user_id)
     if success:
@@ -18186,22 +18220,27 @@ async def tools_message_action(message, data):
 
 
 def tools_user_welcome_text(user_id: int = 0) -> str:
-    vip=(f"👑 VIP: <b>{html.escape(tools_vip_status_text(user_id))}</b>\n"
-         f"💰 Harga: <b>Rp20.000 / bulan</b>\n💵 Saldo Kamu: <b>{rupiah(get_balance(user_id))}</b>\n\n")
+    access=html.escape(tools_vip_status_text(user_id))
+    title="✨ <b>ALIGHT MOTION PRO</b>\n<b>Aktivasi dengan email Anda</b>\n\n"
     if not tools_user_allowed(user_id):
-        return ('🧰 <b>TOOLS MABOYY DIGITAL</b>\n\n'+vip+
-                'Pilih VIP untuk membeli akses Magic Link dan aktivasi premium AM selama satu bulan.\n'
-                'Pembayaran tersedia melalui saldo bot atau ⚡ QRIS Otomatis.')
-    stats=tools_stats_snapshot(user_id)
-    return ("👑 <b>VIP KHUSUS /TOOLS</b>\n\n"
-            +vip+
-            f"📊 Aktivasi premium: <b>{stats['used_accounts']}/{stats['hourly_limit']} akun/jam</b>\n"
-            f"Reset: <b>{stats['reset_at']}</b>\n\n"
-            "Gunakan fitur dengan bijak. Pastikan email dan link yang Anda kirim sudah benar.\n\n"
-            "Pilih Aktivasi AM Pro, masukkan email milik Anda, lalu salin Magic Link terbaru dari inbox ke bot.\n"
-            "Batas layanan bersama: <b>50 request/hari</b>; biasanya 2 request per aktivasi.\n\n"
-            "Riwayat aktivasi tersedia pada menu Aktivasi AM Pro. "
-            "Rating pembelian sebelumnya tetap dapat diakses melalui tombol Rating Toko.")
+        return (title+f"🔒 Akses: <b>{access}</b>\n\n"
+                f"VIP: <b>{rupiah(TOOLS_VIP_PRICE_IDR)} / bulan</b>\n"
+                'Aktifkan VIP untuk mengirim Magic Link dan melakukan aktivasi melalui bot.\n'
+                'Pembayaran tersedia lewat saldo atau QRIS Otomatis.')
+    return (title+f"👑 Akses: <b>{access}</b>\n\n"
+            "Gunakan email milik Anda untuk aktivasi.\n"
+            "Bot akan memandu pengiriman email, input Magic Link, dan hasil aktivasi.\n\n"
+            "Pilih <b>Mulai Aktivasi</b> untuk memulai atau <b>Riwayat Aktivasi</b> untuk melihat hasil tersimpan.")
+
+
+def tools_user_limits_text(user_id: int) -> str:
+    stats=tools_stats_snapshot(user_id,scope='am_service')
+    return ("📊 <b>BATAS PENGGUNAAN</b>\n\n"
+            f"Batas akun Anda: <b>{stats['used_accounts']}/{stats['hourly_limit']} aktivasi per jam</b>\n"
+            f"Periode berikutnya: <b>{stats['reset_at']}</b>\n\n"
+            "Kapasitas layanan bersama: <b>50 request per hari</b>.\n"
+            "Satu aktivasi biasanya memakai 2 request: kirim email dan verifikasi.\n"
+            "Batas request harian digunakan bersama; angka ini bukan jumlah akun atau sisa kuota harian Anda.")
 
 
 def tools_user_flow_key(data: str, action: str):
@@ -18310,6 +18349,17 @@ async def user_tools_login_guide(call: CallbackQuery,state: FSMContext):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Kembali",callback_data="utools:login_guide_back")]
         ]),parse_mode="HTML")
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "utools:limits")
+async def user_tools_limits(call: CallbackQuery,state: FSMContext):
+    if not await tools_vip_public_guard(call):return
+    if not await require_tools_user(call,state):return
+    await state.set_state(None)
+    await safe_edit_or_answer(call,tools_user_limits_text(call.from_user.id),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ Aktivasi AM Pro",callback_data="utools:home")]]),parse_mode="HTML")
     await safe_callback_notice(call)
 
 
@@ -19434,7 +19484,7 @@ async def tools_verification_link_recovery_filter(message: Message, state: FSMCo
         return False
     data=await state.get_data()
     owner=is_owner(message.from_user.id)
-    if not owner and not data.get("tools_user_mode"):
+    if not owner:
         return False
     if any(data.get(key) for key in ("tools_magiclink_sent","tools_verify_email","tools_target_email","tools_correlation_id")):
         return True
@@ -36831,7 +36881,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.59"
+EXPECTED_SOURCE_VERSION = "17.60"
 
 
 def source_integrity_self_test():
