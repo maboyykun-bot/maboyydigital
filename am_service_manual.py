@@ -16,18 +16,19 @@ import html
 import json
 import re
 import secrets
+import sqlite3
 import time
 from urllib.parse import parse_qsl, urlsplit
 
 from Crypto.Cipher import AES
 from aiogram import F
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from am_service_client import (BASE_URL, AMServiceClient, AMServiceConfig,
                                AMServiceError, _email, _magic_link)
 
-ADAPTER_VERSION = '17.63'
+ADAPTER_VERSION = '17.64'
 JOB_PREFIX = 'ammanual.flow.'
 FSM_KEY = 'ammanual_job_id'
 FORM_SECONDS = 15 * 60
@@ -189,7 +190,7 @@ class GatewayManual:
         with self._connection(True) as conn:
             job = self._load(conn, ident)
             if (not job or job['actor_id'] != actor or job['nonce'] != nonce
-                    or not job.get('active')):
+                    or not job.get('active') or job.get('status') == 'PREMIUM_ACTIVE'):
                 return False
             conn.execute('DELETE FROM settings WHERE key=?', (JOB_PREFIX + ident,))
             # The request has already consumed provider allowance. Keep units
@@ -331,6 +332,14 @@ class GatewayManual:
             return await self.host.safe_edit_or_answer(event, text, reply_markup=markup, parse_mode='HTML')
         return await event.answer(text, reply_markup=markup, parse_mode='HTML')
 
+    async def _edit_card(self, message, text, rows):
+        """Edit a known card once; an uncertain edit must not send a duplicate."""
+        try:
+            await message.edit_text(text, reply_markup=_keyboard(rows), parse_mode='HTML')
+            return True
+        except Exception as exc:
+            return 'message is not modified' in str(exc).lower()
+
     async def _notice(self, event, text):
         if hasattr(event, 'data'):
             return await self.host.safe_callback_notice(event, text, show_alert=True)
@@ -393,13 +402,16 @@ class GatewayManual:
                 text += '\n\nStatus: CONFIG'
         elif not history_only:
             text += '\n\nStatus: ' + ('DISABLED' if not self.config.enabled else 'CONFIG')
-        if owner or history_only:
+        if history_only:
             rows += [[('📋 ' + job['id'] + ' • ' + job['status'], self._button('view', job))] for job in jobs]
-        rows.append([self._back(actor)])
+            rows.append([('⬅️ Aktivasi AM Pro', 'amman:menu')])
+        else:
+            rows.append([('📋 Riwayat Aktivasi', 'amman:history')])
+            rows.append([self._back(actor)])
         if self._live(call):
             return await self._ui(call, text, rows)
 
-    async def _render(self, event, state, job, *, session=False):
+    async def _render(self, event, state, job, *, session=False, output=None):
         if not job:
             return
         if not await self._access(event, state):
@@ -466,9 +478,87 @@ class GatewayManual:
                 current['retry_at'], seconds=True, compact=True)
         if current.get('active') and current['status'] not in TERMINAL:
             rows.append([('✖️ Batalkan Form', self._button('cancel', current))])
+        if self._rating_eligible(current):
+            rows.append([('⭐ Rating Toko', self._button('rating', current))])
         rows.append([('⬅️ Aktivasi AM Pro', 'amman:menu')])
         if self._live(event):
+            if output is not None:
+                delivered = await self._edit_card(output, text, rows)
+                if not delivered and self._live(event):
+                    # A repeated edit targets the same message, so it cannot
+                    # duplicate cards or repeat a provider request.
+                    delivered = await self._edit_card(output, text, rows)
+                return delivered
             return await self._ui(event, text, rows)
+
+    def _rating_eligible(self, job):
+        if (not job or self.host.is_owner(job['actor_id'])
+                or job.get('status') != 'PREMIUM_ACTIVE' or job.get('verify_state') != 'DONE'
+                or job.get('send_state') not in {'DONE', 'UNKNOWN'} or job.get('http_status') != 200):
+            return False
+        try:
+            # Completed use can be reviewed later, including after expiry or
+            # a key change. The original result already passed strict proof.
+            until = datetime.fromisoformat(job.get('valid_until', '').replace('Z', '+00:00'))
+            return until.tzinfo is not None and until.utcoffset() is not None
+        except (ValueError, TypeError, AttributeError):
+            return False
+
+    def rating_entry(self, actor):
+        """Expose only the latest owned success's callback, never its email."""
+        try:
+            with self._connection() as conn:
+                job = next((row for row in self._rows(conn, actor) if self._rating_eligible(row)), None)
+        except sqlite3.Error:
+            return None
+        return ('⭐ Rating Toko', self._button('rating', job)) if job else None
+
+    async def _rating(self, call, state, job, stars=None):
+        if not await self._access(call, state):
+            return
+        actor = int(call.from_user.id)
+        try:
+            with self._connection(stars is not None) as conn:
+                current = self._load(conn, job['id'])
+                if (not current or current['actor_id'] != actor or current['nonce'] != job['nonce']
+                        or not self._rating_eligible(current) or not self._live(call)):
+                    raise ValueError('Rating tersedia setelah aktivasi Anda berhasil.')
+                existing = conn.execute("SELECT user_id,rating FROM purchase_rating_requests "
+                    "WHERE source='ammanual' AND entity_key=?", (current['id'],)).fetchone()
+                if existing and existing['user_id'] != actor:
+                    raise ValueError('Rating tidak valid.')
+                if existing and (type(existing['rating']) is not int or not 1 <= existing['rating'] <= 5):
+                    raise ValueError('Rating tidak valid.')
+                if stars is not None:
+                    if type(stars) is not int or not 1 <= stars <= 5:
+                        raise ValueError('Rating tidak valid.')
+                    if not existing:
+                        conn.execute("INSERT INTO purchase_rating_requests(source,entity_key,user_id,reference,"
+                            "item_name,rating,rated_at) VALUES('ammanual',?,?,?,?,?,?)",
+                            (current['id'], actor, 'AM-' + current['id'], 'Alight Motion Pro', stars,
+                             datetime.now(timezone.utc).isoformat(timespec='seconds')))
+                        saved_stars = stars
+                    else:
+                        saved_stars = int(existing['rating'])
+                else:
+                    saved_stars = int(existing['rating']) if existing and existing['rating'] else 0
+        except ValueError as exc:
+            return await self._notice(call, str(exc))
+        except sqlite3.Error:
+            return await self._notice(call, 'Rating belum dapat diproses. Coba lagi sebentar.')
+        if not await self._access(call, state):
+            return
+        back = self._button('view', current)
+        if saved_stars:
+            text = self.host.rating_receipt_text(saved_stars, subtitle='Penilaian Anda sudah tersimpan.')
+            rows = [[('⬅️ Hasil Aktivasi', back)], [('⭐ Rating Toko', self._button('rating', current))],
+                    [('⬅️ Aktivasi AM Pro', 'amman:menu')]]
+            return await self._ui(call, text, rows)
+        text = ('⭐ <b>RATING TOKO</b>\n\n' + self.host.rating_summary_card(self.host.store_rating_summary())
+                + '\n\nAktivasi berhasil. Pilih penilaian 1–5:\n' + self.host.rating_scale_text())
+        keyboard = self.host.rating_choice_keyboard(self._button('rate', current), back, '⬅️ Hasil Aktivasi')
+        if self._live(call):
+            return await self.host.safe_edit_or_answer(call, text, reply_markup=keyboard, parse_mode='HTML')
 
     def _recover(self, job):
         # Reload and transition inside one write transaction. A stale reader
@@ -625,21 +715,27 @@ class GatewayManual:
         # while Telegram is slow cannot issue an abandoned POST.
         if not await self._session(event, state, job):
             return
-        await self._ui(event, '⏳ Memproses AM Manual…\nCID: <code>' + job['id'] + '</code>',
-                       [[('⬅️ AM Manual', 'amman:menu')]])
+        sent = await self._ui(event, '⏳ Memproses AM Manual…\nCID: <code>' + job['id'] + '</code>',
+                              [[('⬅️ AM Manual', 'amman:menu')]])
+        # A message input creates one progress card. Replace that exact card
+        # with its result instead of leaving its processing button behind.
+        output = None if hasattr(event, 'data') else sent
+        if (type(getattr(output, 'message_id', None)) is not int
+                or getattr(getattr(output, 'chat', None), 'id', None) != job['actor_id']):
+            output = None
         if not await self._access(event, state) or not await self._session(event, state, job):
             return
         job, ready = self._ready_job(job)
         if not ready:
-            return await self._render(event, state, job, session=True)
+            return await self._render(event, state, job, session=True, output=output)
         try:
             email = self._decrypt_email(job)
         except AMServiceError:
             job = self._update(job['actor_id'], job['id'], job['nonce'], status='ACCOUNT_CHANGED', code='ACCOUNT_CHANGED')
-            return await self._render(event, state, job, session=True)
+            return await self._render(event, state, job, session=True, output=output)
         leased = self._lease(job, stage)
         if not leased:
-            return await self._render(event, state, self.job(job['actor_id'], job['id']), session=True)
+            return await self._render(event, state, self.job(job['actor_id'], job['id']), session=True, output=output)
         request = 0
         try:
             # Reservation uses its own SQLite transaction, outside our lease CAS.
@@ -651,7 +747,7 @@ class GatewayManual:
             if not request:
                 current = self._update(job['actor_id'], job['id'], job['nonce'], code='QUOTA')
                 self._release(leased)
-                return await self._render(event, state, current, session=True)
+                return await self._render(event, state, current, session=True, output=output)
             # No await separates this live check, the durable claim and POST.
             if (not self._live(event) or not self.configured()
                     or getattr(self.client, 'config', self.config) != self.config
@@ -708,12 +804,15 @@ class GatewayManual:
         # private account value is sent to an abandoned/newer form meanwhile.
         latest = self.job(job['actor_id'], job['id'])
         if not await self._access(event, state) or not await self._session(event, state, latest):
+            if output is not None and self._live(event):
+                await self._edit_card(output, 'ℹ️ Proses pada form ini sudah ditutup.',
+                                      [[('⬅️ Aktivasi AM Pro', 'amman:menu')]])
             return
         if latest['status'] == 'WAIT_LINK':
             async with self._lock(job['actor_id']):
                 if await self._session(event, state, latest):
                     await state.set_state(ManualState.link)
-        return await self._render(event, state, latest, session=True)
+        return await self._render(event, state, latest, session=True, output=output)
 
     async def callback(self, call, state):
         if call.data == 'amman:menu':
@@ -725,10 +824,12 @@ class GatewayManual:
         await self.host.safe_callback_notice(call)
         if not await self._access(call, state):
             return
-        match = re.fullmatch(r'amman:(new|send|view|resume|cancel):(' + IDENT + '):(' + IDENT + ')', str(call.data or ''))
+        match = re.fullmatch(r'amman:(new|send|view|resume|cancel|rating|rate):(' + IDENT + '):(' + IDENT + r')(?::([1-5]))?', str(call.data or ''))
         if not match:
             return await self._notice(call, 'Tombol AM Manual tidak valid.')
-        action, ident, nonce = match.groups()
+        action, ident, nonce, stars = match.groups()
+        if (action == 'rate') != (stars is not None):
+            return await self._notice(call, 'Tombol AM Manual tidak valid.')
         actor = int(call.from_user.id)
         job = self.job(actor, ident)
         if not job or job['nonce'] != nonce:
@@ -736,6 +837,8 @@ class GatewayManual:
         job = self._recover(job)
         if not job:
             return await self._notice(call, 'Form sudah berubah. Buka AM Manual lagi.')
+        if action in {'rating', 'rate'}:
+            return await self._rating(call, state, job, int(stars) if stars else None)
         if action == 'view':
             return await self._render(call, state, job)
         if action == 'new':
@@ -766,8 +869,8 @@ class GatewayManual:
                     await state.update_data(**{FSM_KEY: ident})
                     await state.set_state(ManualState.link)
                     # A Telegram redelivery of the same callback must not
-                    # create repeated prompts. A deliberate later click may
-                    # reopen the reply composer without resending any email.
+                    # repeat the input edit. A deliberate later click may
+                    # reopen the input card without resending any email.
                     key = (actor, ident, job['nonce'], str(call.id))
                     prompt = key not in self._input_callbacks
                     self._input_callbacks[key] = True
@@ -805,15 +908,11 @@ class GatewayManual:
                 or current.get('send_state') not in {'DONE', 'UNKNOWN'}):
             return await self._render(call, state, current, session=True)
         text = ('🔗 <b>MASUKKAN MAGIC LINK</b>\n\n'
-                'Tempel tautan tombol <b>Masuk / Sign in</b> dari email sebagai balasan ke bot.')
-        try:
-            await self._ui(call, text, [
-                [('✖️ Batalkan Form', self._button('cancel', job))],
-                [('⬅️ Aktivasi AM Pro', 'amman:menu')]])
-        except Exception:
-            # The explicit reply prompt can still open input if a card edit
-            # fails. Never resend a provider request to repair Telegram UI.
-            pass
+                'Tempel tautan tombol <b>Masuk / Sign in</b> dari email langsung ke chat bot.\n'
+                'Form AM: ' + job['id'])
+        delivered = await self._edit_card(call.message, text, [
+            [('✖️ Batalkan Form', self._button('cancel', job))],
+            [('⬅️ Aktivasi AM Pro', 'amman:menu')]])
         if not await self._access(call, state) or not await self._session(call, state, job):
             return
         current = self.job(job['actor_id'], job['id'])
@@ -824,18 +923,9 @@ class GatewayManual:
                 or current.get('verify_state') != 'NEW'
                 or current.get('send_state') not in {'DONE', 'UNKNOWN'}):
             # Link submission may complete while the card edit is in flight.
-            # Restore that result instead of asking for another private link.
-            return await self._render(call, state, current, session=True)
-        try:
-            await call.message.answer(
-                '🔗 <b>MASUKKAN MAGIC LINK</b>\n\n'
-                'Balas pesan ini dengan tautan tombol Masuk / Sign in dari email.\n'
-                'Form AM: ' + job['id'], parse_mode='HTML',
-                reply_markup=ForceReply(force_reply=True, selective=False,
-                                       input_field_placeholder='Tempel Magic Link dari email'))
-        except Exception:
-            # Sending may have succeeded despite a timeout. No automatic
-            # resend; input remains active and the card tells how to paste.
+            # Restore that result on the same card.
+            return await self._render(call, state, current, session=True, output=call.message)
+        if not delivered:
             return await self._notice(call, 'Input sudah aktif. Tempel Magic Link dari email ke chat bot.')
 
     async def email_input(self, message, state):

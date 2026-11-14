@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.63"
+BOT_VERSION = "17.64"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -3299,14 +3299,14 @@ def store_rating_summary(conn=None):
                    UNION ALL
                    SELECT rating,'' AS comment FROM tools_user_reviews
                    UNION ALL
-                   SELECT rating,'' AS comment FROM purchase_rating_requests WHERE source IN ('otp','sosmed')
+                   SELECT rating,'' AS comment FROM purchase_rating_requests WHERE source IN ('otp','sosmed','ammanual')
                ) WHERE rating IN (1,2,3,4,5)"""
         ).fetchone()
         buckets=conn.execute(
             """SELECT rating,COUNT(*) AS n FROM (
                    SELECT rating FROM reviews UNION ALL
                    SELECT rating FROM tools_user_reviews
-                   UNION ALL SELECT rating FROM purchase_rating_requests WHERE source IN ('otp','sosmed')
+                   UNION ALL SELECT rating FROM purchase_rating_requests WHERE source IN ('otp','sosmed','ammanual')
                ) WHERE rating IN (1,2,3,4,5) GROUP BY rating"""
         ).fetchall()
         distribution={stars:0 for stars in range(1,6)}
@@ -3348,10 +3348,10 @@ def store_recent_ratings(conn, limit: int=30, offset: int=0):
            FROM tools_user_reviews r LEFT JOIN verified_users v ON v.user_id=r.user_id
            WHERE r.rating IN (1,2,3,4,5)
            UNION ALL
-           SELECT r.user_id,NULL,r.rating,'',CASE r.source WHEN 'otp' THEN 'Nomor OTP' ELSE 'Layanan Sosmed' END,'',
+           SELECT r.user_id,NULL,r.rating,'',CASE r.source WHEN 'otp' THEN 'Nomor OTP' WHEN 'ammanual' THEN 'Alight Motion Pro' ELSE 'Layanan Sosmed' END,'',
                   r.rated_at,v.username,'purchase:'||r.id
            FROM purchase_rating_requests r LEFT JOIN verified_users v ON v.user_id=r.user_id
-           WHERE r.source IN ('otp','sosmed') AND r.rating IN (1,2,3,4,5)
+           WHERE r.source IN ('otp','sosmed','ammanual') AND r.rating IN (1,2,3,4,5)
            ) ORDER BY created_at DESC,order_id DESC,user_id DESC,review_key DESC
            LIMIT ? OFFSET ?""",
         (max(1,min(100,int(limit))),max(0,int(offset)))
@@ -11110,20 +11110,13 @@ class CommandKeyboardMiddleware(BaseMiddleware):
             return await handler(event,data)
         data["command_keyboard_handled"]=True
         await prepare_command_keyboard(event)
-        # ReplyKeyboardRemove sent after this input callback would dismiss
-        # its new ForceReply composer. Clean up before that exact route only.
-        input_reply=bool(isinstance(event,CallbackQuery) and re.fullmatch(
-            r'amman:resume:[0-9a-f]{16}:[0-9a-f]{16}',str(event.data or '')))
-        if not input_reply:
-            result=await handler(event,data)
+        result=await handler(event,data)
         try:
             # A slow/rejected auxiliary reset/delete must not hide a command's
             # response, delay it behind Telegram cleanup, or replay its handler.
             await asyncio.wait_for(hide_shop_keyboard_for_callback(event),timeout=2)
         except Exception as exc:
             logging.warning("Command keyboard cleanup deferred (%s)",type(exc).__name__)
-        if input_reply:
-            result=await handler(event,data)
         return result
 
 
@@ -11147,7 +11140,7 @@ class PurchaseRatingMiddleware(BaseMiddleware):
             text='Gunakan menu owner melalui chat privat bot.'
             if isinstance(event,CallbackQuery):return await safe_callback_notice(event,text,show_alert=True)
             return await event.answer(text)
-        if isinstance(event,CallbackQuery) and str(event.data or '').startswith(('rate:','reviewopen:','reviewcomment:','reviewskip:','purchaserate:','utools:rate:','utools:rating:')) and (
+        if isinstance(event,CallbackQuery) and str(event.data or '').startswith(('rate:','reviewopen:','reviewcomment:','reviewskip:','purchaserate:','utools:rate:','utools:rating:','amman:rating:','amman:rate:')) and (
             message is None or str(message.chat.type)!='private' or message.chat.id!=user
         ):
             return await safe_callback_notice(event,'Gunakan rating melalui chat privat Anda.',show_alert=True)
@@ -11166,7 +11159,7 @@ class PurchaseRatingMiddleware(BaseMiddleware):
         if isinstance(event,CallbackQuery):
             value=str(event.data or '')
             allowed=value.startswith(('rate:','reviewopen:','reviewcomment:','reviewskip:','purchaserate:',
-                'utools:rating:','utools:rate:','orderdetail:','myorderspage:','statuscheck:',
+                'utools:rating:','utools:rate:','amman:rating:','amman:rate:','orderdetail:','myorderspage:','statuscheck:',
                 'usercancel:','topupcancel:','proofsubmit:','userproofback:','proofback:',
                 'resendorder:','loginproof:','usercomplaint:','usercomplaintcancel:',
                 'preorderdetail:','aqris:u:check:','aqris:u:qr:','aqris:u:cancel:',
@@ -16040,6 +16033,8 @@ def owner_tools_legacy_menu():
         [InlineKeyboardButton(text="✅ Magic Link / Verifikasi",callback_data="tools:verification")],
         [InlineKeyboardButton(text="🚀 Apply Premium",callback_data="tools:pro_license"),
          InlineKeyboardButton(text="📋 Hasil Provider",callback_data="tools:final_result")],
+        [InlineKeyboardButton(text="📋 Riwayat Aktivasi",callback_data="tools:history")],
+        [InlineKeyboardButton(text="🗑️ Hapus Riwayat",callback_data="tools:history_clear")],
         [InlineKeyboardButton(text="⬅️ Tools", callback_data="tools:home")],
     ])
 
@@ -16050,9 +16045,7 @@ def owner_tools_menu():
         [InlineKeyboardButton(text="🌐 am-api-service.vercel.app", callback_data="amnew:menu")],
         [InlineKeyboardButton(text="📬 Temp Mail",callback_data="tools:tempmail"),
          InlineKeyboardButton(text="👑 VIP /tools",callback_data="tools:access")],
-        [InlineKeyboardButton(text="📦 Riwayat",callback_data="tools:history"),
-         InlineKeyboardButton(text="📊 Status",callback_data="tools:summary")],
-        [InlineKeyboardButton(text="🗑️ Hapus Riwayat",callback_data="tools:history_clear")],
+        [InlineKeyboardButton(text="📊 Status",callback_data="tools:summary")],
         [InlineKeyboardButton(text="🧹 Bersihkan Log Lama",callback_data="tools:cleanup"),
          InlineKeyboardButton(text="⬅️ Owner Panel",callback_data="owner:panel")],
     ])
@@ -16658,7 +16651,7 @@ def tools_history_filter_keyboard(page: int, total_pages: int, status_filter: st
         nav.append(InlineKeyboardButton(text="➡️",callback_data=f"toolsfilter:{status_filter}:{page+1}"))
     rows.append(nav)
     rows.append([InlineKeyboardButton(text="🗑️ Hapus Riwayat",callback_data="tools:history_clear")])
-    rows.append([InlineKeyboardButton(text="⬅️ Owner Tools",callback_data="tools:home")])
+    rows.append([InlineKeyboardButton(text="⬅️ Provider",callback_data="tools:legacy_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -16692,7 +16685,7 @@ async def render_tools_filtered_history(call: CallbackQuery, page: int=1, status
     conn.close()
 
     lines=[
-        "📦 <b>RIWAYAT TOOLS</b>",
+        "📦 <b>RIWAYAT TOOLS</b> • " + html.escape(tools_legacy_website_name()),
         f"Filter: <b>{html.escape(status_filter.upper())}</b>",
         f"Halaman: <b>{page}/{total_pages}</b> • Total: <b>{total}</b>",
     ]
@@ -18172,13 +18165,15 @@ def tools_user_menu(user_id: int):
     if tools_user_allowed(user_id):
         rows=[
             [InlineKeyboardButton(text="📧 Mulai Aktivasi",callback_data="amman:menu")],
-            [InlineKeyboardButton(text="📋 Riwayat Aktivasi",callback_data="amman:history")],
             [InlineKeyboardButton(text="📖 Panduan Login",callback_data="utools:login_guide"),
              InlineKeyboardButton(text="📊 Batas Penggunaan",callback_data="utools:limits")],
             [InlineKeyboardButton(text='👑 Kelola VIP',callback_data='utools:vip')],
         ]
+    manual_rating=AM_SERVICE_MANUAL.rating_entry(user_id) if tools_user_allowed(user_id) else None
     success=tools_user_success_flow(user_id)
-    if success:
+    if manual_rating:
+        rows.append([InlineKeyboardButton(text=manual_rating[0],callback_data=manual_rating[1])])
+    elif success:
         rows.append([InlineKeyboardButton(text="⭐ Rating Toko",callback_data=f"utools:rating:{success['correlation_id']}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -18223,7 +18218,7 @@ def tools_user_welcome_text(user_id: int = 0) -> str:
     return (title+f"👑 Akses: <b>{access}</b>\n\n"
             "Gunakan email milik Anda untuk aktivasi.\n"
             "Bot akan memandu pengiriman email, input Magic Link, dan hasil aktivasi.\n\n"
-            "Pilih <b>Mulai Aktivasi</b> untuk memulai atau <b>Riwayat Aktivasi</b> untuk melihat hasil tersimpan.")
+            "Pilih <b>Mulai Aktivasi</b>. Riwayat tersedia di dalam menu aktivasi.")
 
 
 def tools_user_limits_text(user_id: int) -> str:
@@ -36873,7 +36868,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.63"
+EXPECTED_SOURCE_VERSION = "17.64"
 
 
 def source_integrity_self_test():

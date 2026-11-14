@@ -25,7 +25,7 @@ from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMa
 from am_service_client import BASE_URL, AMServiceClient, AMServiceConfig, AMServiceError, _magic_link
 
 
-ADAPTER_VERSION = '17.63'
+ADAPTER_VERSION = '17.64'
 JOB_PREFIX = 'amservice.job.'
 DUE_PREFIX = 'amservice.due.'
 VIEW_PREFIX = 'amservice.view.'
@@ -543,6 +543,7 @@ class Gateway:
             nav.append(('Berikutnya ➡️', 'amnew:history:' + str(page + 1)))
         if nav:
             controls.append(nav)
+        controls.append([('📧 Riwayat Aktivasi Manual', 'amman:history')])
         controls.append([('⬅️ AM Auto Create', 'amnew:menu')])
         return await self.host.safe_edit_or_answer(call, text, reply_markup=self._keyboard(controls), parse_mode='HTML')
 
