@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 import aiohttp
 
 
-VERSION = '17.57'
+VERSION = '17.58'
 BASE_URL = 'https://am-api-service.vercel.app'
 BODY_LIMIT = 256 * 1024
 MAX_JSON_DEPTH = 12

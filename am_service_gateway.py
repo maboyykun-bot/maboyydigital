@@ -21,10 +21,10 @@ from aiogram import F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from am_service_client import BASE_URL, AMServiceClient, AMServiceConfig, AMServiceError
+from am_service_client import BASE_URL, AMServiceClient, AMServiceConfig, AMServiceError, _magic_link
 
 
-ADAPTER_VERSION = '17.57'
+ADAPTER_VERSION = '17.58'
 JOB_PREFIX = 'amservice.job.'
 DUE_PREFIX = 'amservice.due.'
 WORK_SECONDS = 90
@@ -142,7 +142,8 @@ class Gateway:
                        status='WAITING', stage='CREATE_MAILBOX', code='', http_status=0,
                        mailbox_id=0, mailbox_state='NEW', send_state='NEW', verify_state='NEW',
                        magic_sent_at='', retry_at=0, lease_token='', lease_until=0,
-                       valid_until='', plan_name='')
+                       valid_until='', plan_name='', mail_checked_at='', mail_count=0,
+                       mail_candidate_count=0, mail_checked_details=0, mail_scan_code='')
             self._save(conn, job)
             return job
 
@@ -214,7 +215,10 @@ class Gateway:
         if not isinstance(sender, str) or sender.count('@') != 1:
             return False
         local, domain = sender.strip().lower().rsplit('@', 1)
-        trusted = domain == 'alight-creative.firebaseapp.com' or any(
+        # Firebase may put its Google bounce envelope in the provider's From
+        # field. This exact host is accepted only with the mailbox/time checks
+        # below and an Alight action URL validated before a verification claim.
+        trusted = domain in {'alight-creative.firebaseapp.com', 'firebaseapp.bounces.google.com'} or any(
             domain == value or domain.endswith('.' + value)
             for value in ('alightcreative.com', 'alightmotion.com'))
         if not local or not trusted:
@@ -247,10 +251,17 @@ class Gateway:
         if (not isinstance(binding, dict) or binding.get('id') != job['mailbox_id']
                 or binding.get('owner_id') != job['owner_id']
                 or str(inbox.get('address', '')).strip().lower() != email):
+            self._change(job, mail_checked_at=_stamp(), mail_scan_code='INBOX_MISMATCH')
             return ''
         messages = inbox.get('messages', [])
         if not isinstance(messages, list):
+            self._change(job, mail_checked_at=_stamp(), mail_scan_code='INBOX_INVALID')
             return ''
+        # Store only bounded counts and reason codes, never mail bodies, sender
+        # addresses or magic links. HTTP 200 from send-link is not inbox proof.
+        diagnostics = dict(mail_checked_at=_stamp(), mail_count=len(messages[:30]),
+                           mail_candidate_count=0, mail_checked_details=0,
+                           mail_scan_code='EMPTY' if not messages else 'NO_MATCH')
         checked = set()
         for item in messages[:30]:
             if not self._candidate(item, job, email):
@@ -261,18 +272,35 @@ class Gateway:
             checked.add(ident)
             if len(checked) > 10:
                 break
+            diagnostics['mail_candidate_count'] += 1
             try:
                 message = await self.host.temp_mail_read_message(job['owner_id'], job['mailbox_id'], ident)
+                diagnostics['mail_checked_details'] += 1
                 if not self._candidate(message, job, email, detail=True):
+                    diagnostics['mail_scan_code'] = 'DETAIL_MISMATCH'
                     continue
                 link = self.host.auto_am_extract_magic_link(message)
                 if link:
+                    # The shared legacy extractor also recognizes other Firebase
+                    # projects. The new service only accepts its canonical Alight
+                    # URL contract, so reject unrelated links before any POST claim.
+                    try:
+                        link = _magic_link(link)
+                    except AMServiceError:
+                        diagnostics['mail_scan_code'] = 'UNTRUSTED_LINK'
+                        continue
+                    diagnostics['mail_scan_code'] = 'LINK_FOUND'
+                    self._change(job, **diagnostics)
                     return link
             except ValueError:
+                diagnostics['mail_scan_code'] = 'NO_LINK'
                 continue
             except self.host.TempMailError as exc:
+                diagnostics['mail_scan_code'] = 'DETAIL_UNAVAILABLE'
                 if exc.status not in {404, 409, 422, 502}:
+                    self._change(job, **diagnostics)
                     raise
+        self._change(job, **diagnostics)
         return ''
 
     async def _post(self, job, email, *, link=None, deadline=None):
@@ -288,7 +316,8 @@ class Gateway:
         if not request:
             return self._change(job, status='WAITING', code='QUOTA', retry_at=time.time() + 60)
         changes = {state: 'CLAIMED', 'status': 'RUNNING', 'code': '', 'cause_code': '',
-                   'stage': 'VERIFYING' if verify else 'SENDING_LINK'}
+                   'stage': 'VERIFYING' if verify else 'SENDING_LINK', 'http_status': 0,
+                   'http_stage': 'verify-link' if verify else 'send-link'}
         if not verify:
             changes['magic_sent_at'] = _stamp()
         try:
@@ -390,7 +419,11 @@ class Gateway:
             return self._change(job, status='UNKNOWN', code='MAIL_WAIT_EXPIRED', retry_at=0)
         link = await self._find_link(job, email)
         if not link:
+            # A recovered, readable inbox clears an earlier read/budget error;
+            # retain send ambiguity because a mailbox scan cannot prove a POST.
             return self._change(job, stage='WAITING_MAIL', status='WAITING',
+                                code='SEND_UNKNOWN' if job['send_state'] == 'UNKNOWN' else '',
+                                cause_code=job.get('cause_code', '') if job['send_state'] == 'UNKNOWN' else '',
                                 retry_at=time.time() + MAIL_RETRY_SECONDS)
         return await self._post(job, email, link=link, deadline=deadline)
 
@@ -420,9 +453,16 @@ class Gateway:
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=text, callback_data=data) for text, data in row] for row in rows])
 
-    async def menu(self, call):
-        if not await self.host.temp_mail_require_owner(call):
+    async def menu(self, call, state=None):
+        # The provider chooser includes manual activation, which needs no Temp
+        # Mail. Mailbox creation/resume remains behind temp_mail_require_owner.
+        if not self.host.is_owner(call.from_user.id):
+            return await self.host.deny_owner_callback(call)
+        if not await self.host.tools_vip_public_guard(call):
             return
+        await self.host.safe_callback_notice(call)
+        if state is not None:
+            await state.set_state(None)
         owner = int(call.from_user.id)
         with self._connection() as conn:
             rows = conn.execute('SELECT value FROM settings WHERE key LIKE ? ORDER BY rowid DESC LIMIT 30',
@@ -430,11 +470,15 @@ class Gateway:
         jobs = [json.loads(row['value']) for row in rows]
         jobs = [job for job in jobs if job.get('owner_id') == owner][:5]
         status = 'Konfigurasi tersedia' if self.configured() else 'DISABLED' if not self.config.enabled else 'CONFIG'
-        text = ('⚡ <b>AM AUTO CREATE</b>\n\nStatus: <b>' + status + '</b>\n'
-                'Membuat email melalui Temp Mail yang dipilih, lalu mengirim dan memverifikasi Magic Link.\n'
-                'Premium hanya ditampilkan setelah bukti aktivasi dan masa berlaku terkonfirmasi.')
-        controls = []
-        if self.configured():
+        text = ('⚡ <b>am-api-service.vercel.app</b>\n\nStatus: <b>' + status + '</b>\n'
+                'Auto Create membuat email melalui Temp Mail yang dipilih. Manual memakai email Anda sendiri.\n'
+                'Premium hanya ditampilkan setelah bukti aktivasi dan masa berlaku terkonfirmasi.\n\n'
+                'Paket Free: 50 request API/hari, dipakai bersama oleh API key yang sama. '
+                'Satu aktivasi biasanya memakai 2 request (kirim + verifikasi), bukan 50 akun/hari.')
+        if not self.host.TEMPMAIL_ENABLED:
+            text += '\n\nAuto Create memerlukan Temp Mail aktif. Aktivasi Manual tetap tersedia.'
+        controls = [[('✉️ Aktivasi Manual • Email Sendiri', 'amman:menu')]]
+        if self.configured() and self.host.TEMPMAIL_ENABLED:
             controls.append([('⚡ Buat AM Pro', 'amnew:new:' + secrets.token_hex(8))])
         controls += [[('📋 ' + job['id'] + ' • ' + job['status'], 'amnew:view:' + job['id'])] for job in jobs]
         controls.append([('⬅️ Owner Tools', 'tools:home')])
@@ -447,7 +491,7 @@ class Gateway:
         text = '⚡ <b>AM AUTO CREATE</b>\n\nJob: <code>' + job['id'] + '</code>\n'
         text += 'Status: <b>' + labels.get(job['status'], 'Menunggu') + '</b>\n'
         stages = {'CREATE_MAILBOX': 'Membuat email', 'SEND_LINK': 'Menyiapkan pengiriman link',
-                  'SENDING_LINK': 'Mengirim Magic Link', 'WAITING_MAIL': 'Memeriksa inbox',
+                  'SENDING_LINK': 'Mengirim Magic Link', 'WAITING_MAIL': 'Menunggu email Magic Link',
                   'VERIFYING': 'Memverifikasi Magic Link', 'COMPLETE': 'Selesai',
                   'MAILBOX_UNKNOWN': 'Pembuatan email perlu diperiksa',
                   'VERIFY_UNKNOWN': 'Hasil verifikasi perlu diperiksa'}
@@ -470,24 +514,59 @@ class Gateway:
                  'MAILBOX_UNKNOWN': 'Pembuatan email belum pasti. Email pengganti tidak dibuat otomatis.',
                  'ACCOUNT_CHANGED': 'Job disimpan memakai konfigurasi sebelumnya. Periksa hasil pada akun lama.',
                  'JOB_BUDGET': 'Pemeriksaan email memerlukan waktu tambahan. Bot melanjutkan job ini sebentar lagi.',
-                 'MAIL_WAIT_EXPIRED': 'Batas pemeriksaan inbox tercapai. Periksa email dan hasil provider secara manual.'}
+                 'MAIL_WAIT_EXPIRED': 'Batas pemeriksaan inbox tercapai. Periksa email dan hasil provider secara manual.',
+                 'INBOX_UNAVAILABLE': 'Inbox belum dapat dibaca. Bot akan mencoba membaca lagi tanpa mengulang pengiriman link.'}
         if job['code']:
             text += '\n' + notes.get(job['code'], 'Kode: ' + job['code'])
         cause = job.get('cause_code')
         if isinstance(cause, str) and cause in SAFE_CODES:
             text += '\nPenyebab: ' + cause
         if _status(job.get('http_status')):
-            text += '\nHTTP: ' + str(job['http_status'])
+            http_stage = job.get('http_stage')
+            if http_stage not in {'send-link', 'verify-link'}:
+                http_stage = 'verify-link' if job.get('verify_state') != 'NEW' else 'send-link'
+            text += '\nHTTP ' + http_stage + ': ' + str(job['http_status'])
+        if job['stage'] == 'WAITING_MAIL' and job['status'] not in TERMINAL:
+            scans = {'EMPTY': 'Inbox berhasil diperiksa; belum ada email masuk.',
+                     'NO_MATCH': 'Email masuk belum cocok dengan pengirim, penerima, atau waktu aktivasi.',
+                     'NO_LINK': 'Email kandidat belum berisi satu Magic Link yang valid.',
+                     'UNTRUSTED_LINK': 'Link email belum cocok dengan domain aktivasi Alight yang diizinkan.',
+                     'DETAIL_MISMATCH': 'Identitas detail email tidak cocok; link tidak digunakan.',
+                     'DETAIL_UNAVAILABLE': 'Detail email belum dapat dibaca; pemeriksaan akan diulang.',
+                     'INBOX_MISMATCH': 'Identitas inbox tidak cocok; link tidak digunakan.',
+                     'INBOX_INVALID': 'Format daftar email belum valid.',
+                     'LINK_FOUND': 'Magic Link ditemukan; verifikasi menunggu giliran.'}
+            scan_code = job.get('mail_scan_code', '')
+            if scan_code in scans:
+                text += '\n\n' + scans[scan_code]
+            checked_at = job.get('mail_checked_at', '')
+            try:
+                checked = datetime.fromisoformat(checked_at.replace('Z', '+00:00'))
+                if checked.tzinfo is not None:
+                    text += '\nInbox terakhir diperiksa: ' + checked.astimezone(timezone.utc).strftime('%H:%M:%S UTC')
+            except (ValueError, AttributeError):
+                pass
+            text += '\nBot memeriksa inbox otomatis; tidak perlu menekan Cek Job.'
+            try:
+                sent = datetime.fromisoformat(job['magic_sent_at'].replace('Z', '+00:00'))
+                remaining = max(0, MAX_MAIL_WATCH_SECONDS - (datetime.now(timezone.utc) - sent).total_seconds())
+                text += '\nBatas tunggu email: ' + str(max(1, int((remaining + 59) // 60))) + ' menit lagi.'
+            except (KeyError, TypeError, ValueError):
+                pass
+            if job.get('send_state') == 'DONE':
+                text += '\nHTTP send-link hanya membuktikan permintaan diterima API; bukan email sudah sampai.'
         controls = [[('🔄 Cek Job', 'amnew:resume:' + job['id'])], [('⬅️ AM Auto Create', 'amnew:menu')]]
         if mailbox is not None and mailbox.get('state') == 'ready':
             controls.insert(0, [('📬 Inbox Email', 'tm:inbox:' + str(mailbox['id']) + ':1')])
         return await self.host.safe_edit_or_answer(call, text, reply_markup=self._keyboard(controls), parse_mode='HTML')
 
-    async def callback(self, call):
+    async def callback(self, call, state=None):
+        if call.data == 'amnew:menu':
+            return await self.menu(call, state)
         if not await self.host.temp_mail_require_owner(call):
             return
-        if call.data == 'amnew:menu':
-            return await self.menu(call)
+        if state is not None:
+            await state.set_state(None)
         match = re.fullmatch(r'amnew:(new|view|resume):([0-9a-f]{16})', str(call.data or ''))
         if not match:
             return await self.host.safe_callback_notice(call, 'Tombol tidak valid.', show_alert=True)
@@ -536,7 +615,11 @@ class Gateway:
             call = self._views.get((owner, ident))
             await self.process(owner, ident, call)
             current = self.job(owner, ident)
-            signature = (current['status'], current['stage'], current['code'], current['valid_until'])
+            # Empty inbox scans still make progress. Refresh a visible waiting
+            # view at most once per minute unless counts/reason/state changes.
+            signature = (current['status'], current['stage'], current['code'], current['valid_until'],
+                         current.get('mail_scan_code'), current.get('mail_count'),
+                         current.get('mail_checked_at', '')[:16])
             if call is not None and self._rendered.get((owner, ident)) != signature:
                 try:
                     await self.render(call, current)
@@ -571,13 +654,13 @@ class Gateway:
 def register(router, gateway):
     router.callback_query.register(gateway.callback, F.data.startswith('amnew:'))
 
-    async def command(message):
+    async def command(message, state=None):
         async def answer(text='', **kwargs):
             if text:
                 await message.answer(text)
         call = SimpleNamespace(from_user=message.from_user, message=message,
                                data='amnew:menu', id='', answer=answer)
-        await gateway.menu(call)
+        await gateway.menu(call, state)
 
     router.message.register(command, Command('amautocreate', 'amnew'))
     return gateway

@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.57"
+BOT_VERSION = "17.58"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -336,6 +336,8 @@ payinaja_gateway.register(router, PAYINAJA_GATEWAY)
 import am_service_client
 import am_service_gateway
 AM_SERVICE_GATEWAY = am_service_gateway.register(router, am_service_gateway.Gateway(_otp_sys.modules[__name__]))
+import am_service_manual
+AM_SERVICE_MANUAL = am_service_manual.register(router, am_service_manual.GatewayManual(_otp_sys.modules[__name__]))
 import bot_api
 PARTNER_API = bot_api.register(router, bot_api.Manager(_otp_sys.modules[__name__]))
 START_TIME = time.time()
@@ -11087,7 +11089,7 @@ class CommandKeyboardMiddleware(BaseMiddleware):
                     return await handler(event,data)
         elif isinstance(event,CallbackQuery) and (str(event.data or "").startswith(
                 (otp_smscode.PREFIX,sosmed_buzzerpanel.PREFIX,bank_accounts.PREFIX,klikqris_gateway.PREFIX,payinaja_gateway.PREFIX,"qrpg:",
-                 "purchaserate:","rate:","reviewopen:","owner:","tools:","utools:","toolsaccess","tm:","cekml:","userdemo:"))
+                 "purchaserate:","rate:","reviewopen:","owner:","tools:","utools:","amnew:","amman:","toolsaccess","tm:","cekml:","userdemo:"))
                 or getattr(getattr(data.get("handler"),"callback",None),"__name__","").startswith(
                     ("owner_","user_tools_"))):
             main_menu=False
@@ -11160,7 +11162,8 @@ class PurchaseRatingMiddleware(BaseMiddleware):
                 'utools:rating:','utools:rate:','orderdetail:','myorderspage:','statuscheck:',
                 'usercancel:','topupcancel:','proofsubmit:','userproofback:','proofback:',
                 'resendorder:','loginproof:','usercomplaint:','usercomplaintcancel:',
-                'preorderdetail:','aqris:u:check:','aqris:u:qr:','aqris:u:cancel:')) or value in {'my_orders','verify_join','contact_owner'}
+                'preorderdetail:','aqris:u:check:','aqris:u:qr:','aqris:u:cancel:',
+                'amman:view:','amman:resume:','amman:cancel:')) or value in {'my_orders','verify_join','contact_owner','amman:menu'}
             try:
                 if value.startswith(otp_smscode.PREFIX):
                     action,_=OTP_STORE.read_token(user,value[len(otp_smscode.PREFIX):])
@@ -11185,7 +11188,7 @@ class PurchaseRatingMiddleware(BaseMiddleware):
                 allowed=current in {CheckoutState.waiting_payment_proof.state,
                     otp_smscode.OTPState.topup_proof.state,LoginProofState.waiting_photo.state,
                     UserComplaintState.waiting_reason.state,FamilySupportState.waiting_issue_reason.state,
-                    ReviewState.waiting_comment.state}
+                    ReviewState.waiting_comment.state,am_service_manual.ManualState.link.state}
         if allowed:return await handler(event,data)
         if unavailable:
             text='Penilaian pembelian belum dapat diperiksa. Coba lagi sebentar; pembayaran dan pesanan berjalan tetap dapat diperiksa.'
@@ -16000,13 +16003,32 @@ async def temp_mail_read_message(owner_id: int, mailbox_id: int, message_id: str
 
 
 
-def owner_tools_menu():
+def tools_legacy_website_name():
+    """Display only a configured legacy hostname, never credentials or a URL query."""
+    for value in (TOOLS_PROVIDER_MAGICLINK_URL, TOOLS_PROVIDER_VERIFY_URL, TOOLS_PROVIDER_APPLY_URL):
+        try:
+            name = urlparse(value).hostname or ''
+        except ValueError:
+            continue
+        if name and len(name) <= 100 and re.fullmatch(r'[a-zA-Z0-9.-]+', name):
+            return name.lower()
+    return 'alightfree.my.id'
+
+
+def owner_tools_legacy_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚡ AM Pro Otomatis • 1 Tahun", callback_data=auto_am_start_token())],
-        [InlineKeyboardButton(text="⚡ AM Auto Create • API Baru", callback_data="amnew:menu")],
         [InlineKeyboardButton(text="✅ Magic Link / Verifikasi",callback_data="tools:verification")],
         [InlineKeyboardButton(text="🚀 Apply Premium",callback_data="tools:pro_license"),
          InlineKeyboardButton(text="📋 Hasil Provider",callback_data="tools:final_result")],
+        [InlineKeyboardButton(text="⬅️ Tools", callback_data="tools:home")],
+    ])
+
+
+def owner_tools_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 " + tools_legacy_website_name(), callback_data="tools:legacy_menu")],
+        [InlineKeyboardButton(text="🌐 am-api-service.vercel.app", callback_data="amnew:menu")],
         [InlineKeyboardButton(text="📬 Temp Mail",callback_data="tools:tempmail"),
          InlineKeyboardButton(text="👑 VIP /tools",callback_data="tools:access")],
         [InlineKeyboardButton(text="📦 Riwayat",callback_data="tools:history"),
@@ -16018,7 +16040,7 @@ def owner_tools_menu():
 
 
 def owner_tools_more_menu():
-    # Old messages keep working while the main menu no longer has extra submenus.
+    # Old messages keep working with the current provider selector.
     return owner_tools_menu()
 
 
@@ -16040,8 +16062,10 @@ def owner_tools_home_text(owner_id: int) -> str:
     return (
         "🧰 <b>OWNER TOOLS</b>\n"
         "Gunakan fitur dengan bijak.\n\n"
-        f"Provider: <b>{html.escape(str(TOOLS_PROVIDER_NAME)[:120])}</b>\n"
-        f"Status: <b>{html.escape(tools_provider_status_text())}</b>\n"
+        "Pilih website untuk membuka alur AM masing-masing.\n\n"
+        f"{html.escape(tools_legacy_website_name())}: <b>{html.escape(tools_provider_status_text())}</b>\n"
+        "am-api-service.vercel.app: Auto Create atau aktivasi manual.\n"
+        "Paket Free API baru: <b>50 request/hari per API key</b>; biasanya 2 request per aktivasi.\n"
         f"Aktivasi premium: <b>{quota}</b>\n"
         "Temp Mail: <b>Tanpa batas pembuatan di bot</b>"
     )
@@ -17860,7 +17884,8 @@ async def user_tools_vip_purchase(call: CallbackQuery,state: FSMContext):
                 [InlineKeyboardButton(text='✅ Bayar & Aktifkan VIP' if parts[3]=='w' else '✅ Buat QRIS VIP',callback_data='utools:vip:pay:'+parts[3]+':'+purchase['id'])],
                 [InlineKeyboardButton(text='⬅️ Kembali',callback_data='utools:vip')]]),parse_mode='HTML')
         if safe_mode_enabled() or maintenance_enabled():raise ValueError('Pembelian sementara belum tersedia. Coba kembali nanti.')
-        if not tools_provider_ready():raise ValueError('Pembelian VIP belum tersedia. Hubungi owner.')
+        if not (tools_provider_ready() or AM_SERVICE_MANUAL.config.enabled and AM_SERVICE_MANUAL.config.valid()):
+            raise ValueError('Pembelian VIP belum tersedia. Hubungi owner.')
         if not await is_channel_member(call.bot,call.from_user.id):raise ValueError('Gabung channel toko sebelum membeli VIP.')
         ok,_=persistent_rate_limit(call.from_user.id,'tools_vip_purchase',limit=5,window_seconds=60)
         if not ok:raise ValueError('Terlalu banyak percobaan. Coba kembali sebentar lagi.')
@@ -18125,7 +18150,8 @@ def tools_user_menu(user_id: int):
     rows=[[InlineKeyboardButton(text='👑 VIP • Rp20.000 / bulan',callback_data='utools:vip')]]
     if tools_user_allowed(user_id):
         rows[0:0]=[
-            [InlineKeyboardButton(text="📧 Magic Link",callback_data="utools:magic")],
+            [InlineKeyboardButton(text="🌐 " + tools_legacy_website_name(),callback_data="utools:magic")],
+            [InlineKeyboardButton(text="🌐 am-api-service.vercel.app",callback_data="amman:menu")],
             [InlineKeyboardButton(text="📖 Panduan Login AM via Email",callback_data="utools:login_guide")],
         ]
     success=tools_user_success_flow(user_id)
@@ -18180,9 +18206,11 @@ def tools_user_welcome_text(user_id: int = 0) -> str:
             f"📊 Aktivasi premium: <b>{stats['used_accounts']}/{stats['hourly_limit']} akun/jam</b>\n"
             f"Reset: <b>{stats['reset_at']}</b>\n\n"
             "Gunakan fitur dengan bijak. Pastikan email dan link yang Anda kirim sudah benar.\n\n"
-            "📧 Pilih Magic Link untuk mengirim link ke email, melakukan verifikasi, "
-            "dan menerapkan premium.\n\n"
-            "⭐ Rating Toko tersedia setelah premium berhasil diterapkan.")
+            "Pilih website, masukkan email Anda, lalu salin Magic Link terbaru dari inbox ke bot.\n"
+            "API baru: Free <b>50 request/hari per API key</b>, dibagi seluruh pemakai key; "
+            "biasanya 2 request per aktivasi, bukan 50 akun.\n\n"
+            "Riwayat API baru tersedia pada menu website tersebut. "
+            "Rating alur existing tetap tersedia setelah premium berhasil diterapkan.")
 
 
 def tools_user_flow_key(data: str, action: str):
@@ -19230,6 +19258,18 @@ async def owner_tools_alight(call: CallbackQuery,state: FSMContext):
         f"Sisa kapasitas: <b>{tools_stats_snapshot(call.from_user.id)['remaining_accounts']} akun</b>",
         reply_markup=alight_tools_menu(),parse_mode="HTML"
     )
+    await safe_callback_notice(call)
+
+
+@router.callback_query(F.data == "tools:legacy_menu")
+async def owner_tools_legacy_home(call: CallbackQuery, state: FSMContext):
+    if not await tools_cleanup_require_owner(call):return
+    await state.set_state(None)
+    await safe_edit_or_answer(call,
+        "🌐 <b>" + html.escape(tools_legacy_website_name()) + "</b>\n\n"
+        "Pilih AM Pro Otomatis atau Magic Link / Verifikasi untuk alur existing.\n"
+        f"Status provider: <b>{html.escape(tools_provider_status_text())}</b>",
+        reply_markup=owner_tools_legacy_menu(), parse_mode="HTML")
     await safe_callback_notice(call)
 
 
@@ -36814,7 +36854,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.57"
+EXPECTED_SOURCE_VERSION = "17.58"
 
 
 def source_integrity_self_test():
@@ -37004,6 +37044,11 @@ async def main():
             await AM_SERVICE_GATEWAY.close()
         except Exception:
             logging.warning("AM service client cleanup failed.")
+
+        try:
+            await AM_SERVICE_MANUAL.close()
+        except Exception:
+            logging.warning("AM manual client cleanup failed.")
 
         try:
             await runner.cleanup()

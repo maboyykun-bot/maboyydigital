@@ -2,7 +2,7 @@ import asyncio
 import os
 import sys
 
-EXPECTED_VERSION = "17.57"
+EXPECTED_VERSION = "17.58"
 
 import bot
 
@@ -21,7 +21,7 @@ def launcher_self_test():
         )
 
     for module_name in ('klikqris_gateway', 'payinaja_gateway', 'automatic_qris',
-                        'am_service_gateway', 'am_service_client'):
+                        'am_service_gateway', 'am_service_manual', 'am_service_client'):
         module = getattr(bot, module_name, None)
         field = 'VERSION' if module_name == 'am_service_client' else 'ADAPTER_VERSION'
         actual = str(getattr(module, field, '') or '')
