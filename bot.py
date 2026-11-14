@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.58"
+BOT_VERSION = "17.59"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -14573,16 +14573,9 @@ def temp_mail_decrypt_credentials(row: dict) -> dict:
 
 
 def temp_mail_selected_provider() -> str:
-    provider = str(TEMPMAIL_PROVIDER or "grabmail").strip().lower()
-    if provider == "mail.tm":
-        provider = "mailtm"
-    if provider in {"guerrillamail", "guerrilla-mail"}:
-        provider = "guerrilla"
-    if provider == "grabmail.io":
-        provider = "grabmail"
-    if provider not in {"grabmail", "guerrilla", "maildrop", "mailtm"}:
-        raise TempMailError("TEMPMAIL_PROVIDER harus grabmail, guerrilla, maildrop, atau mailtm.", status=503)
-    return provider
+    # New Tools mailboxes are always Grabmail, including with legacy Variables.
+    # Stored mailboxes keep their own provider for historical inbox access.
+    return "grabmail"
 
 
 
@@ -15665,8 +15658,8 @@ async def temp_mail_create_account(owner_id: int, *, auto_job_id=0, provider=Non
     if provider is not None and auto_job_id:
         raise TempMailError("Provider job existing tidak boleh ditimpa.", status=409)
     provider = (auto_am_mail_provider() if auto_job_id else temp_mail_selected_provider()) if provider is None else provider
-    if provider not in {"grabmail", "guerrilla", "mailtm", "maildrop"}:
-        raise TempMailError("Provider email tidak didukung.", status=503)
+    if provider != "grabmail":
+        raise TempMailError("Pembuatan email /tools hanya menggunakan Grabmail.", status=503)
     if provider in {"mailtm", "guerrilla"}:
         temp_mail_encryption_key()
     async with temp_mail_async_locks(owner_id):
@@ -18150,8 +18143,7 @@ def tools_user_menu(user_id: int):
     rows=[[InlineKeyboardButton(text='👑 VIP • Rp20.000 / bulan',callback_data='utools:vip')]]
     if tools_user_allowed(user_id):
         rows[0:0]=[
-            [InlineKeyboardButton(text="🌐 " + tools_legacy_website_name(),callback_data="utools:magic")],
-            [InlineKeyboardButton(text="🌐 am-api-service.vercel.app",callback_data="amman:menu")],
+            [InlineKeyboardButton(text="📧 Aktivasi AM Pro",callback_data="amman:menu")],
             [InlineKeyboardButton(text="📖 Panduan Login AM via Email",callback_data="utools:login_guide")],
         ]
     success=tools_user_success_flow(user_id)
@@ -18206,11 +18198,10 @@ def tools_user_welcome_text(user_id: int = 0) -> str:
             f"📊 Aktivasi premium: <b>{stats['used_accounts']}/{stats['hourly_limit']} akun/jam</b>\n"
             f"Reset: <b>{stats['reset_at']}</b>\n\n"
             "Gunakan fitur dengan bijak. Pastikan email dan link yang Anda kirim sudah benar.\n\n"
-            "Pilih website, masukkan email Anda, lalu salin Magic Link terbaru dari inbox ke bot.\n"
-            "API baru: Free <b>50 request/hari per API key</b>, dibagi seluruh pemakai key; "
-            "biasanya 2 request per aktivasi, bukan 50 akun.\n\n"
-            "Riwayat API baru tersedia pada menu website tersebut. "
-            "Rating alur existing tetap tersedia setelah premium berhasil diterapkan.")
+            "Pilih Aktivasi AM Pro, masukkan email milik Anda, lalu salin Magic Link terbaru dari inbox ke bot.\n"
+            "Batas layanan bersama: <b>50 request/hari</b>; biasanya 2 request per aktivasi.\n\n"
+            "Riwayat aktivasi tersedia pada menu Aktivasi AM Pro. "
+            "Rating pembelian sebelumnya tetap dapat diakses melalui tombol Rating Toko.")
 
 
 def tools_user_flow_key(data: str, action: str):
@@ -18332,30 +18323,12 @@ async def user_tools_login_guide_back(call: CallbackQuery,state: FSMContext):
 
 @router.callback_query(F.data == "utools:magic")
 async def user_tools_magic_begin(call: CallbackQuery,state: FSMContext):
+    if not await tools_vip_public_guard(call):return
     if not await require_tools_user(call,state):return
-    data=await state.get_data()
-    if data.get("tools_user_mode"):
-        parsed=dict(data.get("tools_provider_apply_premium_result") or {})
-        if data.get("tools_apply_requested") and parsed.get("status") in {"pending","unknown",""}:
-            if TOOLS_PROVIDER_APPLY_STATUS_URL:await refresh_tools_apply_result(state,call.from_user.id)
-            await render_tools_user_result(call,state)
-            return await safe_callback_notice(call)
-        if data.get("tools_user_verify_started") and data.get("tools_final_status","") in {"pending","unknown",""}:
-            await render_tools_user_result(call,state)
-            return await safe_callback_notice(call)
-        if data.get("tools_magiclink_sent") and not data.get("tools_user_verify_started") and not tools_session_expired(data):
-            await render_tools_user_link_prompt(call,state)
-            return await safe_callback_notice(call)
-    if not tools_provider_ready():
-        return await safe_callback_notice(call,"Magic Link belum tersedia. Hubungi owner.",show_alert=True)
-    await state.clear()
-    await state.update_data(tools_user_mode=True,tools_session_started_at=datetime.now().isoformat(timespec="seconds"))
-    await state.set_state(ToolsUserState.email)
-    await safe_edit_or_answer(call,"📧 <b>MAGIC LINK</b>\n\nKirim email akun yang akan menerima Magic Link.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Batal",callback_data="utools:home")]
-        ]),parse_mode="HTML")
-    await safe_callback_notice(call)
+    # Old entry buttons open the current public flow. Preserve previous results
+    # and irreversible claims; no request to the old provider is dispatched.
+    await state.set_state(None)
+    return await AM_SERVICE_MANUAL.menu(call,state)
 
 
 @router.message(ToolsUserState.email)
@@ -20122,11 +20095,7 @@ TOOLS_AUTO_AM_MAIL_PROVIDER = os.getenv("TOOLS_AUTO_AM_MAIL_PROVIDER", "grabmail
 
 
 def auto_am_mail_provider():
-    provider = str(TOOLS_AUTO_AM_MAIL_PROVIDER or "grabmail").strip().lower()
-    provider = {"guerrillamail": "guerrilla", "guerrillamail.com": "guerrilla", "mail.tm": "mailtm"}.get(provider, provider)
-    if provider not in {"grabmail", "guerrilla", "mailtm", "maildrop"}:
-        raise TempMailError("TOOLS_AUTO_AM_MAIL_PROVIDER harus grabmail, guerrilla, mailtm, atau maildrop.", status=503)
-    return provider
+    return "grabmail"
 
 
 TOOLS_AUTO_AM_MAIL_WAIT_SECONDS = env_int("TOOLS_AUTO_AM_MAIL_WAIT_SECONDS", 90, 15, 180)
@@ -20593,6 +20562,12 @@ async def auto_am_run(call, job):
                             provider_expiry=str(metadata.get("expires_at") or job["provider_expiry"])[:100])
         if status in {"success", "failed"}: state.forget()
         return job
+    if job["mailbox_id"]:
+        existing_mailbox = temp_mail_owned_row(owner, job["mailbox_id"])
+        if temp_mail_row_provider(existing_mailbox) != "grabmail":
+            return auto_am_update(owner, job_id, status="unknown", auto_watch_until="",
+                detail="Otomatisasi /tools kini hanya menggunakan Grabmail. Job dan email lama tetap tersimpan; "
+                       "tidak ada email pengganti atau request aktivasi ulang. Buka Received Mail untuk memeriksa data lama.")
     if job["verify_activity_id"] and not (await state.get_data()).get("tools_verify_id_token"):
         state.forget()
         return auto_am_update(owner, job_id, status="unknown", detail="Verifikasi sudah dikirim, tetapi sesi token tidak tersedia. Periksa provider; verifikasi tidak diulang.")
@@ -20957,7 +20932,8 @@ async def temp_mail_render_home(call: CallbackQuery, *, notice="", mailbox=None)
     else:text+=("Pilih <b>Buat Email</b> untuk membuat alamat baru.\n"
                 "Email yang pernah dibuat dapat dipilih melalui <b>Daftar Email</b>.\n")
     if mailbox and mailbox.get("state")=="ready":text+=temp_mail_inbox_link_text(mailbox)
-    text+="\nGunakan fitur dengan bijak. Alamat ini untuk kebutuhan sementara.\n"
+    text+="\nEmail baru dan Auto Create /tools menggunakan <b>Grabmail</b>.\n"
+    text+="Gunakan fitur dengan bijak. Alamat ini untuk kebutuhan sementara.\n"
     if mailbox:text+="Pesan masuk dibuka melalui Received Mail.\n"
     text+=temp_mail_provider_caption(mailbox)
     await safe_edit_or_answer(call,text,reply_markup=temp_mail_ui_keyboard(mailbox),parse_mode="HTML",disable_web_page_preview=True)
@@ -21114,8 +21090,9 @@ async def owner_temp_mail_help(call: CallbackQuery):
         "Pembuatan email tanpa batas jumlah dan tanpa cooldown lokal. Daftar Email mempunyai halaman; alamat dan akses email tetap tersedia setelah bot restart.\n"
         "Isi pesan ditampilkan sebagai teks. Link dibuka sendiri; bot tidak otomatis menjalankan link atau Apply Premium.\n\n"
         "Gunakan fitur dengan bijak. Hindari data penting karena provider dapat menghapus email sementara.\n"
-        "Email Grabmail, Guerrilla Mail, dan Maildrop mempunyai link inbox situs yang dapat dibagikan tanpa login bot. Inbox publik; jangan gunakan untuk data penting.\n"
-        "Grabmail menyimpan pesan hingga 5 hari; Received Mail menampilkan maksimal 1.000 pesan terbaru. Guerrilla Mail sekitar 60 menit. Maildrop dapat menunda pengiriman pertama 15 menit–1 jam.\n"
+        "Buat Email dan Auto Create /tools hanya menggunakan Grabmail. Mode aktivasi manual dapat memakai email bebas milik Anda.\n"
+        "Grabmail mempunyai link inbox yang dapat dibagikan tanpa login bot. Inbox publik; jangan gunakan untuk data penting.\n"
+        "Grabmail menyimpan pesan hingga 5 hari; Received Mail menampilkan maksimal 1.000 pesan terbaru.\n"
         "Email lama tetap dapat dibuka melalui Received Mail sesuai provider masing-masing.\n"
         +temp_mail_provider_caption(),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Temp Mail",callback_data="tm:home")]]),
@@ -36854,7 +36831,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.58"
+EXPECTED_SOURCE_VERSION = "17.59"
 
 
 def source_integrity_self_test():

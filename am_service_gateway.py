@@ -19,12 +19,12 @@ from types import SimpleNamespace
 
 from aiogram import F
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
 
 from am_service_client import BASE_URL, AMServiceClient, AMServiceConfig, AMServiceError, _magic_link
 
 
-ADAPTER_VERSION = '17.58'
+ADAPTER_VERSION = '17.59'
 JOB_PREFIX = 'amservice.job.'
 DUE_PREFIX = 'amservice.due.'
 WORK_SECONDS = 90
@@ -37,7 +37,7 @@ SAFE_CODES = {
     'DNS', 'TLS', 'NETWORK', 'JSON_INVALID', 'SCHEMA', 'REJECTED',
     'INVALID_EMAIL', 'INVALID_MAGIC_LINK', 'EMAIL_MISMATCH', 'RESPONSE_TOO_LARGE',
     'ENDPOINT_NOT_FOUND', 'QUOTA', 'ACCOUNT_CHANGED', 'MAILBOX_UNKNOWN',
-    'MAILBOX_MISMATCH', 'SEND_UNKNOWN', 'VERIFY_UNKNOWN', 'UNCONFIRMED',
+    'MAILBOX_MISMATCH', 'MAIL_PROVIDER_DISABLED', 'SEND_UNKNOWN', 'VERIFY_UNKNOWN', 'UNCONFIRMED',
     'INBOX_UNAVAILABLE', 'MAIL_WAIT_EXPIRED', 'LOCAL_ERROR', 'JOB_BUDGET',
 }
 
@@ -134,9 +134,7 @@ class Gateway:
             job = self._load(conn, ticket)
             if job:
                 return job if job['owner_id'] == int(owner) else None
-            provider = self.host.auto_am_mail_provider()
-            if provider not in {'grabmail', 'guerrilla', 'mailtm', 'maildrop'}:
-                raise ValueError('MAILBOX_MISMATCH')
+            provider = 'grabmail'
             job = dict(id=ticket, owner_id=int(owner), fingerprint=self.fingerprint(),
                        provider=provider, created_at=_stamp(), updated_at=_stamp(),
                        status='WAITING', stage='CREATE_MAILBOX', code='', http_status=0,
@@ -388,6 +386,13 @@ class Gateway:
             job = self._recover(job)
             if job['status'] in TERMINAL:
                 return job
+        if job['provider'] != 'grabmail':
+            # An unstarted draft can adopt the fixed provider. A bound/claimed
+            # mailbox remains intact and is never replaced or used for new work.
+            if not job['mailbox_id'] and job['mailbox_state'] == 'NEW':
+                job = self._change(job, provider='grabmail')
+            else:
+                return self._change(job, status='UNKNOWN', code='MAIL_PROVIDER_DISABLED', retry_at=0)
         if getattr(self.client, 'config', self.config) != self.config:
             await self.client.close()
             self.client = AMServiceClient(self.config)
@@ -471,7 +476,7 @@ class Gateway:
         jobs = [job for job in jobs if job.get('owner_id') == owner][:5]
         status = 'Konfigurasi tersedia' if self.configured() else 'DISABLED' if not self.config.enabled else 'CONFIG'
         text = ('⚡ <b>am-api-service.vercel.app</b>\n\nStatus: <b>' + status + '</b>\n'
-                'Auto Create membuat email melalui Temp Mail yang dipilih. Manual memakai email Anda sendiri.\n'
+                'Auto Create membuat email melalui Grabmail. Manual memakai email Anda sendiri.\n'
                 'Premium hanya ditampilkan setelah bukti aktivasi dan masa berlaku terkonfirmasi.\n\n'
                 'Paket Free: 50 request API/hari, dipakai bersama oleh API key yang sama. '
                 'Satu aktivasi biasanya memakai 2 request (kirim + verifikasi), bukan 50 akun/hari.')
@@ -484,7 +489,69 @@ class Gateway:
         controls.append([('⬅️ Owner Tools', 'tools:home')])
         return await self.host.safe_edit_or_answer(call, text, reply_markup=self._keyboard(controls), parse_mode='HTML')
 
+    def _success_view(self, job, mailbox):
+        """Export only the requested email/public inbox, never login credentials."""
+        expiry = self.host.format_wib_datetime(job['valid_until'], compact=True)
+        lines = ['<b>✅ APPLY PREMIUM SUKSES</b>', '', 'AM Pro • API Baru',
+                 '🕒 Diperiksa: ' + html.escape(self.host.format_wib_datetime(job['updated_at'], compact=True))]
+        rows = []
+        if mailbox is not None:
+            email = mailbox['address'].strip().lower()
+            lines.extend(['', '📧 <code>' + html.escape(email) + '</code>'])
+            rows.append([InlineKeyboardButton(text='📋 Salin Email', copy_text=CopyTextButton(text=email))])
+        lines.append('Email sudah diverifikasi dan aktivasi Premium berhasil menurut provider.')
+        if job.get('plan_name'):
+            lines.append('Paket provider: ' + html.escape(job['plan_name']))
+        lines.append('Berlaku sampai: <b>' + html.escape(expiry) + '</b>')
+        if mailbox is not None and mailbox.get('state') == 'ready':
+            rows.insert(0, [InlineKeyboardButton(text='📥 Received Mail',
+                         callback_data='tm:inbox:' + str(mailbox['id']) + ':1')])
+            inbox_url = ''
+            try:
+                inbox_url = self.host.temp_mail_web_inbox_url(mailbox)
+            except self.host.TempMailError:
+                pass
+            if inbox_url:
+                lines.append(self.host.temp_mail_inbox_link_text(mailbox))
+                rows.append([
+                    InlineKeyboardButton(text='🔗 Buka Kotak Masuk', url=inbox_url),
+                    InlineKeyboardButton(text='📋 Salin Link Inbox', copy_text=CopyTextButton(text=inbox_url)),
+                ])
+                # CopyTextButton accepts at most 256 UTF-16 units. Optional
+                # presentation fields must never prevent copying the inbox.
+                shared = 'AM Pro\nEmail: ' + email + '\nBerlaku: ' + expiry + '\nInbox: ' + inbox_url
+                if len(shared.encode('utf-16-le')) // 2 > 256:
+                    shared = 'AM Pro\nEmail: ' + email + '\nInbox: ' + inbox_url
+                if len(shared.encode('utf-16-le')) // 2 <= 256:
+                    rows.append([InlineKeyboardButton(text='📤 Salin untuk Dibagikan',
+                                 copy_text=CopyTextButton(text=shared))])
+            else:
+                lines.append('\nLink inbox publik tidak tersedia untuk email ini. '
+                             'Gunakan Received Mail melalui akun owner; tautan bot owner tidak dapat dibagikan sebagai akses inbox publik.')
+        else:
+            lines.append('\nInbox belum tersedia. Data aktivasi tetap tersimpan.')
+        if self.configured() and self.host.TEMPMAIL_ENABLED:
+            rows.append([InlineKeyboardButton(text='⚡ Aktivasi Baru', callback_data='amnew:new:' + secrets.token_hex(8))])
+        rows.append([InlineKeyboardButton(text='⬅️ AM Auto Create', callback_data='amnew:menu')])
+        return '\n'.join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
     async def render(self, call, job):
+        # Recheck durable, actor-scoped evidence before exporting a saved result.
+        if not self.host.is_owner(call.from_user.id):
+            return await self.host.deny_owner_callback(call)
+        if not await self.host.tools_vip_public_guard(call):
+            return
+        job = self.job(call.from_user.id, job['id'])
+        if job is None:
+            return await self.host.safe_callback_notice(call, 'Job tidak ditemukan.', show_alert=True)
+        if job['status'] == 'PREMIUM_ACTIVE':
+            try:
+                until = datetime.fromisoformat(job['valid_until'].replace('Z', '+00:00'))
+                confirmed = job['verify_state'] == 'DONE' and until.tzinfo is not None
+            except (AttributeError, KeyError, TypeError, ValueError):
+                confirmed = False
+            if not confirmed:
+                job = dict(job, status='UNKNOWN', code='UNCONFIRMED')
         labels = {'PREMIUM_ACTIVE': '✅ PREMIUM ACTIVE', 'WAITING': '⏳ Menunggu',
                   'RUNNING': '⏳ Diproses', 'UNKNOWN': '⚠️ Hasil belum terkonfirmasi',
                   'FAILED': '❌ Belum berhasil', 'ACCOUNT_CHANGED': '⚠️ Konfigurasi akun berubah'}
@@ -504,15 +571,15 @@ class Gateway:
             except Exception:
                 pass
         if job['status'] == 'PREMIUM_ACTIVE':
-            text += 'Berlaku sampai: <b>' + html.escape(job['valid_until']) + '</b>\n'
-            if job['plan_name']:
-                text += 'Paket: ' + html.escape(job['plan_name']) + '\n'
+            text, markup = self._success_view(job, mailbox)
+            return await self.host.safe_edit_or_answer(call, text, reply_markup=markup, parse_mode='HTML')
         notes = {'QUOTA': 'Kuota akun per jam habis. Pemeriksaan dijadwalkan kembali.',
                  'SEND_UNKNOWN': 'Pengiriman belum pasti. Bot hanya memeriksa inbox; pengiriman tidak diulang.',
                  'VERIFY_UNKNOWN': 'Verifikasi sudah dikirim. Hasil belum pasti; verifikasi tidak diulang.',
                  'UNCONFIRMED': 'Respons belum membuktikan premium aktif dan masa berlaku.',
                  'MAILBOX_UNKNOWN': 'Pembuatan email belum pasti. Email pengganti tidak dibuat otomatis.',
                  'ACCOUNT_CHANGED': 'Job disimpan memakai konfigurasi sebelumnya. Periksa hasil pada akun lama.',
+                 'MAIL_PROVIDER_DISABLED': 'Otomatisasi kini hanya menggunakan Grabmail. Job dan mailbox lama tetap tersimpan; buka Received Mail untuk memeriksanya.',
                  'JOB_BUDGET': 'Pemeriksaan email memerlukan waktu tambahan. Bot melanjutkan job ini sebentar lagi.',
                  'MAIL_WAIT_EXPIRED': 'Batas pemeriksaan inbox tercapai. Periksa email dan hasil provider secara manual.',
                  'INBOX_UNAVAILABLE': 'Inbox belum dapat dibaca. Bot akan mencoba membaca lagi tanpa mengulang pengiriman link.'}

@@ -27,7 +27,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from am_service_client import (BASE_URL, AMServiceClient, AMServiceConfig,
                                AMServiceError, _email, _magic_link)
 
-ADAPTER_VERSION = '17.58'
+ADAPTER_VERSION = '17.59'
 JOB_PREFIX = 'ammanual.flow.'
 FSM_KEY = 'ammanual_job_id'
 FORM_SECONDS = 15 * 60
@@ -313,6 +313,9 @@ class GatewayManual:
     def _back(self, actor):
         return ('⬅️ Owner Tools', 'tools:home') if self.host.is_owner(actor) else ('⬅️ /tools', 'utools:home')
 
+    def _title(self, actor):
+        return 'AM MANUAL • API BARU' if self.host.is_owner(actor) else 'AKTIVASI AM PRO'
+
     async def menu(self, call, state):
         if not await self._access(call, state):
             return
@@ -328,10 +331,13 @@ class GatewayManual:
             return
         with self._connection() as conn:
             jobs = [job for job in self._rows(conn, actor) if job['status'] != 'DRAFT'][:5]
-        text = ('⚡ <b>AM MANUAL • API BARU</b>\n\n'
-                'Web: <b>am-api-service.vercel.app</b>\n'
-                'Paket Free: <b>50 requests/hari</b>, dibagi seluruh pemakai API key yang sama. '
-                'Satu aktivasi biasanya memakai 2 requests (send + verify).\n\n'
+        details = ('Web: <b>am-api-service.vercel.app</b>\n'
+                   'Paket Free: <b>50 requests/hari</b>, dibagi seluruh pemakai API key yang sama. '
+                   'Satu aktivasi biasanya memakai 2 requests (send + verify).\n\n'
+                   if self.host.is_owner(actor) else
+                   'Batas layanan bersama: <b>50 requests/hari</b>. '
+                   'Satu aktivasi biasanya memakai 2 requests.\n\n')
+        text = ('⚡ <b>' + self._title(actor) + '</b>\n\n' + details +
                 'Gunakan email milik Anda, lalu tempel Magic Link dari inbox email yang sama. '
                 'Premium aktif hanya ditampilkan setelah bukti lengkap terkonfirmasi.\n'
                 'Form berlaku 15 menit. Kuota /tools mengikuti aturan akun Anda.')
@@ -362,7 +368,7 @@ class GatewayManual:
                   'PREMIUM_ACTIVE': '✅ PREMIUM ACTIVE', 'UNKNOWN': 'Hasil belum terkonfirmasi',
                   'FAILED': 'Belum berhasil', 'ACCOUNT_CHANGED': 'Konfigurasi akun berubah',
                   'EXPIRED': 'Form kedaluwarsa'}
-        text = ('⚡ <b>AM MANUAL • API BARU</b>\n\nCID: <code>' + current['id']
+        text = ('⚡ <b>' + self._title(int(event.from_user.id)) + '</b>\n\nCID: <code>' + current['id']
                 + '</code>\nStatus: <b>' + labels.get(current['status'], 'Menunggu') + '</b>\n')
         try:
             email = self._decrypt_email(current) if current.get('email_secret') else ''
@@ -385,7 +391,8 @@ class GatewayManual:
         elif current['status'] == 'PREMIUM_ACTIVE':
             text += 'Berlaku sampai: <b>' + html.escape(current['valid_until']) + '</b>\n'
             if current.get('plan_name'):
-                text += 'Paket: ' + html.escape(current['plan_name']) + '\n'
+                plan = current['plan_name'] if self.host.is_owner(event.from_user.id) else 'Alight Motion Pro'
+                text += 'Paket: ' + html.escape(plan) + '\n'
         notes = {
             'SEND_UNKNOWN': 'Pengiriman belum pasti; permintaan tidak diulang. Jika email masuk, gunakan link dari email ini.',
             'VERIFY_UNKNOWN': 'Hasil verifikasi belum pasti. Verifikasi tidak diulang; periksa akun Anda.',
