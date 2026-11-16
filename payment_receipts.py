@@ -74,6 +74,7 @@ def method_label(value):
             "QRIS": "QRIS", "BALANCE": "Saldo Bot", "SALDO": "Saldo Bot",
             "WALLET": "Saldo Bot", "BANK": "Transfer Bank", "TRANSFER": "Transfer Bank",
             "BANK_TRANSFER": "Transfer Bank",
+            "BINANCE_PAY": "Binance Pay • USDT",
             "SHOPEEPAY": "QRIS Otomatis"}.get(str(value or "").upper(), public_text(value, 80))
 
 

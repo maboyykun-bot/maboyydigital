@@ -42,7 +42,7 @@ from aiogram.filters import Command, Filter, StateFilter
 from aiogram.types import (
     ErrorEvent,
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, CopyTextButton, FSInputFile,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, LinkPreviewOptions
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, LinkPreviewOptions, InputMediaPhoto
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import StatesGroup, State
@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.64"
+BOT_VERSION = "17.65"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -324,6 +324,8 @@ SOSMED_STORE = sosmed_ui.register(
 )
 import bank_accounts
 BANK_ACCOUNTS = bank_accounts.register(router, bank_accounts.Manager(_otp_sys.modules[__name__]))
+import binance_pay
+BINANCE_PAY = binance_pay.register(router, binance_pay.Gateway(_otp_sys.modules[__name__]))
 import payment_receipts
 PAYMENT_RECEIPTS = payment_receipts.ReceiptService(_otp_sys.modules[__name__])
 import klikqris_gateway
@@ -4176,7 +4178,7 @@ async def cancel_pending_order(order_id: int, bot: Bot):
 
     return True, "Order berhasil dibatalkan dan reservasi stok dilepas."
 
-MANUAL_PAYMENT_METHODS = frozenset({'QRIS','QRIS_MANUAL','BANK_TRANSFER'})
+MANUAL_PAYMENT_METHODS = frozenset({'QRIS','QRIS_MANUAL','BANK_TRANSFER','BINANCE_PAY'})
 MANUAL_QRIS_MINUTES = 15
 
 
@@ -4220,7 +4222,7 @@ def backfill_manual_qris_deadlines(conn):
 def deadline_payment_sql() -> str:
     # Retention uses timed_payment_sql separately: expired manual proofs/history
     # must remain available for an owner to investigate actual late transfers.
-    return "UPPER(TRIM(COALESCE(payment_method,''))) NOT IN ('BANK_TRANSFER','KLIKQRIS_AUTO','PAYINAJA_AUTO')"
+    return "UPPER(TRIM(COALESCE(payment_method,''))) NOT IN ('BANK_TRANSFER','BINANCE_PAY','KLIKQRIS_AUTO','PAYINAJA_AUTO')"
 
 
 def manual_confirmation_required(row) -> bool:
@@ -4234,7 +4236,7 @@ def timed_payment_sql(alias: str = '') -> str:
     """Fixed payment-method predicate for expiry/retention queries only."""
     if alias and not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*',alias):raise ValueError('Invalid SQL alias')
     field=(alias+'.' if alias else '')+'payment_method'
-    return "UPPER(TRIM(COALESCE("+field+",''))) NOT IN ('QRIS','QRIS_MANUAL','BANK_TRANSFER','KLIKQRIS_AUTO','PAYINAJA_AUTO')"
+    return "UPPER(TRIM(COALESCE("+field+",''))) NOT IN ('QRIS','QRIS_MANUAL','BANK_TRANSFER','BINANCE_PAY','KLIKQRIS_AUTO','PAYINAJA_AUTO')"
 
 
 def owner_confirmable_expired_manual(row) -> bool:
@@ -4665,6 +4667,18 @@ def checkout_note_keyboard(variant_id: int, qty: int):
 
 def payment_method_keyboard(variant_id: int, qty: int):
     qty = 1
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='💳 Pay Manual',callback_data=f'paymanual:{variant_id}:{qty}')],
+        [InlineKeyboardButton(text='⚡ QR Otomatis',callback_data=(
+            automatic_qris.checkout_callback(variant_id,qty) if auto_payment_ready()
+            else f'payauto:{variant_id}:{qty}'))],
+        [InlineKeyboardButton(text='⬅️ Ringkasan Pesanan',callback_data=f'confirm:{variant_id}:{qty}')],
+        [InlineKeyboardButton(text='❌ Batalkan',callback_data=f'checkoutcancel:{variant_id}')],
+    ])
+
+
+def manual_payment_method_keyboard(variant_id: int, qty: int):
+    qty = 1
     rows = [
         [
             InlineKeyboardButton(
@@ -4688,18 +4702,18 @@ def payment_method_keyboard(variant_id: int, qty: int):
             )
         ])
 
-    if auto_payment_ready():
+    if BINANCE_PAY.ready():
         rows.append([
             InlineKeyboardButton(
-                text="⚡ QRIS Otomatis",
-                callback_data=automatic_qris.checkout_callback(variant_id,qty)
+                text="🌐 Binance Pay • USDT",
+                callback_data=f"processbinance:{variant_id}:{qty}"
             )
         ])
 
     rows.append([
         InlineKeyboardButton(
-            text="⬅️ Ringkasan Pesanan",
-            callback_data=f"confirm:{variant_id}:{qty}"
+            text="⬅️ Pilih Pembayaran",
+            callback_data=f"checkoutpay:{variant_id}:{qty}"
         )
     ])
 
@@ -4711,6 +4725,62 @@ def payment_method_keyboard(variant_id: int, qty: int):
     ])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def binance_order_text(order_id: int) -> str:
+    conn = db()
+    try:
+        return BINANCE_PAY.text(BINANCE_PAY.invoice(conn, int(order_id)))
+    except (binance_pay.BinancePayError,sqlite3.Error):
+        return 'Rincian Binance Pay belum dapat dibaca. Hubungi owner sebelum membayar.'
+    finally:
+        conn.close()
+
+
+async def render_binance_order(call: CallbackQuery, order_id: int, product_name: str, variant_name: str):
+    conn = db()
+    try:
+        current=conn.execute('SELECT * FROM orders WHERE id=? AND user_id=?',(order_id,call.from_user.id)).fetchone()
+        if not current or current['status']!='pending' or current['payment_status']!='unpaid':
+            return False
+        saved = BINANCE_PAY.invoice(conn, order_id)
+    finally:
+        conn.close()
+    text = ('🧾 <b>' + invoice(order_id) + '</b>\n'
+            + rating_html_excerpt(product_name,100) + ' • ' + rating_html_excerpt(variant_name,80)
+            + '\n\n' + BINANCE_PAY.text(saved)
+            + '\n\nBayar nominal USDT di atas, lalu kirim bukti. Menunggu konfirmasi owner.')
+    markup = BINANCE_PAY.keyboard(order_id, transaction_pending_keyboard(order_id,include_proof=not proof_locked_status(current)))
+    delivered = False
+    if saved['qr_file_id']:
+        try:
+            await call.message.edit_media(media=InputMediaPhoto(media=saved['qr_file_id'],caption=text,parse_mode='HTML'),
+                                          reply_markup=markup)
+            delivered = True
+        except Exception:
+            pass
+    if not delivered:
+        fallback = text + ('\nQR belum dapat ditampilkan; gunakan Pay ID/email di atas.' if saved['qr_file_id'] else '')
+        try:
+            await call.message.edit_text(fallback,reply_markup=markup,parse_mode='HTML')
+            delivered = True
+        except Exception:
+            try:
+                # An edit-media timeout may already have installed the photo.
+                # Update the same known message rather than sending a second QR.
+                await call.message.edit_caption(caption=fallback,reply_markup=markup,parse_mode='HTML')
+                delivered = True
+            except Exception:
+                pass
+    if delivered and type(getattr(call.message,'message_id',None)) is int:
+        try:
+            if not save_order_payment_message(order_id,call.from_user.id,call.message.message_id):
+                await retire_topup_payment_message(call.bot,call.from_user.id,call.message.message_id,invoice_label='Binance Pay')
+        except sqlite3.Error:
+            logging.warning('Binance Pay invoice message tracking deferred order=%s',order_id)
+    if not delivered:
+        await safe_callback_notice(call,'Invoice sudah dibuat. Buka Riwayat Pesanan untuk rincian Binance Pay.',show_alert=True)
+    return delivered
 
 
 def get_checkout_note_from_state(data: dict) -> str:
@@ -5664,7 +5734,7 @@ async def payment_health_report():
     conn = db()
     data = {
         "pending_manual": conn.execute(
-            "SELECT COUNT(*) AS n FROM orders WHERE payment_method IN ('QRIS','BANK_TRANSFER') AND payment_status='unpaid' AND status='pending'"
+            "SELECT COUNT(*) AS n FROM orders WHERE payment_method IN ('QRIS','BANK_TRANSFER','BINANCE_PAY') AND payment_status='unpaid' AND status='pending'"
         ).fetchone()["n"],
         "paid_pending": conn.execute(
             "SELECT COUNT(*) AS n FROM orders WHERE payment_status='paid' AND fulfillment_status!='delivered'"
@@ -6087,7 +6157,7 @@ def save_topup_payment_message(topup_id: int, user_id: int, message_id: int) -> 
         conn.close()
 
 
-async def retire_topup_payment_message(bot: Bot, user_id: int, message_id: int) -> bool:
+async def retire_topup_payment_message(bot: Bot, user_id: int, message_id: int, *, invoice_label='QRIS') -> bool:
     if automatic_qris.protected_receipt(_otp_sys.modules[__name__],user_id,message_id):
         return True  # The former QR message is now the successful photo invoice.
     try:
@@ -6100,7 +6170,7 @@ async def retire_topup_payment_message(bot: Bot, user_id: int, message_id: int) 
         pass
     try:
         await bot.edit_message_caption(chat_id=user_id, message_id=message_id,
-            caption="⛔ Invoice QRIS ini sudah tidak aktif. Jangan lakukan pembayaran.",
+            caption="⛔ Invoice "+html.escape(invoice_label)+" ini sudah tidak aktif. Jangan lakukan pembayaran.",
             reply_markup=None, parse_mode="HTML")
         return True
     except Exception:
@@ -6151,7 +6221,7 @@ def save_order_payment_message(order_id: int, user_id: int, message_id: int) -> 
     with db() as conn:
         begin_immediate_retry(conn)
         row=conn.execute('SELECT * FROM orders WHERE id=? AND user_id=?',(order_id,user_id)).fetchone()
-        if (not row or not manual_qris_required(row) or row['status']!='pending'
+        if (not row or not (manual_qris_required(row) or row['payment_method']=='BINANCE_PAY') or row['status']!='pending'
                 or row['payment_status']=='paid' or order_reservation_expired(row)):
             return False
         ids=topup_saved_payment_message_ids(row['payment_message_ids'])
@@ -6163,12 +6233,13 @@ def save_order_payment_message(order_id: int, user_id: int, message_id: int) -> 
 async def retire_saved_order_payment_messages(bot: Bot, order_id: int, user_id: int):
     with db() as conn:
         row=conn.execute('SELECT * FROM orders WHERE id=? AND user_id=?',(order_id,user_id)).fetchone()
-    if (not row or not manual_qris_required(row) or
+    if (not row or not (manual_qris_required(row) or row['payment_method']=='BINANCE_PAY') or
             (row['payment_status']!='paid' and row['status'] not in {'expired','cancelled','completed'})):
         return
     retired=set()
     for message_id in topup_saved_payment_message_ids(row['payment_message_ids']):
-        if await retire_topup_payment_message(bot,user_id,message_id):retired.add(message_id)
+        if await retire_topup_payment_message(bot,user_id,message_id,**(
+                {'invoice_label':'Binance Pay'} if row['payment_method']=='BINANCE_PAY' else {})):retired.add(message_id)
     if retired:
         with db() as conn:
             begin_immediate_retry(conn)
@@ -9081,6 +9152,7 @@ def payment_method_label(value: str) -> str:
         "PAYINAJA_AUTO": "⚡ QRIS Otomatis",
         "SHOPEEPAY": "QRIS Otomatis",
         "BANK_TRANSFER": "Transfer Rekening",
+        "BINANCE_PAY": "Binance Pay • USDT",
         "WALLET": "Saldo",
         "OWNER_FREE": "Owner Free",
     }
@@ -9172,6 +9244,8 @@ def order_detail_text(order) -> str:
         lines.append(f"❌ Alasan: <b>{rating_html_excerpt(reject_reason,500)}</b>")
     if str(order["payment_method"] or "") == "BANK_TRANSFER":
         lines.append(bank_transfer_text(entity="order",entity_id=order["id"]))
+    if str(order['payment_method'] or '') == 'BINANCE_PAY':
+        lines.append(binance_order_text(order['id']))
     lines += ["", f"<i>{rating_html_excerpt(STORE_FOOTER,200)}</i>"]
     return "\n".join(lines)
 
@@ -9293,7 +9367,13 @@ def order_detail_keyboard(order, *, include_history: bool = True):
         navigation.append(InlineKeyboardButton(text="⬅️ Riwayat",callback_data="my_orders"))
     navigation.append(InlineKeyboardButton(text="🏠 Menu",callback_data="home"))
     rows.append(navigation)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
+    if str(order['payment_method'] or '') == 'BINANCE_PAY' and payment_status == 'unpaid' and status == 'pending':
+        try:
+            return BINANCE_PAY.keyboard(int(order['id']), markup)
+        except (binance_pay.BinancePayError,sqlite3.Error):
+            pass
+    return markup
 
 
 def payment_proof_keyboard(entity: str, entity_id: int):
@@ -9428,6 +9508,8 @@ def payment_proof_caption(entity: str, row) -> str:
         snapshot = BANK_ACCOUNTS.snapshot(entity, row["id"])
         if snapshot:
             bank_tail = "\n\nTujuan transfer: " + bank_accounts.fragment(snapshot["bank_name"],70) + "\n<code>" + bank_accounts.fragment(snapshot["account_number"],100) + "</code>\na.n. " + bank_accounts.fragment(snapshot["holder_name"],100)
+    if entity == 'order' and str(row['payment_method'] or '') == 'BINANCE_PAY':
+        bank_tail = '\n\n' + binance_order_text(row['id'])
     if entity == "order":
         proof_note = bank_accounts.fragment(row["note"] or "-",260) if bank_tail else html.escape(row["note"] or "-")
         return (
@@ -10133,6 +10215,13 @@ def confirm_order_payment_atomic(order_id: int, paid_amount: int | None = None, 
             order=conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
             if not order:return None,False
             if manual_confirmation_required(order) and not is_owner(verified_by):return None,False
+            if str(order['payment_method'] or '') == 'BINANCE_PAY':
+                try:
+                    snapshot = BINANCE_PAY.invoice(conn, order_id)
+                except (binance_pay.BinancePayError,sqlite3.Error):
+                    return None,False
+                if paid_amount is not None and (type(paid_amount) is not int or paid_amount != snapshot['quoted_idr']):
+                    return None,False
             gateway_verified=automatic_qris.managed(order) and automatic_qris.payment_authorized(_otp_sys.modules[__name__],conn,'order',order_id)
             if automatic_qris.managed(order) and not gateway_verified:return None,False
             recovered=(owner_confirmable_expired_manual(order) and is_owner(verified_by)) or (gateway_verified and order['status']=='expired')
@@ -10180,7 +10269,7 @@ async def mark_order_paid(
             await retire_saved_order_payment_messages(bot,order_id,expired['user_id'])
         return False
 
-    if manual_qris_required(order):
+    if manual_qris_required(order) or str(order['payment_method'] or '')=='BINANCE_PAY':
         await retire_saved_order_payment_messages(bot,order_id,order['user_id'])
     if first_payment:
         # Voucher is consumed only on the first successful payment transition.
@@ -11089,7 +11178,7 @@ class CommandKeyboardMiddleware(BaseMiddleware):
                     return await handler(event,data)
         elif isinstance(event,CallbackQuery) and (str(event.data or "").startswith(
                 (otp_smscode.PREFIX,sosmed_buzzerpanel.PREFIX,bank_accounts.PREFIX,klikqris_gateway.PREFIX,payinaja_gateway.PREFIX,"qrpg:",
-                 "purchaserate:","rate:","reviewopen:","owner:","tools:","utools:","amnew:","amman:","toolsaccess","tm:","cekml:","userdemo:"))
+                 "purchaserate:","rate:","reviewopen:","owner:","tools:","utools:","amnew:","amman:","bpay:","paymanual:","payauto:","processbinance:","toolsaccess","tm:","cekml:","userdemo:"))
                 or getattr(getattr(data.get("handler"),"callback",None),"__name__","").startswith(
                     ("owner_","user_tools_"))):
             main_menu=False
@@ -12935,6 +13024,7 @@ def qris_settings_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="🖼️ Ganti QRIS Manual", callback_data="owner:qris_set")
     kb.button(text="🏦 Rekening Transfer", callback_data="owner:bank_settings")
+    kb.button(text="🌐 Binance Pay • USDT", callback_data="bpay:menu")
     kb.button(text="📝 Edit Catatan", callback_data="owner:qris_note")
     kb.button(text="🔢 Kode Unik: WAJIB", callback_data="owner:unique_info")
     kb.button(text="👁️ Preview QRIS", callback_data="owner:qris_preview")
@@ -23343,46 +23433,30 @@ async def payment_select(call: CallbackQuery):
     if not checkout_variant_is_active(variant_id):
         return await call.answer("Produk tidak tersedia.", show_alert=True)
 
-    mode = get_setting("payment_mode", "manual")
-    auto_ready = auto_payment_ready()
+    await safe_edit_or_answer(call,
+        "💳 <b>PEMBAYARAN</b>\n\nPilih Pay Manual atau QR Otomatis.",
+        reply_markup=payment_method_keyboard(variant_id,qty), parse_mode="HTML")
+    await safe_callback_notice(call)
 
-    kb = InlineKeyboardBuilder()
 
-    balance = get_balance(call.from_user.id)
-    kb.button(
-        text=f"💰 Saldo Kamu ({rupiah(balance)})",
-        callback_data=f"paywallet:{variant_id}:{qty}"
-    )
+@router.callback_query(F.data.startswith("paymanual:"))
+async def payment_manual_select(call: CallbackQuery):
+    numbers=callback_positive_numbers(call.data,"paymanual",2)
+    message=getattr(call,"message",None)
+    if (not numbers or message is None or str(message.chat.type)!="private"
+            or message.chat.id!=call.from_user.id or security_blocked(call.from_user.id)):
+        return await safe_callback_notice(call,"Pilihan pembayaran tidak valid.",show_alert=True)
+    if not checkout_variant_is_active(numbers[0]):
+        return await safe_callback_notice(call,"Produk tidak tersedia.",show_alert=True)
+    await safe_edit_or_answer(call,
+        "💳 <b>PAY MANUAL</b>\n\nPilih metode pembayaran.",
+        reply_markup=manual_payment_method_keyboard(numbers[0],1),parse_mode="HTML")
+    await safe_callback_notice(call)
 
-    # Manual is always available as fallback
-    kb.button(
-        text="🟡 QRIS Pribadi + Kode Unik",
-        callback_data=f"process:{variant_id}:{qty}"
-    )
 
-    # Auto only appears when enabled + credentials complete
-    if auto_ready:
-        kb.button(
-            text="⚡ QRIS Otomatis",
-            callback_data=automatic_qris.checkout_callback(variant_id,qty)
-        )
-
-    kb.button(text="⬅️ Kembali", callback_data=f"variant:{variant_id}")
-    kb.adjust(1)
-
-    auto_status = "✅ Siap" if auto_ready else "⚪ Belum dikonfigurasi"
-    preferred = "QRIS Otomatis" if mode == "auto" else "QRIS Manual"
-
-    await safe_edit_or_answer(call, 
-        "💳 <b>PILIH METODE PEMBAYARAN</b>\n\n"
-        f"🟡 QRIS pribadi: <b>Aktif</b>\n"
-        f"⚡ QRIS Otomatis: <b>{auto_status}</b>\n"
-        f"⭐ Mode utama owner: <b>{preferred}</b>\n\n"
-        "Jika QRIS Otomatis belum siap, pembayaran manual tetap dapat digunakan.",
-        reply_markup=kb.as_markup(),
-        parse_mode="HTML"
-    )
-    await call.answer()
+@router.callback_query(F.data.startswith("payauto:"))
+async def payment_auto_unavailable(call: CallbackQuery):
+    return await safe_callback_notice(call,"QR Otomatis belum tersedia. Pilih Pay Manual.",show_alert=True)
 
 
 
@@ -23897,6 +23971,82 @@ async def process_bank_order(call: CallbackQuery, bot: Bot, state: FSMContext, b
 
         await state.clear()
         await call.answer("Pesanan transfer rekening dibuat.")
+
+
+@router.callback_query(F.data.startswith('processbinance:'))
+async def process_binance_order(call: CallbackQuery, bot: Bot, state: FSMContext):
+    numbers=callback_positive_numbers(call.data,'processbinance',2)
+    message=getattr(call,'message',None)
+    if (not numbers or message is None or str(message.chat.type)!='private'
+            or message.chat.id!=call.from_user.id):
+        return await safe_callback_notice(call,'Pembayaran tidak valid. Gunakan chat privat bot.',show_alert=True)
+    variant_id,requested_qty=numbers
+    if ((safe_mode_enabled() or maintenance_enabled()) and not is_owner(call.from_user.id)):
+        return await safe_callback_notice(call,'Pembayaran sementara belum tersedia.',show_alert=True)
+    if not BINANCE_PAY.ready():
+        return await safe_callback_notice(call,'Binance Pay belum aktif. Pilih metode pembayaran lain.',show_alert=True)
+    async with purchase_lock(call.from_user.id):
+        rate_ok,retry_after=persistent_rate_limit(call.from_user.id,'checkout_payment',limit=5,window_seconds=30)
+        if not rate_ok:
+            return await safe_callback_notice(call,f'Coba kembali dalam {retry_after} detik.',show_alert=True)
+        allowed,reason=anti_abuse_checkout(call.from_user.id,'BINANCE_PAY')
+        if not allowed:
+            return await safe_callback_notice(call,reason,show_alert=True)
+        data=await state.get_data()
+        note=get_checkout_note_from_state(data)
+        conn=db()
+        try:
+            begin_immediate_retry(conn)
+            if checkout_duplicate_order(conn,call.from_user.id,variant_id,requested_qty,'BINANCE_PAY'):
+                conn.rollback()
+                return await safe_callback_notice(call,'Invoice sudah tersedia. Buka Riwayat Pesanan.',show_alert=True)
+            variant=conn.execute('SELECT * FROM product_variants WHERE id=? AND active=1',(variant_id,)).fetchone()
+            product=conn.execute('SELECT * FROM products WHERE id=? AND active=1',(variant['product_id'],)).fetchone() if variant else None
+            if not variant or not product_is_available(product) or available_stock(variant)<1:
+                conn.rollback()
+                return await safe_callback_notice(call,'Produk atau stok tidak tersedia.',show_alert=True)
+            if product_is_famhead(product) and (int(data.get('checkout_variant_id',0) or 0)!=variant_id
+                    or not valid_family_gmail(data.get('family_gmail',''))):
+                conn.rollback()
+                return await require_family_checkout_gmail(call,state,product,variant_id,1,data)
+            unit=effective_unit_price(variant,1)
+            try:
+                voucher,discount=checkout_discount_from_state(data,call.from_user.id,product['id'],variant_id,unit,conn=conn)
+                amount=unit-discount
+                if amount<=0:
+                    raise VoucherCheckoutError('Voucher menutup seluruh tagihan. Selesaikan dengan saldo bot tanpa potongan saldo.',wallet_only=True)
+            except VoucherCheckoutError as exc:
+                conn.rollback()
+                return await reject_checkout_voucher(call,state,variant_id,exc)
+            if not reserve_stock_for_order(conn,variant_id,1):
+                conn.rollback()
+                return await safe_callback_notice(call,'Stok berubah. Pilih produk kembali.',show_alert=True)
+            cur=conn.execute('''INSERT INTO orders(user_id,username,product_id,variant_id,qty,unit_price,total,
+                status,payment_method,payment_status,note,unique_code,payment_total,stock_reserved,reserved_until,
+                created_at,voucher_code,discount_amount) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (call.from_user.id,call.from_user.username or '',product['id'],variant_id,1,unit,unit,'pending',
+                 'BINANCE_PAY','unpaid',note,0,amount,1,'',datetime.now(timezone.utc).isoformat(timespec='seconds'),voucher,discount))
+            order_id=int(cur.lastrowid)
+            BINANCE_PAY.snapshot(conn,order_id,amount)
+            if not verify_saved_payment_method(conn,order_id,'BINANCE_PAY'):
+                raise binance_pay.BinancePayError('Metode invoice tidak sesuai. Coba kembali.')
+            conn.commit()
+        except (binance_pay.BinancePayError,sqlite3.Error):
+            conn.rollback()
+            return await safe_callback_notice(call,'Invoice Binance Pay belum dapat dibuat. Pilih metode lain atau hubungi owner.',show_alert=True)
+        finally:
+            conn.close()
+        await state.clear()
+        await render_binance_order(call,order_id,str(product['name']),str(variant['name']))
+        await safe_callback_notice(call,'Invoice Binance Pay dibuat.')
+        if ADMIN_ID:
+            try:
+                await send_owner_order_notification(bot,order_id,call.from_user.id,
+                    '🌐 <b>ORDER BINANCE PAY</b>\n\n🧾 '+invoice(order_id)
+                    +'\nUser ID: <code>'+str(call.from_user.id)+'</code>\n'+binance_order_text(order_id)
+                    +'\n\nBelum dibayar. Periksa penerimaan USDT dan bukti sebelum konfirmasi.',parse_mode='HTML')
+            except Exception:
+                logging.warning('Binance Pay order notification deferred order=%s',order_id)
 
 
 @router.callback_query(F.data.startswith("process:"))
@@ -24735,7 +24885,7 @@ async def user_check_transaction_status(call: CallbackQuery):
     await call.answer("Status diperbarui.")
 
 
-async def render_cancelled_payment_message(call: CallbackQuery, text: str, reply_markup):
+async def render_cancelled_payment_message(call: CallbackQuery, text: str, reply_markup, *, invoice_label='QRIS'):
     """Retire cancelled payment media before it can be mistaken for a live QR."""
     message = getattr(call, "message", None)
     is_media = any(getattr(message, field, None) for field in (
@@ -24767,7 +24917,7 @@ async def render_cancelled_payment_message(call: CallbackQuery, text: str, reply
     # and replace its amount/instructions with an explicit cancellation notice.
     try:
         await message.edit_caption(
-            caption=text + "\n\n⛔ QRIS ini sudah dibatalkan. Jangan lakukan pembayaran.",
+            caption=text + "\n\n⛔ "+html.escape(invoice_label)+" ini sudah dibatalkan. Jangan lakukan pembayaran.",
             reply_markup=None if sent else reply_markup,
             parse_mode="HTML"
         )
@@ -24858,9 +25008,12 @@ async def user_cancel_order(call: CallbackQuery, bot: Bot, state: FSMContext = N
         f"🧾 {invoice(order_id)}\n"
         "✅ Stok reservasi sudah dikembalikan.\n"
         "Jangan lakukan pembayaran untuk invoice ini.",
-        reply_markup=transaction_done_keyboard(order_id)
+        reply_markup=transaction_done_keyboard(order_id),
+        **({'invoice_label':'Binance Pay'} if order['payment_method']=='BINANCE_PAY' else {})
     )
     await safe_callback_notice(call, "Pesanan dibatalkan.", show_alert=True)
+    if order['payment_method']=='BINANCE_PAY':
+        await retire_saved_order_payment_messages(bot,order_id,call.from_user.id)
 
     try:
         await cleanup_owner_order_notifications(bot,order_id=order_id)
@@ -30256,7 +30409,7 @@ async def owner_complete_order(call: CallbackQuery, state: FSMContext):
            FROM orders o
            LEFT JOIN products p ON p.id=o.product_id
            LEFT JOIN product_variants v ON v.id=o.variant_id
-           WHERE o.payment_method IN ('QRIS','BANK_TRANSFER')
+           WHERE o.payment_method IN ('QRIS','BANK_TRANSFER','BINANCE_PAY')
              AND o.payment_status IN ('unpaid','expired')
              AND o.status NOT IN ('cancelled','completed')
            ORDER BY o.id DESC
@@ -30276,7 +30429,7 @@ async def owner_complete_order(call: CallbackQuery, state: FSMContext):
     await safe_edit_or_answer(
         call,
         "✅ <b>VERIFIKASI PEMBAYARAN MANUAL</b>\n\n"
-        "Pilih invoice yang sudah benar-benar masuk ke rekening/QRIS.\n"
+        "Pilih invoice yang sudah benar-benar diterima melalui rekening, QRIS, atau Binance Pay.\n"
         "Invoice kedaluwarsa tetap bisa diverifikasi jika pembayaran memang masuk.",
         reply_markup=kb.as_markup(),
         parse_mode="HTML"
@@ -36868,7 +37021,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.64"
+EXPECTED_SOURCE_VERSION = "17.65"
 
 
 def source_integrity_self_test():
