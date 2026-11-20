@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.65"
+BOT_VERSION = "17.66"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -10268,6 +10268,15 @@ async def mark_order_paid(
         if expired and manual_qris_required(expired) and expired['status']=='expired':
             await retire_saved_order_payment_messages(bot,order_id,expired['user_id'])
         return False
+
+    if automatic_qris.managed(order):
+        try:
+            gateway=automatic_qris.for_native(_otp_sys.modules[__name__],'order',order_id)
+            transaction=gateway.linked('order',order_id) if gateway else None
+            if transaction:
+                await automatic_qris.payment_verified_progress(_otp_sys.modules[__name__],gateway,transaction['id'],bot)
+        except Exception as exc:
+            logging.warning('Verified payment caption deferred order=%s type=%s',order_id,type(exc).__name__)
 
     if manual_qris_required(order) or str(order['payment_method'] or '')=='BINANCE_PAY':
         await retire_saved_order_payment_messages(bot,order_id,order['user_id'])
@@ -37021,7 +37030,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.65"
+EXPECTED_SOURCE_VERSION = "17.66"
 
 
 def source_integrity_self_test():

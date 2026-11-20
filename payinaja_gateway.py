@@ -40,7 +40,7 @@ PREFIX = 'payi:'
 LABEL = '⚡ QRIS Otomatis'
 FINAL = {'SETTLED', 'SETTLED_BALANCE', 'FAILED', 'CANCELLED'}
 TX_PREFIX = 'payinaja.tx.'
-ADAPTER_VERSION = '17.65'
+ADAPTER_VERSION = '17.66'
 QR_BLOCKING_ERRORS = frozenset({'SCHEMA', 'MISMATCH', 'AUTH', 'ACCOUNT_CHANGED', 'DUPLICATE_REFERENCE'})
 DENIAL_LIMIT = 16384
 UPSTREAM_LIMIT = 16384
@@ -780,6 +780,7 @@ class Gateway:
         self.api = Client(self.config)
         self.bot = None
         self.tasks = []
+        self._poll_lock = asyncio.Lock()
         self.delivery_locks = {}
         self.started_at = time.time()
         self.requested_qr_ids = set()
@@ -1480,12 +1481,12 @@ class Gateway:
                     current.update(cancel_lease_owner=None, cancel_lease_until=0, next_poll_at=time.time() + 15)
                     self.save(conn, current)
 
-    async def refresh(self, ident, *, allow_cancel=True, prepare_image=True):
+    async def refresh(self, ident, *, allow_cancel=True, prepare_image=True, settle_payment=True):
         row = self.transaction(ident)
         if row['state'] in FINAL | {'REVIEW'}:
             return row
         if row['state'] == 'PAID_VERIFIED':
-            return await self.settle(ident)
+            return await self.settle(ident) if settle_payment else row
         if row['state'] == 'REQUESTING':
             with self.connection(True) as conn:
                 row = self.transaction(ident, conn=conn)
@@ -1559,7 +1560,7 @@ class Gateway:
                 if current['state'] in FINAL | {'REVIEW', 'PAID_VERIFIED'}:
                     return current
                 current.update(provider_id=ident_provider, total_amount=data['total_amount'], fee=data['fee'],
-                               next_poll_at=time.time() + 15,
+                               next_poll_at=time.time() + (5 if data['status'] == 'PENDING' and not current['cancel_requested'] else 15),
                                error='IMAGE' if current['error'] == 'IMAGE' and not self.has_qr(current) else '')
                 self.native_invoice(conn, current)
                 if data['status'] == 'PAID':
@@ -1585,7 +1586,7 @@ class Gateway:
             if prepare_image and not self.has_qr(self.transaction(ident)):
                 await self.prepare_qr(ident)
             if self.transaction(ident)['state'] == 'PAID_VERIFIED':
-                return await self.settle(ident)
+                return await self.settle(ident) if settle_payment else self.transaction(ident)
         except GatewayError as exc:
             detail = self.diagnostic(exc, 'status')
             with self.connection(True) as conn:
@@ -2177,6 +2178,13 @@ class Gateway:
 
     async def deliver_receipt_photo(self, bot, receipt, photo, caption):
         row = self.receipt_transaction(receipt['source'], receipt['entity_id'])
+        if not row:
+            raise GatewayError('NOT_READY')
+        async with self.host.automatic_qris.payment_view_guard(self, row['id']):
+            return await self._deliver_receipt_photo(bot, receipt, photo, caption)
+
+    async def _deliver_receipt_photo(self, bot, receipt, photo, caption):
+        row = self.receipt_transaction(receipt['source'], receipt['entity_id'])
         if not row or not self.receipt_payment_confirmed(row):
             raise GatewayError('NOT_READY')
         anchor = receipt['message_id'] if receipt['error_code'] == 'QRIS_EDIT' else None
@@ -2239,6 +2247,7 @@ class Gateway:
                                   (row['purpose'], str(row['entity_id']))).fetchone()
         if (self.paid_proof(row) and not row['cancel_requested'] and row['state'] != 'REVIEW'
                 and (not receipt or receipt['status'] not in {'SENT', 'UNKNOWN', 'ARCHIVING', 'ARCHIVED', 'LEGACY'})):
+            await self.host.automatic_qris.payment_verified_progress(self.host, self, ident, bot)
             with self.connection(True) as conn:
                 current = self.transaction(ident, conn=conn)
                 for item in current['qr_messages']:
@@ -2426,32 +2435,40 @@ class Gateway:
         return self.transaction(ident)
 
     async def poll_once(self):
-        for ident in self.due_ids('active'):
-            try:
-                row = self.transaction(ident)
-                if row['state'] == 'NEW':
-                    if self.ready():
-                        await self.issue(ident)
+        if self._poll_lock.locked():
+            return
+        async with self._poll_lock:
+            async def check(ident):
+                try:
+                    row = self.transaction(ident)
+                    if row['state'] == 'NEW':
+                        if self.ready():
+                            await self.issue(ident)
+                        else:
+                            with self.connection(True) as conn:
+                                current = self.transaction(ident, conn=conn)
+                                current['next_poll_at'] = time.time() + 30
+                                self.save(conn, current)
                     else:
-                        with self.connection(True) as conn:
-                            current = self.transaction(ident, conn=conn)
-                            current['next_poll_at'] = time.time() + 30
-                            self.save(conn, current)
-                else:
-                    await self.refresh(ident)
-                current = self.transaction(ident)
-                if (current['purpose'] == 'order' and current['state'] in {'FAILED', 'CANCELLED'}
-                        and self.can_auto_deliver(current) and not current.get('terminal_notice_sent')):
-                    self.terminal_notices.setdefault(ident, dict(queued_at=time.time(), retry_at=0))
-                await self.deliver_pending_qr(ident)
-            except GatewayError as exc:
-                if exc.code == 'RATE_LIMIT':
-                    break
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.diagnostic(exc, 'poll')
-        await self.deliver_terminal_notices()
+                        await self.refresh(ident, settle_payment=False)
+                    current = self.transaction(ident)
+                    if current['state'] == 'PAID_VERIFIED':
+                        self.host.automatic_qris.start_settlement(self, ident)
+                    if (current['purpose'] == 'order' and current['state'] in {'FAILED', 'CANCELLED'}
+                            and self.can_auto_deliver(current) and not current.get('terminal_notice_sent')):
+                        self.terminal_notices.setdefault(ident, dict(queued_at=time.time(), retry_at=0))
+                    await self.deliver_pending_qr(ident)
+                except GatewayError as exc:
+                    if exc.code == 'RATE_LIMIT':
+                        return False
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.diagnostic(exc, 'poll')
+                return True
+
+            await self.host.automatic_qris.poll_batch(self.due_ids('active'), check)
+            await self.deliver_terminal_notices()
 
     async def deliver_terminal_notices(self):
         # Only views from this process are queued. Redeploy never replays old
@@ -2504,6 +2521,7 @@ class Gateway:
         self.bot = bot
         if self.tasks:
             return []
+        self._settlements_closing = False
         async def payments():
             while True:
                 try:
@@ -2512,7 +2530,7 @@ class Gateway:
                     raise
                 except Exception as exc:
                     self.diagnostic(exc, 'poll')
-                await asyncio.sleep(15)
+                await asyncio.sleep(5)
         async def cleanup():
             while True:
                 try:
@@ -2532,6 +2550,7 @@ class Gateway:
         if self.tasks:
             await asyncio.gather(*self.tasks, return_exceptions=True)
         self.tasks = []
+        await self.host.automatic_qris.close_settlements(self)
         await self.api.close()
 
     @staticmethod

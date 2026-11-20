@@ -28,7 +28,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from am_service_client import (BASE_URL, AMServiceClient, AMServiceConfig,
                                AMServiceError, _email, _magic_link)
 
-ADAPTER_VERSION = '17.65'
+ADAPTER_VERSION = '17.66'
 JOB_PREFIX = 'ammanual.flow.'
 FSM_KEY = 'ammanual_job_id'
 FORM_SECONDS = 15 * 60

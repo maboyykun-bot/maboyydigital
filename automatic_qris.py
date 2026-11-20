@@ -5,6 +5,11 @@ import json
 import re
 import secrets
 import sqlite3
+import asyncio
+import logging
+import time
+import weakref
+from contextlib import asynccontextmanager
 
 from aiogram import F
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -12,7 +17,157 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from klikqris_gateway import GatewayError, buyer_error, environment_value
 
 METHODS = frozenset({'KLIKQRIS_AUTO', 'PAYINAJA_AUTO'})
-ADAPTER_VERSION = '17.65'
+ADAPTER_VERSION = '17.66'
+
+
+async def poll_batch(items, operation, *, concurrency=3):
+    """Bound independent invoices; a throttled row stops further launches."""
+    if type(concurrency) is not int or not 1 <= concurrency <= 3:
+        raise ValueError('Invalid payment concurrency')
+    pending = iter(items)
+    stopped = False
+    async def worker():
+        nonlocal stopped
+        while not stopped:
+            try:
+                item = next(pending)
+            except StopIteration:
+                return
+            if await operation(item) is False:
+                stopped = True
+    tasks = [asyncio.create_task(worker()) for _ in range(concurrency)]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def start_settlement(gateway, ident):
+    """Supervise existing paid-proof settlement outside the status polling batch."""
+    if getattr(gateway, '_settlements_closing', False):
+        return None
+    jobs = getattr(gateway, '_settlement_jobs', None)
+    if jobs is None:
+        jobs = gateway._settlement_jobs = {}
+    current = jobs.get(ident)
+    if current is not None and not current.done():
+        return current
+    if len(jobs) >= 32 or gateway.transaction(ident)['state'] != 'PAID_VERIFIED':
+        return None
+    async def run():
+        try:
+            await gateway.settle(ident)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The durable PAID_VERIFIED row and existing recovery remain the
+            # source of truth; never create a replacement invoice here.
+            logging.warning('Verified payment settlement deferred (%s)',type(exc).__name__)
+        finally:
+            if jobs.get(ident) is asyncio.current_task():
+                jobs.pop(ident, None)
+    task = asyncio.create_task(run(), name='verified_qris_settlement')
+    jobs[ident] = task
+    return task
+
+
+async def close_settlements(gateway):
+    gateway._settlements_closing = True
+    jobs = getattr(gateway, '_settlement_jobs', {})
+    tasks = list(jobs.values())
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    jobs.clear()
+
+
+@asynccontextmanager
+async def payment_view_guard(gateway, ident):
+    """Serialize progress captions and final receipt edits on the same invoice."""
+    locks = getattr(gateway, '_payment_view_locks', None)
+    if locks is None:
+        locks = gateway._payment_view_locks = weakref.WeakValueDictionary()
+    lock = locks.get(ident)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[ident] = lock
+    async with lock:
+        yield
+
+
+async def payment_verified_progress(host, gateway, ident, bot):
+    """Update a known QR only after strict provider proof AND native payment."""
+    if bot is None:
+        return False
+    async with payment_view_guard(gateway, ident):
+        row = gateway.transaction(ident)
+        purpose = row['purpose']
+        if purpose not in {'order', 'topup'} or row['state'] not in {'PAID_VERIFIED', 'SETTLED'}:
+            return False
+        with host.db() as conn:
+            if for_native(host, purpose, row['entity_id'], conn) is not gateway:
+                return False
+            if not payment_authorized(host, conn, purpose, row['entity_id'], settled=True):
+                return False
+            native = conn.execute('SELECT * FROM ' + ('orders' if purpose == 'order' else 'topups') + ' WHERE id=? AND user_id=?',
+                                  (row['entity_id'], row['user_id'])).fetchone()
+            if (not native or (native['payment_status'] != 'paid' if purpose == 'order' else native['status'] != 'completed')
+                    or native['status'] in {'cancelled', 'rejected', 'expired'}):
+                return False
+            receipt = conn.execute('SELECT status,error_code FROM payment_receipts WHERE source=? AND entity_id=?',
+                                   (purpose, str(row['entity_id']))).fetchone()
+            if receipt and (receipt['status'] in {'SENT', 'LEGACY', 'UNKNOWN', 'ARCHIVING', 'ARCHIVED'}
+                            or receipt['error_code'] == 'QRIS_EDIT'):
+                return False
+            if gateway is host.PAYINAJA_GATEWAY:
+                provider = 'payinaja'
+                messages = [item['id'] for item in row['qr_messages'] if item['kind'] == 'QR']
+            else:
+                provider = 'klikqris'
+                messages = [item[0] for item in conn.execute('''SELECT message_id FROM klikqris_payment_messages
+                    WHERE transaction_id=? AND chat_id=? AND kind='QR' ORDER BY created_at,message_id''',
+                    (ident, row['user_id']))]
+        for message_id in reversed(messages):
+            if type(message_id) is not int or message_id <= 0:
+                continue
+            key = 'auto_qris_progress.' + provider + '.' + str(ident) + '.' + str(message_id)
+            with host.db() as conn:
+                host.begin_immediate_retry(conn)
+                old = conn.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+                if old and old[0] == 'sent':
+                    continue
+                if old:
+                    try:
+                        if float(old[0]) > time.time():
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                conn.execute('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                             (key, str(time.time() + 20)))
+            delivered = False
+            try:
+                await asyncio.wait_for(bot.edit_message_caption(chat_id=row['user_id'], message_id=message_id,
+                    caption='✅ <b>PEMBAYARAN TERVERIFIKASI</b>\n\n🧾 '
+                        + (host.invoice(row['entity_id']) if purpose == 'order' else host.topup_invoice(row['entity_id']))
+                        + ('\nPesanan sedang diproses.' if purpose == 'order' else '\nSaldo sudah ditambahkan.')
+                        + ' Tidak perlu membayar lagi.',
+                    parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]])), timeout=2)
+                delivered = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                delivered = 'message is not modified' in str(exc).lower()
+            finally:
+                with host.db() as conn:
+                    conn.execute('UPDATE settings SET value=? WHERE key=?',
+                                 ('sent' if delivered else str(time.time() + 5), key))
+            return delivered  # Bound the UI work to one known QR per call.
+    return False
 
 
 def checkout_callback(variant, qty):
@@ -213,7 +368,7 @@ def payment_authorized(host, conn, purpose, entity, *, settled=False):
     gateway = for_native(host, purpose, entity, conn)
     if gateway is host.PAYINAJA_GATEWAY:
         return gateway.payment_authorized(conn, purpose, entity, settled=settled)
-    return bool(gateway and gateway.payment_authorized(conn, purpose, entity))
+    return bool(gateway and gateway.payment_authorized(conn, purpose, entity, settled=settled))
 
 
 def record_failure(host, exc):
