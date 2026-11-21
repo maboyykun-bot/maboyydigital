@@ -42,7 +42,7 @@ PREFIX = 'payi:'
 LABEL = '⚡ QRIS Otomatis'
 FINAL = {'SETTLED', 'SETTLED_BALANCE', 'FAILED', 'CANCELLED'}
 TX_PREFIX = 'payinaja.tx.'
-ADAPTER_VERSION = '17.70'
+ADAPTER_VERSION = '17.71'
 QR_BLOCKING_ERRORS = frozenset({'SCHEMA', 'MISMATCH', 'AUTH', 'ACCOUNT_CHANGED', 'DUPLICATE_REFERENCE'})
 DENIAL_LIMIT = 16384
 UPSTREAM_LIMIT = 16384
@@ -1733,7 +1733,7 @@ class Gateway:
                  'Hasil pembayaran sebelumnya masih perlu dipastikan agar tagihan tidak ganda.'))
         controls = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text='🔄 Periksa pembayaran sebelumnya', callback_data=PREFIX + 'u:check:' + ident)],
-            [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]])
+            [InlineKeyboardButton(text='🏠 Menu Utama', callback_data='home')]])
         if row['purpose'] == 'order':
             controls = self.user_keyboard(row)
             text += '\nBot melanjutkan pemeriksaan pembayaran secara otomatis.'
@@ -1909,7 +1909,7 @@ class Gateway:
             await asyncio.wait_for(call.bot.edit_message_text(chat_id=call.from_user.id, message_id=source,
                 text='⏳ <b>Menyiapkan QRIS Otomatis</b>\nMohon tunggu sebentar.', parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]])), timeout=2)
+                    [InlineKeyboardButton(text='🏠 Menu Utama', callback_data='home')]])), timeout=2)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2159,7 +2159,7 @@ class Gateway:
                                              callback_data=PREFIX + 'u:check:' + row['id'])])
         if row['state'] not in FINAL | {'REVIEW', 'PAID_VERIFIED'} and not row['cancel_requested']:
             rows.append([InlineKeyboardButton(text='❌ Batalkan', callback_data=PREFIX + 'u:cancel:' + row['id'])])
-        rows.append([InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')])
+        rows.append([InlineKeyboardButton(text='🏠 Menu Utama', callback_data='home')])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     def status_text(self, row):
@@ -2537,7 +2537,7 @@ class Gateway:
 
     async def _edit_order_notice(self, bot, user, message_id, kind, text):
         controls = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]])
+            [InlineKeyboardButton(text='🏠 Menu Utama', callback_data='home')]])
         for _ in range(2):
             try:
                 if kind == 'photo':
@@ -2650,7 +2650,7 @@ class Gateway:
                         try:
                             sent = await asyncio.wait_for(bot.send_message(row['user_id'], text, parse_mode='HTML',
                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                                    [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]])), timeout=2)
+                                    [InlineKeyboardButton(text='🏠 Menu Utama', callback_data='home')]])), timeout=2)
                             target = getattr(sent, 'message_id', None)
                             if type(target) is not int or target <= 0:
                                 raise GatewayError('TELEGRAM')
