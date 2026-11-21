@@ -19,7 +19,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
 
 
-ADAPTER_VERSION = '17.66'
+ADAPTER_VERSION = '17.68'
 PREFIX = 'bpay:'
 SETTINGS_PREFIX = 'binance_pay.'
 INVOICE_PREFIX = SETTINGS_PREFIX + 'invoice.'

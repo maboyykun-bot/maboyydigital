@@ -25,7 +25,7 @@ from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMa
 from am_service_client import BASE_URL, AMServiceClient, AMServiceConfig, AMServiceError, _magic_link
 
 
-ADAPTER_VERSION = '17.66'
+ADAPTER_VERSION = '17.68'
 JOB_PREFIX = 'amservice.job.'
 DUE_PREFIX = 'amservice.due.'
 VIEW_PREFIX = 'amservice.view.'

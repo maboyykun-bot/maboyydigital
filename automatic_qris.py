@@ -17,7 +17,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from klikqris_gateway import GatewayError, buyer_error, environment_value
 
 METHODS = frozenset({'KLIKQRIS_AUTO', 'PAYINAJA_AUTO'})
-ADAPTER_VERSION = '17.66'
+ADAPTER_VERSION = '17.68'
 
 
 async def poll_batch(items, operation, *, concurrency=3):
@@ -103,11 +103,22 @@ async def payment_verified_progress(host, gateway, ident, bot):
     """Update a known QR only after strict provider proof AND native payment."""
     if bot is None:
         return False
+    if gateway is host.PAYINAJA_GATEWAY:
+        locks = getattr(gateway, '_payment_view_locks', None)
+        lock = locks.get(ident) if locks is not None else None
+        if lock is not None and lock.locked():
+            # A QR upload may still be in flight. Financial settlement and
+            # product delivery must not wait for that Telegram operation.
+            # Its completion/receipt path retries this same known message.
+            return False
     async with payment_view_guard(gateway, ident):
         row = gateway.transaction(ident)
         purpose = row['purpose']
         if purpose not in {'order', 'topup'} or row['state'] not in {'PAID_VERIFIED', 'SETTLED'}:
             return False
+        if (gateway is host.PAYINAJA_GATEWAY and purpose == 'topup'
+                and not gateway.receipt_payment_confirmed(row)):
+            return False  # "Saldo masuk" requires the native credit and ledger.
         with host.db() as conn:
             if for_native(host, purpose, row['entity_id'], conn) is not gateway:
                 return False
@@ -279,9 +290,8 @@ def managed(row):
 
 
 def selected(host):
-    if 'AUTO_QRIS_PROVIDER' in os.environ:
-        value, _ = environment_value('AUTO_QRIS_PROVIDER')
-    else:
+    value, _ = environment_value('AUTO_QRIS_PROVIDER')
+    if not value:
         conn = host.db()
         try:
             found = conn.execute("SELECT value FROM settings WHERE key='auto_qris_provider'").fetchone()
@@ -306,12 +316,8 @@ def ready(host):
 
 
 def available(host):
-    """Configured + owner-enabled may authenticate on click; this is not verified readiness."""
-    try:
-        gateway = active(host)
-        return gateway.can_attempt() if gateway is host.PAYINAJA_GATEWAY else gateway.ready()
-    except (GatewayError, sqlite3.Error):
-        return False
+    """Only advertise an owner-enabled provider with current verified readiness."""
+    return ready(host)
 
 
 def handles_checkout(host):
@@ -412,15 +418,18 @@ async def checkout(host, call, bot, state, variant, qty, *, request_id=None):
     if not call.message or str(call.message.chat.type) != 'private' or call.message.chat.id != call.from_user.id:
         raise GatewayError('FORBIDDEN')
     await host.safe_callback_notice(call)
-    await host.safe_edit_or_answer(call, '⏳ <b>Menyiapkan QRIS Otomatis</b>\n\nMohon tunggu, bot sedang menyiapkan pembayaran.',
-        parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]]))
+    async def progress(gateway):
+        if gateway is not host.PAYINAJA_GATEWAY:
+            await host.safe_edit_or_answer(call, '⏳ <b>Menyiapkan QRIS Otomatis</b>\n\nMohon tunggu, bot sedang menyiapkan pembayaran.',
+                parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]]))
     gateway = None
     try:
         if request_id is not None:
             record = load_checkout_request(host, call.from_user.id, variant, qty, request_id)
             name = record['provider'] if record else selected(host)
             gateway = host.PAYINAJA_GATEWAY if name == 'payinaja' else host.KLIKQRIS_GATEWAY
+            await progress(gateway)
             if record:
                 row = checkout_request_row(host, name, call.from_user.id, variant, qty, request_id)
                 if row['state'] != 'NEW':
@@ -433,6 +442,7 @@ async def checkout(host, call, bot, state, variant, qty, *, request_id=None):
                 return await gateway.show_prior_hold(call, row['id'])
             gateway = None
         gateway = gateway or active(host)
+        await progress(gateway)
         if row:
             # Read/check the old invoice. Never replace it using another provider.
             if gateway is host.PAYINAJA_GATEWAY and row['cancel_requested']:
@@ -463,7 +473,11 @@ async def checkout(host, call, bot, state, variant, qty, *, request_id=None):
                     ORDER BY t.created_at DESC LIMIT 1""", (call.from_user.id, variant, qty))
         except (GatewayError, sqlite3.Error):
             pass
-        if row is not None:
+        if row is not None and gateway is host.PAYINAJA_GATEWAY and gateway.payment_view_message(row):
+            # The known card may already be a QR or verified receipt. Never
+            # answer with a second, stale checkout-progress card after a race.
+            await gateway.show_payment(call, row['id'])
+        elif row is not None:
             await host.safe_edit_or_answer(call, gateway.status_text(row) + '\nBot melanjutkan pemeriksaan secara otomatis.',
                 parse_mode='HTML', reply_markup=gateway.user_keyboard(row))
         else:
@@ -508,7 +522,7 @@ async def owner_provider_menu(host, call):
         name = 'Konfigurasi AUTO_QRIS_PROVIDER perlu diperbaiki'
     text = ('⚙️ <b>PROVIDER QRIS OTOMATIS</b>\n\nPilihan untuk invoice baru: ' + name +
             '\nInvoice existing tetap diperiksa melalui provider asal. Pemilihan tidak membuat invoice atau mengaktifkan gateway.'
-            '\nJika AUTO_QRIS_PROVIDER diisi di hosting, nilainya mengalahkan pilihan database.')
+            '\nAUTO_QRIS_PROVIDER nonkosong di hosting mengalahkan database; nilai kosong mengikuti pilihan database.')
     rows = [
         [InlineKeyboardButton(text='Pilih KlikQRIS', callback_data='qrpg:select:klikqris'),
          InlineKeyboardButton(text='Pilih Payinaja', callback_data='qrpg:select:payinaja')],
@@ -541,7 +555,8 @@ def register(router, host):
             if len(parts) != 3 or parts[1] not in {'select', 'open'} or parts[2] not in {'klikqris', 'payinaja'}:
                 raise GatewayError('INPUT')
             if parts[1] == 'select':
-                if 'AUTO_QRIS_PROVIDER' in os.environ and selected(host) != parts[2]:
+                override, _ = environment_value('AUTO_QRIS_PROVIDER')
+                if override and selected(host) != parts[2]:
                     raise GatewayError('CONFIG')
                 with host.db() as conn:
                     host.begin_immediate_retry(conn)

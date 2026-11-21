@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.66"
+BOT_VERSION = "17.68"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -2811,6 +2811,104 @@ def split_delivery_text(delivery_text: str, max_chars: int = 3200):
     return chunks or [""]
 
 
+class PayinajaDeliveryUncertain(RuntimeError):
+    """A credential send may have reached Telegram; automatic replay is unsafe."""
+
+
+def payinaja_delivery_attempt(order_id: int, conn=None):
+    if conn is None:
+        with db() as current:
+            return payinaja_delivery_attempt(order_id,current)
+    saved=conn.execute('SELECT value FROM settings WHERE key=?',
+                       ('payinaja.delivery_attempt.'+str(order_id),)).fetchone()
+    if not saved:return None
+    try:
+        marker=json.loads(saved[0])
+        if (marker.get('version')!=1 or marker.get('order_id')!=order_id
+                or marker.get('phase')!='account' or marker.get('state') not in {'REQUESTING','UNKNOWN'}
+                or type(marker.get('chunk')) is not int or marker['chunk']<0
+                or not re.fullmatch('[0-9a-f]{16}',str(marker.get('attempt_id','')))):
+            raise ValueError
+        return marker
+    except (ValueError,TypeError,AttributeError):
+        raise PayinajaDeliveryUncertain('DELIVERY_UNCERTAIN: owner reconciliation required') from None
+
+
+def claim_payinaja_delivery_attempt(order_id: int, chunk: int):
+    with db() as conn:
+        begin_immediate_retry(conn)
+        row=conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
+        if not row or row['payment_method']!='PAYINAJA_AUTO':
+            raise PayinajaDeliveryUncertain('DELIVERY_UNCERTAIN: delivery binding requires review')
+        if (row['payment_status']!='paid' or row['status'] in {'cancelled','rejected'}
+                or row['fulfillment_status']=='delivered'
+                or int(row['delivery_chunks_sent'] or 0)!=chunk
+                or not automatic_qris.payment_authorized(
+                    _otp_sys.modules[__name__],conn,'order',order_id,settled=True)):
+            raise PayinajaDeliveryUncertain('DELIVERY_UNCERTAIN: payment or progress requires review')
+        if payinaja_delivery_attempt(order_id,conn):
+            raise PayinajaDeliveryUncertain('DELIVERY_UNCERTAIN: owner reconciliation required')
+        marker=dict(version=1,order_id=order_id,phase='account',chunk=chunk,state='REQUESTING',
+                    attempt_id=secrets.token_hex(8),created_at=time.time())
+        conn.execute('INSERT INTO settings(key,value) VALUES(?,?)',
+                     ('payinaja.delivery_attempt.'+str(order_id),json.dumps(marker,separators=(',',':'))))
+        return marker
+
+
+def update_payinaja_delivery_attempt(order_id: int, attempt_id: str, *, confirmed=False, rejected=False, error_type=''):
+    with db() as conn:
+        begin_immediate_retry(conn)
+        marker=payinaja_delivery_attempt(order_id,conn)
+        if not marker or not hmac.compare_digest(marker['attempt_id'],attempt_id):
+            raise PayinajaDeliveryUncertain('DELIVERY_UNCERTAIN: send progress requires review')
+        if confirmed:
+            changed=conn.execute('''UPDATE orders SET delivery_chunks_sent=?
+                WHERE id=? AND payment_method='PAYINAJA_AUTO' AND payment_status='paid'
+                AND delivery_chunks_sent=?''',(marker['chunk']+1,order_id,marker['chunk'])).rowcount
+            if changed!=1:raise PayinajaDeliveryUncertain('DELIVERY_UNCERTAIN: send progress requires review')
+        if confirmed or rejected:
+            conn.execute('DELETE FROM settings WHERE key=?',('payinaja.delivery_attempt.'+str(order_id),))
+        else:
+            marker.update(state='UNKNOWN',error_type=error_type[:80])
+            conn.execute('UPDATE settings SET value=? WHERE key=?',
+                         (json.dumps(marker,separators=(',',':')),'payinaja.delivery_attempt.'+str(order_id)))
+            conn.execute('''UPDATE orders SET status='paid_pending_delivery',fulfillment_status='send_failed',
+                last_delivery_error='DELIVERY_UNCERTAIN: owner reconciliation required'
+                WHERE id=? AND payment_status='paid' AND fulfillment_status!='delivered' ''',(order_id,))
+
+
+def resolve_payinaja_delivery_attempt(order_id: int, actor_id: int, attempt_id: str, *, received: bool):
+    """Record an owner's explicit delivery reconciliation; never alter payment."""
+    if not is_owner(actor_id):return False,'owner_required'
+    if (type(order_id) is not int or not 0<order_id<=9223372036854775807
+            or type(received) is not bool or not isinstance(attempt_id,str)
+            or not re.fullmatch('[0-9a-f]{16}',attempt_id)):
+        return False,'input'
+    with db() as conn:
+        begin_immediate_retry(conn)
+        row=conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
+        marker=payinaja_delivery_attempt(order_id,conn)
+        if not marker or not hmac.compare_digest(marker['attempt_id'],attempt_id):return False,'stale'
+        if (not row or row['payment_method']!='PAYINAJA_AUTO' or row['payment_status']!='paid'
+                or row['status'] in {'cancelled','rejected'} or row['fulfillment_status']=='delivered'
+                or int(row['delivery_chunks_sent'] or 0)!=marker['chunk']
+                or not (row['delivery_text'] or '').strip()
+                or marker['chunk']>=len(split_delivery_text(row['delivery_text']))
+                or not automatic_qris.payment_authorized(
+                    _otp_sys.modules[__name__],conn,'order',order_id,settled=True)):
+            return False,'payment_or_progress'
+        gateway=PAYINAJA_GATEWAY.linked('order',order_id,conn)
+        if not gateway or gateway.get('delivery_until',0)>time.time():return False,'busy'
+        marker.update(resolved_by=actor_id,resolved_at=time.time(),received=received)
+        conn.execute('INSERT INTO settings(key,value) VALUES(?,?)',
+                     ('payinaja.delivery_resolved.'+str(order_id)+'.'+attempt_id,json.dumps(marker,separators=(',',':'))))
+        conn.execute('''UPDATE orders SET delivery_chunks_sent=?,status='paid_pending_delivery',
+            fulfillment_status='send_failed',last_delivery_error='' WHERE id=? AND payment_status='paid' ''',
+            (marker['chunk']+(1 if received else 0),order_id))
+        conn.execute('DELETE FROM settings WHERE key=?',('payinaja.delivery_attempt.'+str(order_id),))
+        return True,'received' if received else 'not_sent'
+
+
 async def send_delivery_payload(bot: Bot, user_id: int, order_id: int, delivery_text: str):
     """
     Resume-safe delivery:
@@ -2824,6 +2922,16 @@ async def send_delivery_payload(bot: Bot, user_id: int, order_id: int, delivery_
     conn.close()
     if not order:
         raise RuntimeError("Order tidak ditemukan saat delivery.")
+    if order['payment_method']=='PAYINAJA_AUTO' and (user_id!=order['user_id']
+            or order['payment_status']!='paid' or delivery_text!=order['delivery_text']):
+        raise PayinajaDeliveryUncertain('DELIVERY_UNCERTAIN: delivery binding requires review')
+    if order['payment_method']=='PAYINAJA_AUTO':
+        with db() as conn:
+            if not automatic_qris.payment_authorized(
+                    _otp_sys.modules[__name__],conn,'order',order_id,settled=True):
+                raise PayinajaDeliveryUncertain('DELIVERY_UNCERTAIN: payment proof requires review')
+    if order['payment_method']=='PAYINAJA_AUTO' and payinaja_delivery_attempt(order_id):
+        raise PayinajaDeliveryUncertain('DELIVERY_UNCERTAIN: owner reconciliation required')
 
     chunks=split_delivery_text(delivery_text)
 
@@ -2847,15 +2955,30 @@ async def send_delivery_payload(bot: Bot, user_id: int, order_id: int, delivery_
     current=conn.execute("SELECT delivery_chunks_sent FROM orders WHERE id=?",(order_id,)).fetchone()
     conn.close()
     sent_count=int(current["delivery_chunks_sent"] or 0) if current else 0
+    if order['payment_method']=='PAYINAJA_AUTO' and not 0<=sent_count<=len(chunks):
+        raise PayinajaDeliveryUncertain('DELIVERY_UNCERTAIN: send progress requires review')
 
     for index,chunk in enumerate(chunks):
         if index < sent_count:
             continue
-        await bot.send_message(
-            user_id,
-            f"<pre>{html.escape(chunk)}</pre>",
-            parse_mode="HTML"
-        )
+        attempt=claim_payinaja_delivery_attempt(order_id,index) if order['payment_method']=='PAYINAJA_AUTO' else None
+        try:
+            await bot.send_message(
+                user_id,
+                f"<pre>{html.escape(chunk)}</pre>",
+                parse_mode="HTML"
+            )
+        except (TelegramBadRequest,TelegramForbiddenError,TelegramRetryAfter):
+            if attempt:update_payinaja_delivery_attempt(order_id,attempt['attempt_id'],rejected=True)
+            raise
+        except BaseException as exc:
+            if attempt:
+                try:update_payinaja_delivery_attempt(order_id,attempt['attempt_id'],error_type=type(exc).__name__)
+                except Exception:pass  # The durable REQUESTING claim still blocks a blind replay.
+            raise
+        if attempt:
+            update_payinaja_delivery_attempt(order_id,attempt['attempt_id'],confirmed=True)
+            continue
         conn=db()
         conn.execute(
             """UPDATE orders
@@ -2873,7 +2996,13 @@ async def send_delivery_payload(bot: Bot, user_id: int, order_id: int, delivery_
     conn.commit(); conn.close()
 
     # The shared photo outbox owns delivery and restart-safe retry.
-    await payment_receipts.notify(_otp_sys.modules[__name__], bot, "order", order_id)
+    try:
+        await payment_receipts.notify(_otp_sys.modules[__name__], bot, "order", order_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if order['payment_method']!='PAYINAJA_AUTO':raise
+        logging.warning('Payinaja receipt deferred order=%s type=%s',order_id,type(exc).__name__)
 
     # Footer is cosmetic but tracked too, so retry does not duplicate it.
     conn=db()
@@ -2884,14 +3013,21 @@ async def send_delivery_payload(bot: Bot, user_id: int, order_id: int, delivery_
     conn.close()
 
     if footer_state and int(footer_state["delivery_footer_sent"] or 0)==0:
-        await bot.send_message(
-            user_id,
-            "🔒 Simpan akun dengan aman dan jangan membagikannya kepada orang lain.\n\n"
-            "Jika akun tidak valid / bermasalah, gunakan tombol komplain di bawah.\n\n"
-            f"<i>{STORE_FOOTER}</i>",
-            reply_markup=user_delivery_actions_keyboard(order_id),
-            parse_mode="HTML"
-        )
+        try:
+            await bot.send_message(
+                user_id,
+                "🔒 Simpan akun dengan aman dan jangan membagikannya kepada orang lain.\n\n"
+                "Jika akun tidak valid / bermasalah, gunakan tombol komplain di bawah.\n\n"
+                f"<i>{STORE_FOOTER}</i>",
+                reply_markup=user_delivery_actions_keyboard(order_id),
+                parse_mode="HTML"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if order['payment_method']!='PAYINAJA_AUTO':raise
+            logging.warning('Payinaja delivery footer deferred order=%s type=%s',order_id,type(exc).__name__)
+            return
         conn=db()
         conn.execute(
             "UPDATE orders SET delivery_footer_sent=1 WHERE id=?",
@@ -3659,7 +3795,13 @@ async def _fulfill_order_impl(order_id: int, bot: Bot) -> bool:
         if (manual_confirmation_required(order) or automatic_qris.managed(order)) and int(order['stock_reserved'] or 0)!=1:
             sync_variant_stock_from_inventory(conn,int(order['variant_id']))
             if not reserve_stock_for_order(conn,int(order['variant_id']),qty):
-                conn.rollback();conn.close()
+                if order['payment_method']=='PAYINAJA_AUTO':
+                    conn.execute("""UPDATE orders SET status='paid_pending_delivery',fulfillment_status='pending'
+                        WHERE id=? AND payment_status='paid' AND fulfillment_status!='delivered'
+                        AND status NOT IN ('cancelled','rejected')""",(order_id,))
+                    conn.commit()
+                else:conn.rollback()
+                conn.close()
                 return False
             conn.execute("UPDATE orders SET stock_reserved=1,reserved_until='' WHERE id=?",(order_id,))
             order=conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
@@ -3780,6 +3922,13 @@ async def _fulfill_order_impl(order_id: int, bot: Bot) -> bool:
         if not delivery_state or int(delivery_state["account_sent"] or 0)!=1:
             raise RuntimeError("Account delivery belum selesai.")
     except Exception as exc:
+        error_detail=str(exc)[:500]
+        delivery_uncertain=False
+        if order['payment_method']=='PAYINAJA_AUTO':
+            try:delivery_uncertain=bool(payinaja_delivery_attempt(order_id))
+            except PayinajaDeliveryUncertain:delivery_uncertain=True
+            error_detail=('DELIVERY_UNCERTAIN: owner reconciliation required'
+                          if delivery_uncertain else type(exc).__name__)
         conn = db()
         conn.execute(
             """UPDATE orders
@@ -3788,12 +3937,15 @@ async def _fulfill_order_impl(order_id: int, bot: Bot) -> bool:
                    delivery_attempts=delivery_attempts+1,
                    last_delivery_error=?
                WHERE id=?""",
-            (str(exc)[:500], order_id)
+            (error_detail, order_id)
         )
         conn.commit()
         conn.close()
 
-        logging.exception("Delivery send failed for order %s: %s", order_id, exc)
+        if order['payment_method']=='PAYINAJA_AUTO':
+            logging.warning("Payinaja delivery deferred order=%s type=%s",order_id,type(exc).__name__)
+        else:
+            logging.exception("Delivery send failed for order %s: %s", order_id, exc)
 
         if ADMIN_ID:
             try:
@@ -3802,18 +3954,22 @@ async def _fulfill_order_impl(order_id: int, bot: Bot) -> bool:
                     "⚠️ <b>PENGIRIMAN AKUN GAGAL</b>\n\n"
                     f"🧾 {invoice(order_id)}\n"
                     "Akun sudah dialokasikan dan <b>tidak akan diberikan ke user lain</b>.\n"
-                    "Gunakan Riwayat / kirim ulang setelah koneksi Telegram normal.",
+                    + ("Hasil pengiriman belum pasti. Buka detail invoice di QRIS Otomatis untuk rekonsiliasi sebelum mengirim ulang."
+                       if delivery_uncertain else "Gunakan Riwayat / kirim ulang setelah koneksi Telegram normal."),
                     parse_mode="HTML"
                 )
             except Exception as owner_alert_exc:
-                logging.exception(
-                    "Failed to notify owner about delivery failure for order %s: %s",
-                    order_id,
-                    owner_alert_exc
-                )
+                if order['payment_method']=='PAYINAJA_AUTO':
+                    logging.warning('Payinaja delivery alert deferred order=%s type=%s',order_id,type(owner_alert_exc).__name__)
+                else:
+                    logging.exception(
+                        "Failed to notify owner about delivery failure for order %s: %s",
+                        order_id,
+                        owner_alert_exc
+                    )
                 log_system_error(
                     "DELIVERY_OWNER_ALERT",
-                    str(owner_alert_exc),
+                    type(owner_alert_exc).__name__ if order['payment_method']=='PAYINAJA_AUTO' else str(owner_alert_exc),
                     reference=f"order:{order_id}",
                     severity="warning",
                     recovered=False
@@ -4121,7 +4277,15 @@ async def recover_stuck_orders(bot: Bot):
     still_pending = 0
 
     for row in rows:
-        ok = await fulfill_order(row["id"], bot)
+        try:
+            ok = await fulfill_order(row["id"], bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # One failed paid order must not starve later paid deliveries.
+            # The original order/allocation remains eligible for the next pass.
+            logging.warning("Paid order recovery deferred order=%s type=%s", row["id"], type(exc).__name__)
+            ok = False
         if ok:
             recovered += 1
         else:
@@ -4667,10 +4831,17 @@ def checkout_note_keyboard(variant_id: int, qty: int):
 
 def payment_method_keyboard(variant_id: int, qty: int):
     qty = 1
+    auto_ready = auto_payment_ready()
+    auto_label = '⚡ QR Otomatis'
+    try:
+        if not auto_ready and automatic_qris.selected(_otp_sys.modules[__name__]) == 'payinaja':
+            auto_label += ' • Belum Tersedia'
+    except (klikqris_gateway.GatewayError, sqlite3.Error):
+        pass
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='💳 Pay Manual',callback_data=f'paymanual:{variant_id}:{qty}')],
-        [InlineKeyboardButton(text='⚡ QR Otomatis',callback_data=(
-            automatic_qris.checkout_callback(variant_id,qty) if auto_payment_ready()
+        [InlineKeyboardButton(text=auto_label,callback_data=(
+            automatic_qris.checkout_callback(variant_id,qty) if auto_ready
             else f'payauto:{variant_id}:{qty}'))],
         [InlineKeyboardButton(text='⬅️ Ringkasan Pesanan',callback_data=f'confirm:{variant_id}:{qty}')],
         [InlineKeyboardButton(text='❌ Batalkan',callback_data=f'checkoutcancel:{variant_id}')],
@@ -5954,7 +6125,9 @@ def verify_topup_atomic(topup_id: int, actor_id: int):
         row = conn.execute("SELECT * FROM topups WHERE id=?", (topup_id,)).fetchone()
         if not row:
             return None, "not_found"
-        if automatic_qris.managed(row) and not automatic_qris.payment_authorized(_otp_sys.modules[__name__],conn,'topup',topup_id):
+        if automatic_qris.managed(row) and not automatic_qris.payment_authorized(
+                _otp_sys.modules[__name__],conn,'topup',topup_id,
+                settled=row['payment_method']=='PAYINAJA_AUTO' and row['status']=='completed'):
             return None,'provider_unverified'
         if manual_confirmation_required(row) and not is_owner(actor_id):
             return None,"owner_required"
@@ -5963,6 +6136,11 @@ def verify_topup_atomic(topup_id: int, actor_id: int):
         ).fetchone()
         balance = int(wallet["balance"] or 0) if wallet else 0
         if row["status"] == "completed":
+            if row['payment_method']=='PAYINAJA_AUTO':
+                credits=conn.execute("SELECT amount FROM wallet_ledger WHERE user_id=? AND type='TOPUP' AND reference=?",
+                                     (row['user_id'],topup_invoice(topup_id))).fetchall()
+                if (not wallet or balance<0 or len(credits)!=1 or int(credits[0]['amount'])!=int(row['amount'])):
+                    return None,'storage_error'
             return (row, balance), "already_completed"
         if row["status"] not in {"pending", "expired"}:
             return None, f"invalid_status:{row['status']}"
@@ -5974,6 +6152,11 @@ def verify_topup_atomic(topup_id: int, actor_id: int):
             (row["user_id"], reference)
         ).fetchone()
         if existing_credit:
+            if row['payment_method']=='PAYINAJA_AUTO':
+                credits=conn.execute("SELECT amount FROM wallet_ledger WHERE user_id=? AND type='TOPUP' AND reference=?",
+                                     (row['user_id'],reference)).fetchall()
+                if (not wallet or balance<0 or len(credits)!=1 or int(credits[0]['amount'])!=int(row['amount'])):
+                    return None,'storage_error'
             # Preserve credits from legacy/recovered invoices without adding them again.
             conn.execute(
                 """UPDATE topups SET status='completed', updated_at=?
@@ -10265,6 +10448,21 @@ async def mark_order_paid(
     if not order:
         with db() as conn:
             expired=conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
+            if (expired and str(expired['payment_method'] or '')=='PAYINAJA_AUTO'
+                    and expired['payment_status']=='paid'
+                    and expired['status'] not in {'cancelled','rejected'}
+                    and (paid_amount is None or (type(paid_amount) is int
+                         and paid_amount==expired['payment_total']))
+                    and automatic_qris.payment_authorized(
+                        _otp_sys.modules[__name__],conn,'order',order_id,settled=True)):
+                # Payment may have committed before a crash or Telegram failure.
+                # Resume only fulfillment, retaining its existing allocation/lease.
+                # No payment event, stock reservation, or voucher is repeated here.
+                order=expired
+                first_payment=False
+        if order and order['fulfillment_status']=='delivered':
+            return True
+    if not order:
         if expired and manual_qris_required(expired) and expired['status']=='expired':
             await retire_saved_order_payment_messages(bot,order_id,expired['user_id'])
         return False
@@ -37030,7 +37228,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.66"
+EXPECTED_SOURCE_VERSION = "17.68"
 
 
 def source_integrity_self_test():
@@ -37073,6 +37271,7 @@ def runtime_dependency_self_test():
         checks.append(("re_parser",False))
 
     checks.append(("JAKARTA_TZ", str(JAKARTA_TZ)=="Asia/Jakarta"))
+    checks.append(("payinaja_qr_decoder", callable(getattr(payinaja_gateway.zxingcpp,"read_barcodes",None))))
     checks.append(("invoice_photo_renderer", callable(payment_receipts.render_invoice)))
     checks.append(("main_menu", callable(main_menu)))
     checks.append(("parse_rupiah_input", callable(parse_rupiah_input)))

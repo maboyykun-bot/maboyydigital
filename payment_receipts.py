@@ -599,6 +599,16 @@ class ReceiptService:
             gateway = (provider_router.for_receipt(self.host, source, entity) if provider_router is not None
                        else getattr(self.host, "KLIKQRIS_GATEWAY", None))
             linked = gateway.receipt_transaction(source, entity) if gateway is not None else None
+            if source in {'order', 'topup'}:
+                with self.host.db() as conn:
+                    native = conn.execute('SELECT payment_method FROM '
+                        + ('orders' if source == 'order' else 'topups') + ' WHERE id=?', (entity,)).fetchone()
+                if native and str(native['payment_method'] or '').strip().upper() == 'PAYINAJA_AUTO':
+                    # Losing a provider link must not turn a verified QRIS
+                    # receipt into the generic, native-status-only send path.
+                    if (gateway is None or gateway is not getattr(self.host, 'PAYINAJA_GATEWAY', None)
+                            or not linked or not gateway.receipt_payment_confirmed(linked)):
+                        raise ValueError('Payinaja receipt evidence unavailable')
             if not linked and not callable(getattr(bot,'send_photo',None)):
                 raise ValueError('Photo transport unavailable')
             if source in {'otp_order','otp_payment','sosmed','sosmed_payment'}:

@@ -15,6 +15,7 @@ import time
 import base64
 import warnings
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -24,6 +25,7 @@ from urllib.parse import urlsplit, parse_qs, urljoin, unquote
 
 import aiohttp
 import qrcode
+import zxingcpp
 from PIL import Image
 from Crypto.Cipher import AES
 from aiogram import F
@@ -40,7 +42,7 @@ PREFIX = 'payi:'
 LABEL = '⚡ QRIS Otomatis'
 FINAL = {'SETTLED', 'SETTLED_BALANCE', 'FAILED', 'CANCELLED'}
 TX_PREFIX = 'payinaja.tx.'
-ADAPTER_VERSION = '17.66'
+ADAPTER_VERSION = '17.68'
 QR_BLOCKING_ERRORS = frozenset({'SCHEMA', 'MISMATCH', 'AUTH', 'ACCOUNT_CHANGED', 'DUPLICATE_REFERENCE'})
 DENIAL_LIMIT = 16384
 UPSTREAM_LIMIT = 16384
@@ -693,6 +695,21 @@ class Client:
             raise GatewayError('IMAGE') from None
         return raw  # Original API-provided raster, never reconstructed/repriced.
 
+    @staticmethod
+    def image_qris(raw, total):
+        """Verify the actual raster's QR payload, retaining the original bytes."""
+        Client.image_valid(raw)
+        try:
+            with Image.open(BytesIO(raw)) as picture:
+                codes = zxingcpp.read_barcodes(picture.convert('RGB'), formats=zxingcpp.BarcodeFormat.QRCode)
+            if len(codes) != 1 or not codes[0].valid:
+                raise ValueError
+            payload = codes[0].text
+        except Exception:
+            raise GatewayError('QR_IMAGE_UNREADABLE') from None
+        qris_payload(payload, total)  # Same EMV, CRC, currency and amount guard as text QRIS.
+        return raw
+
     async def image(self, value, provider_id=None):
         """Fetch only the image URL returned by an authenticated, bound invoice."""
         endpoint = 'GET {qris_image}'
@@ -781,6 +798,8 @@ class Gateway:
         self.bot = None
         self.tasks = []
         self._poll_lock = asyncio.Lock()
+        self._media_jobs = {}
+        self._media_closing = False
         self.delivery_locks = {}
         self.started_at = time.time()
         self.requested_qr_ids = set()
@@ -967,6 +986,7 @@ class Gateway:
         return data
 
     async def ensure_profile(self, *, force=False):
+        fingerprint = self.fingerprint()
         current = self.proof()
         if current.get('approved') and not force:
             return current
@@ -982,6 +1002,8 @@ class Gateway:
         try:
             result = await self.api.profile()
         except GatewayError as exc:
+            if self.fingerprint() != fingerprint:
+                raise GatewayError('CONFIG') from None
             detail = self.diagnostic(exc, 'connection')
             with self.connection(True) as conn:
                 self.put(conn, 'profile', dict(approved=False, fingerprint=self.fingerprint(),
@@ -989,7 +1011,9 @@ class Gateway:
                     error_endpoint=detail['endpoint'], error_correlation_id=detail['correlation_id'],
                     error_denial=detail.get('denial', {})))
             raise
-        result.update(fingerprint=self.fingerprint(), checked_at=time.time(), http_status=200)
+        if self.fingerprint() != fingerprint:
+            raise GatewayError('CONFIG')
+        result.update(fingerprint=fingerprint, checked_at=time.time(), http_status=200)
         with self.connection(True) as conn:
             self.put(conn, 'profile', result)
             self.put(conn, 'diagnostic.connection', dict(stage='profile', code='OK', http_status=200,
@@ -1023,7 +1047,12 @@ class Gateway:
             current = self.setting('activation', {})
             if current.get('token') != token or self.fingerprint() != fingerprint:
                 raise GatewayError('ACTIVATION_CANCELLED')
-            await self.ensure_profile(force=True)  # GET only, never a probe invoice.
+            try:
+                await self.ensure_profile(force=True)  # GET only, never a probe invoice.
+            except GatewayError:
+                if self.fingerprint() != fingerprint:
+                    raise GatewayError('ACTIVATION_CANCELLED') from None
+                raise
             with self.connection(True) as conn:
                 current = self.setting('activation', {}, conn)
                 if current.get('token') != token or self.fingerprint() != fingerprint:
@@ -1303,6 +1332,7 @@ class Gateway:
             self.save(conn, current)
         try:
             raw = await self.api.image(data['qris_image_url'], row['provider_id'])
+            await self.validate_qr_image(raw, row['total_amount'])
             encrypted = self.crypt(base64.b64encode(raw).decode('ascii'), ident)
             with self.connection(True) as conn:
                 current = self.transaction(ident, conn=conn)
@@ -1335,6 +1365,21 @@ class Gateway:
                     current.update(image_lease_owner=None, image_lease_until=0)
                     self.save(conn, current)
         return self.transaction(ident)
+
+    async def validate_qr_image(self, raw, total):
+        """Bound CPU decoding separately from payment status polling."""
+        guard = getattr(self, '_qr_decode_guard', None)
+        if guard is None:
+            guard = self._qr_decode_guard = asyncio.Semaphore(3)
+        async with guard:
+            pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='payinaja-qr')
+            try:
+                job = pool.submit(self.api.image_qris, raw, total)
+                while not job.done():
+                    await asyncio.sleep(.01)
+                return job.result()
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
 
     async def issue(self, ident):
         row = self.transaction(ident)
@@ -1501,8 +1546,6 @@ class Gateway:
             profile = await self.ensure_profile()
             if profile['account_binding'] != row['account_binding'] or row['origin'] != self.config.base_url:
                 raise GatewayError('ACCOUNT_CHANGED')
-            if prepare_image and row['state'] == 'PENDING' and not self.has_qr(row) and row.get('qr_source_cipher'):
-                await self.prepare_qr(ident)
             ident_provider = row['provider_id']
             if not ident_provider:
                 history = await self.api.history(20, row.get('reconcile_offset', 0))
@@ -1583,7 +1626,10 @@ class Gateway:
                     current['error'] = ''
                 self.save(conn, current)
                 self.resolve_create_proof(conn, current, data['status'])
-            if prepare_image and not self.has_qr(self.transaction(ident)):
+            # Financial status takes precedence over a slow/unavailable QR image.
+            # A confirmed payment must never wait for media it no longer needs.
+            current = self.transaction(ident)
+            if prepare_image and current['state'] == 'PENDING' and not self.has_qr(current):
                 await self.prepare_qr(ident)
             if self.transaction(ident)['state'] == 'PAID_VERIFIED':
                 return await self.settle(ident) if settle_payment else self.transaction(ident)
@@ -1640,6 +1686,17 @@ class Gateway:
 
     async def settle(self, ident):
         token = secrets.token_hex(12)
+        correlation_id = secrets.token_hex(8)
+
+        def record(conn, current, code, exception_type=''):
+            detail = dict(stage='settlement', code=code, http_status=0,
+                          checked_at=time.time(), correlation_id=correlation_id,
+                          fingerprint=self.fingerprint(), transaction_id=ident)
+            if exception_type:
+                detail['exception_type'] = exception_type
+            current['settlement_diagnostic'] = detail
+            self.put(conn, 'diagnostic.settlement', detail)
+
         with self.connection(True) as conn:
             row = self.transaction(ident, conn=conn)
             if row['state'] != 'PAID_VERIFIED':
@@ -1650,65 +1707,114 @@ class Gateway:
                 return row
             if not self.payment_authorized(conn, row['purpose'], row['entity_id']):
                 row.update(state='REVIEW', error='PAYMENT_PROOF_INVALID')
+                record(conn, row, 'PAYMENT_PROOF_INVALID')
                 self.save(conn, row)
                 return row
             native = conn.execute('SELECT * FROM ' + ('orders' if row['purpose'] == 'order' else 'topups') + ' WHERE id=?',
                                   (row['entity_id'],)).fetchone()
             if native['status'] in {'cancelled', 'rejected'} or row['cancel_requested']:
                 row.update(state='REVIEW', error='PAYMENT_AFTER_CANCEL')
+                record(conn, row, 'PAYMENT_AFTER_CANCEL')
                 self.save(conn, row)
                 return row
             row.update(lease_owner=token, lease_until=time.time() + 180,
                        next_poll_at=time.time() + 180)
             self.save(conn, row)
+        settlement_code, exception_type = 'SETTLEMENT_RETRY', ''
         try:
             if row['purpose'] == 'topup':
                 result, reason = self.host.verify_topup_atomic(row['entity_id'], 0)
-                success = result is not None and reason in {'completed', 'already_completed'}
+                settlement_code = {
+                    'storage_error': 'TOPUP_STORAGE_ERROR',
+                    'race_lost': 'TOPUP_RACE_LOST',
+                    'provider_unverified': 'TOPUP_PROVIDER_UNVERIFIED',
+                }.get(reason, 'TOPUP_INVALID_STATUS' if isinstance(reason, str)
+                      and reason.startswith('invalid_status:') else 'SETTLEMENT_RETRY')
+                with self.connection() as conn:
+                    native = conn.execute('SELECT status FROM topups WHERE id=?', (row['entity_id'],)).fetchone()
+                    success = bool(result is not None and reason in {'completed', 'already_completed'}
+                                   and native and native['status'] == 'completed'
+                                   and self.payment_authorized(conn, 'topup', row['entity_id']))
             else:
                 if self.bot is None:
                     raise GatewayError('NOT_READY')
                 await self.host.mark_order_paid(row['entity_id'], self.bot, row['total_amount'])
                 with self.connection() as conn:
                     native = conn.execute('SELECT payment_status FROM orders WHERE id=?', (row['entity_id'],)).fetchone()
-                    success = bool(native and native['payment_status'] == 'paid')
+                    # Financial settlement and account delivery are separate.
+                    # mark_order_paid resumes an already-paid undelivered order;
+                    # its return value is not proof that either action finished.
+                    success = bool(native and native['payment_status'] == 'paid'
+                                   and self.payment_authorized(conn, 'order', row['entity_id']))
+                settlement_code = 'ORDER_LOCAL_PAYMENT_UNCOMMITTED'
+            if success:
+                settlement_code = 'LOCAL_PAYMENT_COMMITTED'
             with self.connection(True) as conn:
                 current = self.transaction(ident, conn=conn)
                 if current['lease_owner'] == token and success:
                     current.update(state='SETTLED', error='', lease_owner=None, lease_until=0)
+                    record(conn, current, settlement_code)
                     self.save(conn, current)
             if success:
                 self.host.payment_receipts.queue(self.host, row['purpose'], row['entity_id'])
                 await self.retire_paid_messages(self.bot, ident)
+        except asyncio.CancelledError:
+            settlement_code, exception_type = 'SETTLEMENT_CANCELLED', 'CancelledError'
+            raise
+        except Exception as exc:
+            if isinstance(exc, sqlite3.Error):
+                settlement_code, exception_type = ('TOPUP_STORAGE_ERROR' if row['purpose'] == 'topup'
+                                                   else 'ORDER_STORAGE_ERROR'), 'SQLiteError'
+            else:
+                settlement_code = 'TOPUP_SETTLEMENT_ERROR' if row['purpose'] == 'topup' else 'ORDER_SETTLEMENT_ERROR'
+                name = type(exc).__name__
+                exception_type = name if name in {
+                    'GatewayError', 'RuntimeError', 'ValueError', 'TypeError',
+                    'TimeoutError', 'OSError', 'ConnectionError', 'KeyError',
+                } else 'Exception'
+            raise
         finally:
             with self.connection(True) as conn:
                 current = self.transaction(ident, conn=conn)
                 if current['lease_owner'] == token:
                     current.update(lease_owner=None, lease_until=0, next_poll_at=time.time() + 30)
+                    record(conn, current, settlement_code, exception_type)
                     self.save(conn, current)
         return self.transaction(ident)
 
     async def fulfill_once(self, order_id, bot, implementation):
         row = self.linked('order', order_id)
         if not row:
+            with self.connection() as conn:
+                native = conn.execute('SELECT payment_method FROM orders WHERE id=?', (order_id,)).fetchone()
+            if native and native['payment_method'] == METHOD:
+                return False  # A local paid flag cannot replace missing provider evidence.
             return await implementation(order_id, bot)
         lock = self.delivery_locks.setdefault(order_id, asyncio.Lock())
         async with lock:
             token = secrets.token_hex(12)
-            with self.connection(True) as conn:
-                current = self.transaction(row['id'], conn=conn)
-                if current['delivery_until'] > time.time():
-                    return False
-                current.update(delivery_owner=token, delivery_until=time.time() + 300)
-                self.save(conn, current)
+            leased = False
             try:
-                return await implementation(order_id, bot)
-            finally:
                 with self.connection(True) as conn:
                     current = self.transaction(row['id'], conn=conn)
-                    if current['delivery_owner'] == token:
-                        current.update(delivery_owner=None, delivery_until=0)
-                        self.save(conn, current)
+                    native = conn.execute('SELECT payment_status,status FROM orders WHERE id=?', (order_id,)).fetchone()
+                    if (not native or native['payment_status'] != 'paid'
+                            or native['status'] in {'cancelled', 'rejected'}
+                            or not self.payment_authorized(conn, 'order', order_id, settled=True)):
+                        return False
+                    if current['delivery_until'] > time.time():
+                        return False
+                    current.update(delivery_owner=token, delivery_until=time.time() + 300)
+                    self.save(conn, current)
+                leased = True
+                return await implementation(order_id, bot)
+            finally:
+                if leased:
+                    with self.connection(True) as conn:
+                        current = self.transaction(row['id'], conn=conn)
+                        if current['delivery_owner'] == token:
+                            current.update(delivery_owner=None, delivery_until=0)
+                            self.save(conn, current)
                 if not getattr(lock, '_waiters', None):
                     self.delivery_locks.pop(order_id, None)
 
@@ -1727,7 +1833,150 @@ class Gateway:
             raise GatewayError('RATE_LIMIT')
         self.bot = call.bot
         await self.host.safe_callback_notice(call)
+        await self.render_checkout_start(call)
         await self.ensure_profile()  # Automatic auth after acknowledging the click, before invoice creation.
+
+    async def render_checkout_start(self, call):
+        source = self.editable_payment_message(call)
+        if source is None or self.setting('qr_view.' + str(call.from_user.id) + '.' + str(source), None) is not None:
+            return
+        try:
+            await asyncio.wait_for(call.bot.edit_message_text(chat_id=call.from_user.id, message_id=source,
+                text='⏳ <b>Menyiapkan QRIS Otomatis</b>\nMohon tunggu sebentar.', parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]])), timeout=2)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass  # Only edit the known card; an uncertain edit never triggers a send.
+
+    @staticmethod
+    def editable_payment_message(call):
+        """Only a known bot message in the buyer's private chat can anchor a QR."""
+        message = getattr(call, 'message', None)
+        chat = getattr(message, 'chat', None)
+        actor = getattr(message, 'from_user', None)
+        message_id = getattr(message, 'message_id', None)
+        return (message_id if type(message_id) is int and message_id > 0
+                and str(getattr(chat, 'type', '')) == 'private'
+                and getattr(chat, 'id', None) == call.from_user.id
+                and getattr(actor, 'is_bot', False) is True else None)
+
+    def bind_payment_view(self, ident, user, message_id):
+        if type(message_id) is not int or message_id <= 0:
+            return False
+        with self.connection(True) as conn:
+            row = self.transaction(ident, user, conn=conn)
+            key = 'qr_view.' + str(user) + '.' + str(message_id)
+            owner = self.setting(key, None, conn)
+            if owner not in (None, ident):
+                return False
+            if row.get('qr_view_message_id') not in (None, message_id):
+                return False
+            self.put(conn, key, ident)
+            row['qr_view_message_id'] = message_id
+            self.save(conn, row)
+        return True
+
+    def payment_view_message(self, row, conn=None):
+        message_id = row.get('qr_view_message_id')
+        if (type(message_id) is int and message_id > 0
+                and self.setting('qr_view.' + str(row['user_id']) + '.' + str(message_id), None, conn) == row['id']):
+            return message_id
+        return None
+
+    @staticmethod
+    def uneditable_payment_message(exc):
+        text = str(exc).lower()
+        return isinstance(exc, TelegramBadRequest) and any(note in text for note in (
+            'message to edit not found', "message can't be edited", 'message can not be edited'))
+
+    async def render_payment_progress(self, call, ident):
+        """Remember the exact progress card before create or its recovery can run."""
+        source = self.editable_payment_message(call)
+        if source is None:
+            row = self.transaction(ident, call.from_user.id)
+            return await self.host.safe_edit_or_answer(call, self.status_text(row),
+                reply_markup=self.user_keyboard(row), parse_mode='HTML')
+        row = self.transaction(ident, call.from_user.id)
+        anchor = self.payment_view_message(row)
+        if anchor is None and self.bind_payment_view(ident, row['user_id'], source):
+            anchor = source
+        async with self.host.automatic_qris.payment_view_guard(self, ident):
+            row = self.transaction(ident, call.from_user.id)
+            if row['state'] not in {'NEW', 'REQUESTING', 'CREATE_UNKNOWN'} or row['qr_messages']:
+                return
+            # An ID already owned by another invoice must never be repurposed.
+            # send_message is attempted only once; an uncertain result is not replayed.
+            if anchor is None:
+                with self.connection(True) as conn:
+                    current = self.transaction(ident, conn=conn)
+                    if current.get('qr_view_progress_started'):
+                        return
+                    current['qr_view_progress_started'] = True
+                    self.save(conn, current)
+                try:
+                    message = await asyncio.wait_for(call.bot.send_message(row['user_id'], self.status_text(row),
+                        reply_markup=self.user_keyboard(row), parse_mode='HTML'), timeout=self.config.timeout + 15)
+                    self.bind_payment_view(ident, row['user_id'], message.message_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    with self.connection(True) as conn:
+                        current = self.transaction(ident, conn=conn)
+                        current['qr_view_progress_unknown'] = True
+                        self.save(conn, current)
+                return
+            try:
+                await asyncio.wait_for(call.bot.edit_message_text(chat_id=row['user_id'], message_id=anchor,
+                    text=self.status_text(row), reply_markup=self.user_keyboard(row), parse_mode='HTML'),
+                    timeout=self.config.timeout + 15)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Keep the known ID: a timeout may already have changed it.
+                # The QR worker retries media replacement against this same ID.
+                pass
+
+    async def render_payment_status(self, call, ident, *, note=''):
+        """Update the invoice's own card without guessing a new message on failure."""
+        row = self.transaction(ident, call.from_user.id)
+        anchor = self.payment_view_message(row)
+        if anchor is None:
+            if row.get('qr_view_fallback_started') or row.get('qr_view_progress_unknown'):
+                return  # An uncertain send must not be replaced with another card.
+            source = self.editable_payment_message(call)
+            if source and self.setting('qr_view.' + str(row['user_id']) + '.' + str(source), None) not in (None, ident):
+                return
+            return await self.host.safe_edit_or_answer(call, self.status_text(row) + note,
+                reply_markup=self.user_keyboard(row), parse_mode='HTML')
+        async with self.host.automatic_qris.payment_view_guard(self, ident):
+            row = self.transaction(ident, call.from_user.id)
+            if (row['state'] in {'PAID_VERIFIED', 'SETTLED'} or self.payment_view_message(row) != anchor
+                    or self.protected_receipt_message(row['user_id'], anchor)):
+                return
+            options = dict(chat_id=row['user_id'], message_id=anchor,
+                           reply_markup=self.user_keyboard(row), parse_mode='HTML')
+            is_photo = any(item['id'] == anchor and item['kind'] == 'QR' for item in row['qr_messages'])
+            try:
+                if is_photo:
+                    await asyncio.wait_for(call.bot.edit_message_caption(caption=self.status_text(row) + note, **options),
+                                           timeout=self.config.timeout + 15)
+                else:
+                    try:
+                        await asyncio.wait_for(call.bot.edit_message_text(text=self.status_text(row) + note, **options),
+                                               timeout=self.config.timeout + 15)
+                    except TelegramBadRequest as exc:
+                        if not any(message in str(exc).lower() for message in (
+                                'there is no text in the message', 'message has no text')):
+                            raise
+                        # A previous media edit may have applied despite its lost response.
+                        await asyncio.wait_for(call.bot.edit_message_caption(caption=self.status_text(row) + note, **options),
+                                               timeout=self.config.timeout + 15)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass  # No answer()/send_message fallback for a known invoice card.
 
     async def checkout(self, call, bot, state, variant_id, qty, *, request_id=None):
         await self.buyer_guard(call)
@@ -1790,8 +2039,7 @@ class Gateway:
                     self.host.automatic_qris.save_checkout_request(self.host, 'payinaja', conn, call.from_user.id,
                         variant_id, qty, request_id, row['id'])
             if row['state'] == 'NEW':
-                await self.host.safe_edit_or_answer(call, self.status_text(row),
-                    reply_markup=self.user_keyboard(row), parse_mode='HTML')
+                await self.render_payment_progress(call, row['id'])
                 await self.issue(row['id'])
             elif row['cancel_requested']:
                 await state.clear()
@@ -1824,6 +2072,7 @@ class Gateway:
                         (call.from_user.id, call.from_user.username or '', amount, amount, METHOD, stamp, stamp)).lastrowid
                     row = self.reserve(conn, 'topup', entity, call.from_user.id, amount)
             if row['state'] == 'NEW':
+                await self.render_payment_progress(call, row['id'])
                 await self.issue(row['id'])
             elif row['cancel_requested']:
                 if state is not None:
@@ -1937,9 +2186,79 @@ class Gateway:
                 row.update(retention_done=False, cleanup_at=0)
             self.save(conn, row)
 
+    async def replace_payment_view(self, call, row, raw):
+        """Replace a known card; never turn an uncertain edit into a second send."""
+        rendered_source = (row.get('qris_cipher'), row.get('qr_image_cipher'))
+        anchor = self.payment_view_message(row)
+        if anchor:
+            try:
+                await asyncio.wait_for(call.bot.edit_message_media(chat_id=row['user_id'], message_id=anchor,
+                    media=InputMediaPhoto(media=BufferedInputFile(raw, filename='qris.png'),
+                                         caption=self.status_text(row), parse_mode='HTML'),
+                    reply_markup=self.user_keyboard(row)), timeout=self.config.timeout + 15)
+                return SimpleNamespace(message_id=anchor)
+            except TelegramBadRequest as exc:
+                if 'message is not modified' in str(exc).lower():
+                    return SimpleNamespace(message_id=anchor)
+                if not self.uneditable_payment_message(exc):
+                    raise
+                with self.connection(True) as conn:
+                    current = self.transaction(row['id'], conn=conn)
+                    if self.payment_view_message(current, conn) == anchor:
+                        current.pop('qr_view_message_id', None)
+                        current['qr_view_fallback_from'] = anchor
+                        self.save(conn, current)
+                row = self.transaction(row['id'])
+                with self.connection() as conn:
+                    native = conn.execute('SELECT * FROM ' + ('orders' if row['purpose'] == 'order' else 'topups')
+                        + ' WHERE id=?', (row['entity_id'],)).fetchone()
+                if (row['state'] != 'PENDING' or row['cancel_requested'] or row.get('retention_done')
+                        or row['error'] in QR_BLOCKING_ERRORS or row['expires_at'] <= time.time()
+                        or row['origin'] != self.config.base_url or not self.proof().get('approved')
+                        or self.proof().get('account_binding') != row['account_binding']
+                        or (row.get('qris_cipher'), row.get('qr_image_cipher')) != rendered_source
+                        or not native or native['user_id'] != row['user_id'] or native['payment_method'] != METHOD
+                        or native['status'] in {'cancelled', 'expired', 'completed', 'rejected'}
+                        or (native['payment_status'] == 'paid' if row['purpose'] == 'order' else native['status'] == 'paid')):
+                    return None
+        fallback = row.get('qr_view_fallback_from')
+        if not anchor and not fallback and row.get('qr_view_progress_unknown'):
+            return None
+        if fallback:
+            with self.connection(True) as conn:
+                current = self.transaction(row['id'], conn=conn)
+                if current.get('qr_view_fallback_started'):
+                    return None  # A lost send response cannot safely be replayed.
+                current['qr_view_fallback_started'] = True
+                self.save(conn, current)
+        try:
+            message = await asyncio.wait_for(call.bot.send_photo(row['user_id'], BufferedInputFile(raw, filename='qris.png'),
+                caption=self.status_text(row), reply_markup=self.user_keyboard(row), parse_mode='HTML'),
+                timeout=self.config.timeout + 15)
+        except (TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter):
+            if fallback:
+                with self.connection(True) as conn:
+                    current = self.transaction(row['id'], conn=conn)
+                    current.pop('qr_view_fallback_started', None)
+                    self.save(conn, current)
+            raise
+        if fallback:
+            self.bind_payment_view(row['id'], row['user_id'], message.message_id)
+        return message
+
     async def show_payment(self, call, ident, *, automatic=False):
         row = self.transaction(ident, call.from_user.id)
         self.bot = call.bot
+        if not self.payment_view_message(row):
+            # v17.66 rows already know the QR they sent. Adopt it instead of
+            # turning a later menu callback into a second invoice card.
+            known = next((item['id'] for item in reversed(row['qr_messages'])
+                          if item['kind'] == 'QR' and type(item['id']) is int and item['id'] > 0), None)
+            if known:
+                self.bind_payment_view(ident, row['user_id'], known)
+            elif not automatic and not row.get('qr_view_fallback_started'):
+                self.bind_payment_view(ident, row['user_id'], self.editable_payment_message(call))
+            row = self.transaction(ident, call.from_user.id)
         if not automatic and row['purpose'] == 'order':
             self.requested_qr_ids.add(ident)
         if automatic and (not self.can_auto_deliver(row) or row['qr_messages'] or row.get('qr_send_retry_at', 0) > time.time()):
@@ -1974,12 +2293,13 @@ class Gateway:
         if paid or native['status'] in {'cancelled', 'expired', 'completed', 'rejected'}:
             if automatic:
                 return
-            return await self.host.safe_edit_or_answer(call,
-                self.status_text(row) + '\nPesanan sudah ditutup atau diproses di bot. QR tidak ditampilkan; status provider perlu diperiksa owner.',
-                reply_markup=self.user_keyboard(row), parse_mode='HTML')
+            return await self.render_payment_status(call, ident,
+                note='\nPesanan sudah ditutup atau diproses di bot. QR tidak ditampilkan; status provider perlu diperiksa owner.')
         try:
             raw = (render_qris(self.crypt(row['qris_cipher'], ident, decrypt=True), row['total_amount']) if row.get('qris_cipher') else
                    self.api.image_valid(base64.b64decode(self.crypt(row['qr_image_cipher'], ident, decrypt=True), validate=True)))
+            if not row.get('qris_cipher'):
+                await self.validate_qr_image(raw, row['total_amount'])
         except (GatewayError, ValueError, TypeError) as exc:
             detail = self.diagnostic(exc if isinstance(exc, GatewayError) else GatewayError('IMAGE'), 'image')
             with self.connection(True) as conn:
@@ -1988,19 +2308,21 @@ class Gateway:
                 # An unreadable cached image must not permanently block recovery
                 # from the retained, authenticated source of this SAME invoice.
                 # Keep ciphertext on key/decryption or amount failures.
-                if (detail['code'] == 'IMAGE' and current['state'] == 'PENDING'
+                invalid_raster = (not current.get('qris_cipher') and current.get('qr_image_cipher')
+                                  and detail['code'] in {'IMAGE', 'QR_IMAGE_UNREADABLE', 'MISMATCH'})
+                if ((invalid_raster or (detail['code'] == 'IMAGE' and current.get('qr_source_cipher')))
+                        and current['state'] == 'PENDING'
                         and not current['cancel_requested'] and current['error'] not in QR_BLOCKING_ERRORS
-                        and current.get('qr_source_cipher')
                         and current.get('qris_cipher') == row.get('qris_cipher')
                         and current.get('qr_image_cipher') == row.get('qr_image_cipher')):
                     current.update(qris_cipher=None, qr_image_cipher=None, error='IMAGE', image_retry_at=0)
                 self.save(conn, current)
             if automatic:
                 return
-            return await self.host.safe_edit_or_answer(call, self.status_text(row) + '\nGambar QR belum dapat dibuka; tidak ada invoice baru dibuat.',
-                       reply_markup=self.user_keyboard(row), parse_mode='HTML')
+            return await self.render_payment_status(call, ident, note='\nGambar QR belum dapat dibuka; tidak ada invoice baru dibuat.')
         # Manual clicks and the recovery worker share one durable send lease.
         # This lease concerns Telegram only; it never authorizes a payment/create.
+        rendered_source = (row.get('qris_cipher'), row.get('qr_image_cipher'))
         token = secrets.token_hex(12)
         with self.connection(True) as conn:
             current = self.transaction(ident, row['user_id'], conn=conn)
@@ -2023,37 +2345,59 @@ class Gateway:
             current.update(qr_send_owner=token, qr_send_until=time.time() + self.config.timeout + 45)
             self.save(conn, current)
         try:
-            try:
-                message = await asyncio.wait_for(call.bot.send_photo(call.from_user.id, BufferedInputFile(raw, filename='qris.png'),
-                    caption=self.status_text(row), reply_markup=self.user_keyboard(row), parse_mode='HTML'), timeout=self.config.timeout + 15)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                delay = max(30, min(3600, float(getattr(exc, 'retry_after', 0) or 0)))
-                status = 429 if isinstance(exc, TelegramRetryAfter) else 403 if isinstance(exc, TelegramForbiddenError) else 400 if isinstance(exc, TelegramBadRequest) else 0
-                detail = self.diagnostic(GatewayError('TELEGRAM', http_status=status), 'telegram')
+            async with self.host.automatic_qris.payment_view_guard(self, ident):
+                row = self.transaction(ident, call.from_user.id)
+                with self.connection() as conn:
+                    native = conn.execute('SELECT * FROM ' + ('orders' if row['purpose'] == 'order' else 'topups')
+                        + ' WHERE id=?', (row['entity_id'],)).fetchone()
+                if (row['state'] != 'PENDING' or row['cancel_requested'] or row.get('retention_done')
+                        or row['error'] in QR_BLOCKING_ERRORS or row['expires_at'] <= time.time()
+                        or row['origin'] != self.config.base_url or not self.proof().get('approved')
+                        or self.proof().get('account_binding') != row['account_binding']
+                        or (row.get('qris_cipher'), row.get('qr_image_cipher')) != rendered_source
+                        or row.get('qr_send_owner') != token
+                        or not native or native['user_id'] != row['user_id'] or native['payment_method'] != METHOD
+                        or native['status'] in {'cancelled', 'expired', 'completed', 'rejected'}
+                        or (native['payment_status'] == 'paid' if row['purpose'] == 'order' else native['status'] == 'paid')):
+                    return
+                try:
+                    message = await self.replace_payment_view(call, row, raw)
+                    if message is None:
+                        return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    delay = max(30, min(3600, float(getattr(exc, 'retry_after', 0) or 0)))
+                    status = 429 if isinstance(exc, TelegramRetryAfter) else 403 if isinstance(exc, TelegramForbiddenError) else 400 if isinstance(exc, TelegramBadRequest) else 0
+                    detail = self.diagnostic(GatewayError('TELEGRAM', http_status=status), 'telegram')
+                    with self.connection(True) as conn:
+                        current = self.transaction(ident, conn=conn)
+                        current['qr_send_retry_at'] = time.time() + delay
+                        current['qr_diagnostic'] = detail
+                        self.save(conn, current)
+                    if automatic or self.payment_view_message(current) or current.get('qr_view_fallback_from'):
+                        return
+                    note = ('\nGambar belum terkirim; bot akan mencoba pengiriman kembali secara otomatis.' if row['purpose'] == 'order' else
+                            '\nGambar belum terkirim; pengiriman akan dicoba kembali. Cek Status tidak membuat invoice baru.')
+                    return await self.host.safe_edit_or_answer(call, self.status_text(row) + note,
+                               reply_markup=self.user_keyboard(row), parse_mode='HTML')
+                self.remember_payment_message(ident, row['user_id'], message.message_id)
+                if row['purpose'] == 'topup':
+                    self.host.save_topup_payment_message(row['entity_id'], row['user_id'], message.message_id)
                 with self.connection(True) as conn:
                     current = self.transaction(ident, conn=conn)
-                    current['qr_send_retry_at'] = time.time() + delay
+                    current['qr_send_retry_at'] = 0
+                    if (current.get('qr_view_fallback_started')
+                            and self.payment_view_message(current, conn) == message.message_id):
+                        # Both the replacement ID and its QR registration are
+                        # confirmed. A later definitive deletion may recover it;
+                        # uncertain send results never reach this block.
+                        current.pop('qr_view_fallback_started', None)
+                    detail = dict(stage='telegram', code='OK', http_status=200,
+                        checked_at=time.time(), correlation_id=secrets.token_hex(8), fingerprint=self.fingerprint())
                     current['qr_diagnostic'] = detail
                     self.save(conn, current)
-                if automatic:
-                    return
-                note = ('\nGambar belum terkirim; bot akan mencoba pengiriman kembali secara otomatis.' if row['purpose'] == 'order' else
-                        '\nGambar belum terkirim; pengiriman akan dicoba kembali. Cek Status tidak membuat invoice baru.')
-                return await self.host.safe_edit_or_answer(call, self.status_text(row) + note,
-                           reply_markup=self.user_keyboard(row), parse_mode='HTML')
-            self.remember_payment_message(ident, row['user_id'], message.message_id)
-            if row['purpose'] == 'topup':
-                self.host.save_topup_payment_message(row['entity_id'], row['user_id'], message.message_id)
-            with self.connection(True) as conn:
-                current = self.transaction(ident, conn=conn)
-                current['qr_send_retry_at'] = 0
-                detail = dict(stage='telegram', code='OK', http_status=200,
-                    checked_at=time.time(), correlation_id=secrets.token_hex(8), fingerprint=self.fingerprint())
-                current['qr_diagnostic'] = detail
-                self.save(conn, current)
-                self.put(conn, 'diagnostic.telegram', detail)
+                    self.put(conn, 'diagnostic.telegram', detail)
         finally:
             with self.connection(True) as conn:
                 current = self.transaction(ident, conn=conn)
@@ -2061,7 +2405,15 @@ class Gateway:
                     current.update(qr_send_owner=None, qr_send_until=0)
                     self.save(conn, current)
         await self.retire_paid_messages(call.bot, ident)
-        if automatic:
+        previous = self.transaction(ident).get('qr_view_fallback_from')
+        if previous and previous != message.message_id:
+            try:
+                await asyncio.wait_for(call.bot.delete_message(chat_id=row['user_id'], message_id=previous), timeout=10)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        if automatic or self.payment_view_message(self.transaction(ident)):
             return
         try:
             await call.message.delete()
@@ -2104,7 +2456,7 @@ class Gateway:
             return
         if refresh and row['state'] == 'PENDING' and self.has_qr(row) and row['expires_at'] > time.time():
             return await self.show_payment(call, ident)
-        await self.host.safe_edit_or_answer(call, self.status_text(row), reply_markup=self.user_keyboard(row), parse_mode='HTML')
+        await self.render_payment_status(call, ident)
 
     async def cancel(self, call, ident, *, admin=False, nonce=None):
         if not call.message or str(call.message.chat.type) != 'private' or call.message.chat.id != call.from_user.id:
@@ -2167,7 +2519,18 @@ class Gateway:
                 return False
             native = conn.execute('SELECT * FROM ' + ('orders' if row['purpose'] == 'order' else 'topups') + ' WHERE id=?',
                                   (row['entity_id'],)).fetchone()
-            return native['payment_status'] == 'paid' if row['purpose'] == 'order' else native['status'] == 'completed'
+            if row['purpose'] == 'order':
+                return native['payment_status'] == 'paid'
+            if native['status'] != 'completed':
+                return False
+            wallet = conn.execute('SELECT balance FROM wallets WHERE user_id=?', (row['user_id'],)).fetchone()
+            credits = conn.execute("SELECT amount FROM wallet_ledger WHERE user_id=? AND type='TOPUP' AND reference=?",
+                (row['user_id'], self.host.topup_invoice(row['entity_id']))).fetchall()
+            # A completed flag is not evidence that wallet credit committed.
+            # Current balance may be lower after a legitimate later purchase.
+            return bool(wallet and type(wallet['balance']) is int and wallet['balance'] >= 0
+                        and len(credits) == 1 and type(credits[0]['amount']) is int
+                        and credits[0]['amount'] == row['amount'])
 
     def protected_receipt_message(self, user, message_id):
         with self.connection() as conn:
@@ -2434,6 +2797,43 @@ class Gateway:
             self.save(conn, row)
         return self.transaction(ident)
 
+    def start_pending_media(self, ident):
+        """Supervise at most three QR views without holding financial polling."""
+        if self._media_closing:
+            return None
+        existing = self._media_jobs.get(ident)
+        if existing is not None and not existing.done():
+            return existing
+        row = self.transaction(ident)
+        if (len(self._media_jobs) >= 3 or row['state'] != 'PENDING' or row.get('qr_messages')
+                or row.get('cancel_requested') or row.get('qr_send_retry_at', 0) > time.time()):
+            return None
+
+        async def run():
+            try:
+                await self.prepare_qr(ident)
+                await self.deliver_pending_qr(ident)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.diagnostic(exc, 'image')
+            finally:
+                if self._media_jobs.get(ident) is asyncio.current_task():
+                    self._media_jobs.pop(ident, None)
+
+        task = asyncio.create_task(run(), name='payinaja_pending_media')
+        self._media_jobs[ident] = task
+        return task
+
+    async def close_pending_media(self):
+        self._media_closing = True
+        jobs = list(self._media_jobs.values())
+        for task in jobs:
+            task.cancel()
+        if jobs:
+            await asyncio.gather(*jobs, return_exceptions=True)
+        self._media_jobs.clear()
+
     async def poll_once(self):
         if self._poll_lock.locked():
             return
@@ -2450,14 +2850,15 @@ class Gateway:
                                 current['next_poll_at'] = time.time() + 30
                                 self.save(conn, current)
                     else:
-                        await self.refresh(ident, settle_payment=False)
+                        await self.refresh(ident, prepare_image=False, settle_payment=False)
                     current = self.transaction(ident)
                     if current['state'] == 'PAID_VERIFIED':
                         self.host.automatic_qris.start_settlement(self, ident)
                     if (current['purpose'] == 'order' and current['state'] in {'FAILED', 'CANCELLED'}
                             and self.can_auto_deliver(current) and not current.get('terminal_notice_sent')):
                         self.terminal_notices.setdefault(ident, dict(queued_at=time.time(), retry_at=0))
-                    await self.deliver_pending_qr(ident)
+                    if current['state'] == 'PENDING':
+                        self.start_pending_media(ident)
                 except GatewayError as exc:
                     if exc.code == 'RATE_LIMIT':
                         return False
@@ -2522,6 +2923,7 @@ class Gateway:
         if self.tasks:
             return []
         self._settlements_closing = False
+        self._media_closing = False
         async def payments():
             while True:
                 try:
@@ -2545,11 +2947,14 @@ class Gateway:
         return list(self.tasks)
 
     async def close(self):
+        self._media_closing = True
+        self._settlements_closing = True
         for task in self.tasks:
             task.cancel()
         if self.tasks:
             await asyncio.gather(*self.tasks, return_exceptions=True)
         self.tasks = []
+        await self.close_pending_media()
         await self.host.automatic_qris.close_settlements(self)
         await self.api.close()
 
@@ -2562,6 +2967,17 @@ class Gateway:
     async def owner_panel(self, call, *, note=''):
         self.require_owner(call.from_user.id)
         proof = self.proof()
+        try:
+            base = urlsplit(self.config.base_url)
+            base_display = (self.config.base_url if base.scheme == 'https' and base.hostname in API_HOSTS
+                and base.port in {None, 443} and not base.username and not base.password
+                and base.path == '/api/v1' and not base.query and not base.fragment else 'URL tidak valid (disembunyikan)')
+        except (ValueError, TypeError, AttributeError):
+            base_display = 'URL tidak valid (disembunyikan)'
+        polling = any(not task.done() and task.get_name() == 'payinaja_payments' for task in self.tasks)
+        settlement_jobs = sum(not task.done() for task in getattr(self, '_settlement_jobs', {}).values())
+        with self.connection() as conn:
+            active_count = conn.execute("SELECT COUNT(*) FROM settings WHERE key GLOB 'payinaja.active.*'").fetchone()[0]
         try:
             server = self.selected_server()
             _, health = self.creation_health()
@@ -2581,17 +2997,30 @@ class Gateway:
                     'Belum tersedia; periksa diagnosis image dan detail invoice')
         text = ('👑 <b>PENGATURAN QRIS OTOMATIS</b>\n\nProvider: Payinaja\n'
                 f'Versi bot: {html.escape(self.host.BOT_VERSION)} • Gateway: {ADAPTER_VERSION}\n'
-                f'Server create: {server or "Periksa pengaturan"} • Sumber: {"bot" if self.setting("server", None) is not None else "hosting/default"}\n'
+                f'API Key: {"Tersedia" if self.config.key else "Belum diisi"}\n'
+                'Base URL: ' + html.escape(base_display) + '\n'
+                f'Server create: {server or "Periksa pengaturan"} • Sumber: {"database owner (mengalahkan ENV)" if self.setting("server", None) is not None else "ENV/default"}\n'
+                'Endpoint create: ' + ({1: 'POST /qris/create', 2: 'POST /qris/create2'}.get(server, 'Periksa pilihan server')) + '\n'
                 f'Batas waktu create: {self.config.create_timeout} detik\n'
                 f'Izin membuat invoice: {"AKTIF" if self.enabled() else "NONAKTIF"}\n'
                 f'Konfigurasi: {"Tersedia" if self.config.valid() and server is not None else "Periksa PAYINAJA_API_KEY / konfigurasi API"}\n'
                 f'Autentikasi: {"Terverifikasi; merchant approved" if proof.get("approved") else "Belum terverifikasi"}\n'
+                'Pemeriksaan profil terakhir: ' + (self.host.payment_receipts.format_wib(proof['checked_at'], compact=True)
+                    if proof.get('checked_at') else 'Belum ada pada konfigurasi aktif') + '\n'
+                f'Polling: {"Berjalan" if polling else "Belum berjalan"} • Antrean pembayaran: {active_count}\n'
+                f'Settlement: {settlement_jobs} task aktif; status pengiriman produk dicatat terpisah\n'
                 'Status pembuatan invoice: ' + html.escape(health) + '\n'
                 'Sumber QR invoice terakhir: ' + qr_state + '\n'
                 'Profil dan invoice diperiksa otomatis saat checkout. '
                 'Pembayaran diverifikasi lewat API status; callback H2H tidak dipakai.\n'
                 'Profil approved tidak membuktikan pembuatan QR berhasil.\n'
                 'Kredensial tidak ditampilkan. Key KlikQRIS tidak dipakai untuk Payinaja.\n')
+        if last:
+            text += ('\nCreate terakhir: ' + html.escape(str(last.get('code') or 'UNKNOWN'))
+                     + ' • HTTP: ' + str(last.get('http_status') or '-')
+                     + '\nWaktu create: ' + (self.host.payment_receipts.format_wib(last['checked_at'], compact=True)
+                         if last.get('checked_at') else '-')
+                     + ' • ID: ' + html.escape(str(last.get('correlation_id') or '-')) + '\n')
         if proof.get('error') and not proof.get('approved'):
             text += ('\nPembayaran belum siap: ' + access_note(proof.get('error_denial'), proof.get('http_status')) +
                      '\nAktivasi hanya berhasil setelah akses API diterima; tidak ada invoice uji dibuat.\n')
@@ -2605,7 +3034,7 @@ class Gateway:
         if note:
             text += '\n' + html.escape(note[:500]) + '\n'
         hidden = 0
-        for kind in ['activation', 'connection', 'create', 'checkout', 'status', 'image', 'telegram', 'cancel', 'poll', 'cleanup']:
+        for kind in ['create', 'activation', 'connection', 'checkout', 'status', 'image', 'telegram', 'cancel', 'poll', 'settlement', 'cleanup']:
             detail = last if kind == 'create' else self.setting('diagnostic.' + kind, {})
             if kind == 'create' and not detail:
                 legacy = self.setting('diagnostic.create', {})
@@ -2654,6 +3083,8 @@ class Gateway:
         if checking:
             controls += [[('⏳ Memeriksa akses…', 'menu', None)], [('🔴 Batalkan Aktivasi', 'toggle', 'off')]]
         else:
+            if self.enabled() and not proof.get('approved'):
+                controls.append([('🔄 Verifikasi Ulang PayinAja', 'toggle', 'on')])
             label = ('🔴 Nonaktifkan' if self.enabled() else '🔄 Coba Aktifkan Kembali' if activation.get('state') == 'denied' else '🟢 Aktifkan Payinaja')
             controls.append([(label, 'toggle', 'off' if self.enabled() else 'on')])
         if proof.get('error_denial', {}).get('kind') == 'ip_restricted':
@@ -2735,8 +3166,31 @@ class Gateway:
     async def owner_detail(self, call, ident, *, confirm=False):
         row = self.transaction(ident, call.from_user.id, admin=True)
         text = self.status_text(row) + '\nProvider: Payinaja\nRef: ' + html.escape(row['reference'])
+        with self.connection() as conn:
+            native = conn.execute('SELECT * FROM ' + ('orders' if row['purpose'] == 'order' else 'topups')
+                + ' WHERE id=? AND user_id=?', (row['entity_id'], row['user_id'])).fetchone()
+        attempt = None
+        if row['purpose'] == 'order' and native:
+            text += ('\nPembayaran lokal: ' + html.escape(str(native['payment_status']))
+                     + '\nPengiriman akun: ' + html.escape(str(native['fulfillment_status']))
+                     + '\nStatus pesanan: ' + html.escape(str(native['status']))
+                     + '\nSETTLED adalah pencatatan pembayaran, bukan bukti akun sudah terkirim.')
+            try:
+                attempt = self.host.payinaja_delivery_attempt(row['entity_id'])
+            except self.host.PayinajaDeliveryUncertain:
+                attempt = {'corrupt': True}
+            if attempt:
+                text += ('\n⚠️ Hasil pengiriman akun belum pasti. Pengiriman ulang ditahan agar tidak ganda.'
+                         '\nOwner perlu mencocokkan pesan yang diterima pelanggan sebelum melanjutkan.')
+        elif native:
+            text += '\nStatus kredit saldo lokal: ' + html.escape(str(native['status']))
         text += '\nServer invoice: ' + str(row['server'])
         text += '\nID provider: ' + html.escape(row['provider_id'] or '-') + '\nKode: ' + html.escape(row['error'] or '-')
+        settlement = row.get('settlement_diagnostic')
+        if isinstance(settlement, dict):
+            text += ('\nTahap settlement: ' + html.escape(str(settlement.get('code', '-')))
+                     + '\nWaktu settlement: ' + self.host.payment_receipts.format_wib(settlement['checked_at'], compact=True)
+                     + ' • ID: ' + html.escape(str(settlement.get('correlation_id', '-'))))
         text += '\nSumber QR: ' + ('tersedia' if self.has_qr(row) else 'belum tersedia')
         text += '\nPesan QR tercatat: ' + ('ada' if row['qr_messages'] else 'tidak ada')
         qr_detail = row.get('qr_diagnostic')
@@ -2799,6 +3253,10 @@ class Gateway:
                      self.host.payment_receipts.format_wib(confirmation['checked_at'], compact=True) +
                      ' • ID: ' + html.escape(confirmation['correlation_id']))
         controls = [[('🔄 Rekonsiliasi Status', 'check', ident)]]
+        if (row['purpose'] == 'order' and native and native['payment_status'] == 'paid'
+                and native['fulfillment_status'] != 'delivered' and self.paid_proof(row)):
+            controls.append([('🔎 Periksa Pengiriman Akun', 'delivery', ident)] if attempt else
+                            [('📦 Lanjutkan Pengiriman', 'deliver', ident)])
         if row['state'] == 'REVIEW' and self.paid_proof(row):
             text += '\nPembayaran sah perlu penanganan owner; tidak ada saldo atau produk diproses otomatis.'
             if confirm:
@@ -2808,6 +3266,98 @@ class Gateway:
                 controls.append([('💰 Pindahkan ke Saldo', 'credit_confirm', ident)])
         controls.append([('⬅️ Kembali', 'pending', '0'), ('🏠 QRIS Otomatis', 'menu', None)])
         await self.host.safe_edit_or_answer(call, text, parse_mode='HTML', reply_markup=self.owner_keyboard(controls))
+
+    async def owner_delivery_review(self, call, ident, *, received=None):
+        """Review one uncertain account chunk; never infer delivery from payment."""
+        if (not call.message or str(call.message.chat.type) != 'private'
+                or call.message.chat.id != call.from_user.id):
+            raise GatewayError('FORBIDDEN')
+        row = self.transaction(ident, call.from_user.id, admin=True)
+        if row['purpose'] != 'order' or not self.paid_proof(row):
+            raise GatewayError('NOT_READY')
+        with self.connection() as conn:
+            native = conn.execute('SELECT payment_status FROM orders WHERE id=? AND user_id=?',
+                (row['entity_id'], row['user_id'])).fetchone()
+            if (not native or native['payment_status'] != 'paid'
+                    or not self.payment_authorized(conn, 'order', row['entity_id'], settled=True)):
+                raise GatewayError('NOT_READY')
+        try:
+            attempt = self.host.payinaja_delivery_attempt(row['entity_id'])
+        except self.host.PayinajaDeliveryUncertain:
+            raise GatewayError('STORAGE') from None
+        if not attempt:
+            return await self.owner_detail(call, ident)
+        if received is not None and type(received) is not bool:
+            raise GatewayError('INPUT')
+        text = ('🔎 <b>PERIKSA PENGIRIMAN AKUN</b>\n\n🧾 ' + html.escape(self.host.invoice(row['entity_id']))
+                + '\nBagian akun: ' + str(attempt['chunk'] + 1)
+                + '\nPembayaran sudah tercatat; hasil pengiriman bagian ini belum pasti.'
+                '\nCocokkan pesan di chat pelanggan. Bot tidak dapat memastikan penerimaan dari timeout Telegram.'
+                '\nPilihan ini tidak mengubah pembayaran, saldo, harga, atau akun yang dialokasikan.')
+        if received is None:
+            controls = [[('✅ Bagian Ini Sudah Diterima', 'drecv', ident)],
+                        [('🔄 Bagian Ini Belum Terkirim', 'dnone', ident)]]
+        else:
+            nonce = secrets.token_hex(8)
+            with self.connection(True) as conn:
+                row = self.transaction(ident, call.from_user.id, admin=True, conn=conn)
+                current = self.host.payinaja_delivery_attempt(row['entity_id'], conn=conn)
+                if not current or current['attempt_id'] != attempt['attempt_id']:
+                    raise GatewayError('CONFIRM_EXPIRED')
+                row['delivery_review_prompt'] = dict(nonce=nonce, actor=call.from_user.id,
+                    attempt_id=current['attempt_id'], received=received, expires_at=time.time() + 300)
+                self.save(conn, row)
+            text += ('\n\nKonfirmasi: bagian ini sudah diterima. Bot akan mencatat bagian ini selesai dan melanjutkan sisa pengiriman.'
+                     if received else '\n\nKonfirmasi: bagian ini benar-benar belum terkirim. Bot akan mencoba bagian yang sama, memakai akun yang sudah dialokasikan.')
+            controls = [[('✅ Konfirmasi Hasil Pemeriksaan', 'dconfirm', ident + '.' + nonce)]]
+        controls.append([('⬅️ Detail Transaksi', 'detail', ident)])
+        await self.host.safe_edit_or_answer(call, text, parse_mode='HTML', reply_markup=self.owner_keyboard(controls))
+
+    async def confirm_delivery_review(self, call, ident, nonce):
+        if (not call.message or str(call.message.chat.type) != 'private'
+                or call.message.chat.id != call.from_user.id):
+            raise GatewayError('FORBIDDEN')
+        row = self.transaction(ident, call.from_user.id, admin=True)
+        if row['purpose'] != 'order' or not self.paid_proof(row):
+            raise GatewayError('NOT_READY')
+        prompt = row.get('delivery_review_prompt', {})
+        if (not isinstance(nonce, str) or not re.fullmatch('[0-9a-f]{16}', nonce)
+                or prompt.get('actor') != call.from_user.id or prompt.get('expires_at', 0) < time.time()
+                or type(prompt.get('received')) is not bool
+                or not hmac.compare_digest(str(prompt.get('nonce', '')), nonce)):
+            raise GatewayError('CONFIRM_EXPIRED')
+        ok, reason = self.host.resolve_payinaja_delivery_attempt(row['entity_id'], call.from_user.id,
+            prompt.get('attempt_id'), received=prompt['received'])
+        if not ok:
+            await self.host.safe_callback_notice(call,
+                'Hasil belum diubah. Pengiriman masih berjalan atau konfirmasi sudah tidak berlaku.', show_alert=True)
+            return await self.owner_detail(call, ident)
+        with self.connection(True) as conn:
+            current = self.transaction(ident, call.from_user.id, admin=True, conn=conn)
+            if current.get('delivery_review_prompt', {}).get('nonce') == nonce:
+                current.pop('delivery_review_prompt', None)
+                self.save(conn, current)
+        return await self.resume_order_delivery(call, ident)
+
+    async def resume_order_delivery(self, call, ident):
+        if (not call.message or str(call.message.chat.type) != 'private'
+                or call.message.chat.id != call.from_user.id):
+            raise GatewayError('FORBIDDEN')
+        row = self.transaction(ident, call.from_user.id, admin=True)
+        if row['purpose'] != 'order' or not self.paid_proof(row):
+            raise GatewayError('NOT_READY')
+        try:
+            if self.host.payinaja_delivery_attempt(row['entity_id']):
+                return await self.owner_delivery_review(call, ident)
+        except self.host.PayinajaDeliveryUncertain:
+            raise GatewayError('STORAGE') from None
+        try:
+            await self.host.fulfill_order(row['entity_id'], call.bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.warning('Payinaja delivery recovery deferred order=%s type=%s',row['entity_id'],type(exc).__name__)
+        return await self.owner_detail(call, ident)
 
 
 def register(router, gateway):
@@ -2886,6 +3436,17 @@ def register(router, gateway):
                 await gateway.owner_list(call, pending=True)
             elif action == 'detail':
                 await gateway.owner_detail(call, value)
+            elif action == 'delivery':
+                await gateway.owner_delivery_review(call, value)
+            elif action in {'drecv', 'dnone'}:
+                await gateway.owner_delivery_review(call, value, received=action == 'drecv')
+            elif action == 'dconfirm':
+                bits = (value or '').split('.')
+                if len(bits) != 2:
+                    raise GatewayError('INPUT')
+                await gateway.confirm_delivery_review(call, bits[0], bits[1])
+            elif action == 'deliver':
+                await gateway.resume_order_delivery(call, value)
             elif action == 'check':
                 await gateway.show_status(call, value, admin=True)
             elif action == 'credit_confirm':
