@@ -42,7 +42,7 @@ PREFIX = 'payi:'
 LABEL = '⚡ QRIS Otomatis'
 FINAL = {'SETTLED', 'SETTLED_BALANCE', 'FAILED', 'CANCELLED'}
 TX_PREFIX = 'payinaja.tx.'
-ADAPTER_VERSION = '17.69'
+ADAPTER_VERSION = '17.70'
 QR_BLOCKING_ERRORS = frozenset({'SCHEMA', 'MISMATCH', 'AUTH', 'ACCOUNT_CHANGED', 'DUPLICATE_REFERENCE'})
 DENIAL_LIMIT = 16384
 UPSTREAM_LIMIT = 16384
@@ -435,7 +435,7 @@ def response_shape(data):
     return result
 
 
-def lifecycle_status(data, *, bound=False):
+def lifecycle_status(data, *, bound=False, qris_bound=False):
     if not isinstance(data, dict):
         raise GatewayError('SCHEMA')
     raw = data.get('status')
@@ -452,7 +452,11 @@ def lifecycle_status(data, *, bound=False):
     method = data.get('payment_method')
     if (method is None or (isinstance(method, str) and not method.strip())) and bound and state != 'PAID':
         return state  # Existing authenticated QRIS create binds this invoice's method.
-    if not isinstance(method, str) or method.strip().casefold() != 'qris':
+    # Server 2 may report a settlement-channel label instead of literal "qris".
+    # Only an authenticated QRIS create plus validated original QR may establish
+    # this alternative binding. A history hit or a paid flag alone cannot.
+    if (not isinstance(method, str) or len(method) > 128
+            or (method.strip().casefold() != 'qris' and not qris_bound)):
         raise GatewayError('SCHEMA')
     return state
 
@@ -608,7 +612,7 @@ class Client:
             exc.uncertain = True
             raise self.validation_context(exc, 'POST ' + path, data)
 
-    async def status(self, ident, ref, amount, total=None, fee=None, *, recovered=False):
+    async def status(self, ident, ref, amount, total=None, fee=None, *, recovered=False, qris_bound=False):
         ident, ref = reference(ident), reference(ref)
         data = await self.request('GET', '/transaction/' + ident)
         try:
@@ -621,7 +625,8 @@ class Client:
                                 and data['status'].strip().casefold() == 'failed')
             # Recovery may recognize FAILED with another method, but never relaxes
             # pending/paid. An unknown quote still goes through amounts() below.
-            state = lifecycle_status(data, bound=recovered_failed or (total is not None and fee is not None))
+            state = lifecycle_status(data, bound=recovered_failed or (total is not None and fee is not None),
+                                     qris_bound=qris_bound is True and total is not None and fee is not None)
             if state == 'FAILED' and total is not None and fee is not None:
                 # Preserve the known create quote; a failed invoice has no
                 # settlement amount to authorize or overwrite that snapshot.
@@ -666,7 +671,7 @@ class Client:
         return dict(accepted=True, http_status=200, checked_at=time.time(),
                     correlation_id=secrets.token_hex(8), endpoint='POST /transaction/{trx_id}/cancel')
 
-    async def cancel_status(self, ident, ref, *, bound=False):
+    async def cancel_status(self, ident, ref, *, bound=False, qris_bound=False):
         """Identity + lifecycle only; this response NEVER authorizes a payment."""
         ident, ref = reference(ident), reference(ref)
         data = await self.request('GET', '/transaction/' + ident)
@@ -675,7 +680,7 @@ class Client:
                 raise GatewayError('SCHEMA')
             if data.get('trx_id') != ident or data.get('merchant_ref') != ref:
                 raise GatewayError('MISMATCH')
-            return lifecycle_status(data, bound=bound)
+            return lifecycle_status(data, bound=bound, qris_bound=qris_bound is True and bound)
         except GatewayError as exc:
             raise self.validation_context(exc, 'GET /transaction/{trx_id}', data)
 
@@ -1381,6 +1386,57 @@ class Gateway:
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
 
+    async def status_binding(self, row):
+        """Identify the invoice kind from its authenticated create and original QR.
+
+        Some settlement responses use a different payment_method label. Do not
+        guess aliases: a successfully created, correctly bound QRIS invoice and
+        its unchanged validated QR are stronger evidence of the invoice kind.
+        Recovered IDs/history without that evidence still require literal qris.
+        This grants no payment proof; status/ID/ref/amount/fee/net must all pass.
+        """
+        detail = row.get('create_diagnostic', {})
+        endpoint = {1: 'POST /qris/create', 2: 'POST /qris/create2'}.get(row.get('server'))
+        profile = self.proof()
+        if (not row.get('provider_id') or row.get('total_amount') is None or row.get('fee') is None
+                or row.get('origin') != self.config.base_url or not profile.get('approved')
+                or row.get('account_binding') != profile.get('account_binding')
+                or not isinstance(detail, dict) or detail.get('success') is not True
+                or detail.get('http_status') != 200 or detail.get('endpoint') != endpoint
+                or detail.get('transaction_id') != row['id'] or not row.get('request_started_at')):
+            return {}
+        with self.connection() as conn:
+            native = conn.execute('SELECT * FROM ' + ('orders' if row['purpose'] == 'order' else 'topups')
+                + ' WHERE id=? AND user_id=?', (row['entity_id'], row['user_id'])).fetchone()
+        base = ((native['total'] - int(native['discount_amount'] or 0)) if row['purpose'] == 'order'
+                else native['amount']) if native else None
+        if (not native or native['payment_method'] != METHOD or native['provider_reference'] != row['provider_id']
+                or native['payment_total'] != row['total_amount'] or base != row['amount']):
+            return {}
+        context = {field: row.get(field) for field in ('id', 'purpose', 'entity_id', 'user_id', 'reference',
+            'provider_id', 'amount', 'total_amount', 'fee', 'origin', 'server', 'account_binding',
+            'request_started_at', 'qris_cipher', 'qr_image_cipher')}
+        digest = hashlib.sha256(encoded(context).encode()).hexdigest()
+        cached = getattr(self, '_status_binding_cache', None)
+        if cached is None:
+            cached = self._status_binding_cache = set()
+        if digest in cached:
+            return {'qris_bound': True}
+        try:
+            if row.get('qris_cipher'):
+                qris_payload(self.crypt(row['qris_cipher'], row['id'], decrypt=True), row['total_amount'])
+            elif row.get('qr_image_cipher'):
+                raw = base64.b64decode(self.crypt(row['qr_image_cipher'], row['id'], decrypt=True), validate=True)
+                await self.validate_qr_image(raw, row['total_amount'])
+            else:
+                return {}
+        except (GatewayError, ValueError, TypeError):
+            return {}
+        if len(cached) >= 256:
+            cached.clear()
+        cached.add(digest)
+        return {'qris_bound': True}
+
     async def issue(self, ident):
         row = self.transaction(ident)
         if row['state'] != 'NEW':
@@ -1469,9 +1525,10 @@ class Gateway:
             row.update(cancel_lease_owner=token, cancel_lease_until=time.time() + self.config.timeout * 3 + 30)
             self.save(conn, row)
         try:
+            binding = await self.status_binding(row)
             if row['provider_id'] and row['total_amount'] is not None and row['fee'] is not None:
                 try:
-                    lifecycle = await self.api.cancel_status(provider_id, row['reference'], bound=True)
+                    lifecycle = await self.api.cancel_status(provider_id, row['reference'], bound=True, **binding)
                     if lifecycle in {'FAILED', 'PAID'}:
                         return lifecycle  # Already terminal: do not submit another cancel POST.
                 except GatewayError:
@@ -1518,7 +1575,7 @@ class Gateway:
                         current.update(cancel_diagnostic=detail,
                                        cancel_retry_at=time.time() + max(30, exc.retry_after))
                         self.save(conn, current)
-            return await self.api.cancel_status(provider_id, row['reference'], bound=True)
+            return await self.api.cancel_status(provider_id, row['reference'], bound=True, **binding)
         finally:
             with self.connection(True) as conn:
                 current = self.transaction(ident, conn=conn)
@@ -1546,6 +1603,7 @@ class Gateway:
             profile = await self.ensure_profile()
             if profile['account_binding'] != row['account_binding'] or row['origin'] != self.config.base_url:
                 raise GatewayError('ACCOUNT_CHANGED')
+            binding = await self.status_binding(row)
             ident_provider = row['provider_id']
             if not ident_provider:
                 history = await self.api.history(20, row.get('reconcile_offset', 0))
@@ -1564,7 +1622,7 @@ class Gateway:
                 if allow_cancel:
                     lifecycle = await self.reconcile_cancellation(ident, ident_provider)
                 elif row['provider_id'] and row['total_amount'] is not None and row['fee'] is not None:
-                    lifecycle = await self.api.cancel_status(ident_provider, row['reference'], bound=True)
+                    lifecycle = await self.api.cancel_status(ident_provider, row['reference'], bound=True, **binding)
                 else:
                     data = await self.api.status(ident_provider, row['reference'], row['amount'],
                                                  row['total_amount'], row['fee'], recovered=True)
@@ -1597,7 +1655,7 @@ class Gateway:
             if row['total_amount'] is None and row['fee'] is None:
                 data = await self.api.status(ident_provider, row['reference'], row['amount'], recovered=True)
             else:
-                data = await self.api.status(ident_provider, row['reference'], row['amount'], row['total_amount'], row['fee'])
+                data = await self.api.status(ident_provider, row['reference'], row['amount'], row['total_amount'], row['fee'], **binding)
             with self.connection(True) as conn:
                 current = self.transaction(ident, conn=conn)
                 if current['state'] in FINAL | {'REVIEW', 'PAID_VERIFIED'}:
@@ -1622,6 +1680,12 @@ class Gateway:
                 else:
                     current['state'] = 'CANCELLED_LOCAL' if current['cancel_requested'] else 'PENDING'
                     self.retain_qr_source(current, data)
+                detail = dict(stage='status', code='CONFIRMED_FAILED' if data['status'] == 'FAILED' else current['state'], http_status=200,
+                    checked_at=time.time(), correlation_id=secrets.token_hex(8),
+                    endpoint='GET /transaction/{trx_id}', fingerprint=self.fingerprint(),
+                    transaction_id=ident)
+                current['status_diagnostic'] = detail
+                self.put(conn, 'diagnostic.status', detail)
                 if data['status'] != 'PENDING':
                     current['error'] = ''
                 self.save(conn, current)
@@ -1638,7 +1702,8 @@ class Gateway:
             with self.connection(True) as conn:
                 current = self.transaction(ident, conn=conn)
                 if current['state'] not in FINAL:
-                    current.update(error=exc.code, diagnostic=detail, next_poll_at=time.time() + max(15, exc.retry_after))
+                    current.update(error=exc.code, diagnostic=detail, status_diagnostic=detail,
+                                   next_poll_at=time.time() + max(15, exc.retry_after))
                     self.save(conn, current)
             raise
         return self.transaction(ident)
@@ -2103,14 +2168,16 @@ class Gateway:
                       PENDING='Menunggu pembayaran', PAID_VERIFIED='Pembayaran diterima; sedang diproses', SETTLED='Pembayaran berhasil',
                       SETTLED_BALANCE='Pembayaran masuk ke saldo', CANCELLED_LOCAL='Pembatalan diajukan; menunggu konfirmasi Payinaja',
                       CANCELLED='Dibatalkan', FAILED='Pembayaran gagal / kedaluwarsa', REVIEW='Perlu pemeriksaan owner')
-        text = LABEL + '\n<b>MABOYY DIGITAL</b>\n\n🧾 ' + html.escape(invoice) + '\n'
+        text = LABEL + ' • <b>MABOYY DIGITAL</b>\n🧾 ' + html.escape(invoice) + '\n'
         text += ('💰 Nominal saldo: ' if row['purpose'] == 'topup' else '💵 Harga pesanan: ') + self.host.rupiah(row['amount']) + '\n'
         if row['total_amount'] is not None:
             adjustment = row['total_amount'] - row['amount']
             if adjustment:
-                text += 'Biaya/penyesuaian QRIS: ' + self.host.rupiah(adjustment) + '\n'
+                text += 'Biaya QRIS: ' + self.host.rupiah(adjustment) + '\n'
             text += '<b>Total pembayaran: ' + self.host.rupiah(row['total_amount']) + '</b>\n'
         text += '📌 Status: ' + states.get(row['state'], 'Sedang diperiksa') + '\n'
+        if row['state'] == 'PENDING' and row['error'] not in {'', 'IMAGE'}:
+            text += 'Verifikasi sedang dicoba ulang. Jika sudah membayar, jangan bayar lagi.\n'
         if row['error'] == 'ACCOUNT_CHANGED':
             text += 'Akun provider berbeda dari akun invoice ini. Owner perlu memeriksa akun asal; jangan bayar QR lama.\n'
         elif row['state'] == 'PENDING' and row['expires_at'] <= time.time():
@@ -2425,16 +2492,16 @@ class Gateway:
         reference = html.escape(self.host.invoice(row['entity_id']))
         amount = html.escape(self.host.rupiah(row['total_amount']))
         if stage == 'completed':
-            return ('✅ <b>PEMBAYARAN BERHASIL</b>\n\n📦 <b>PRODUK BERHASIL DIKIRIM</b>\n\n'
+            return ('✅ <b>PEMBAYARAN BERHASIL</b>\n📦 <b>PRODUK BERHASIL DIKIRIM</b>\n\n'
                     '🧾 Invoice: <b>' + reference + '</b>\n💰 Pembayaran: <b>LUNAS</b>\n'
-                    '💵 Total pembayaran: <b>' + amount + '</b>\n📦 Status pesanan: <b>COMPLETED</b>\n\n'
+                    '💵 Total pembayaran: <b>' + amount + '</b>\n📦 <b>COMPLETED</b>\n'
                     'Terima kasih telah berbelanja di Maboyy Digital.')
         status, note = {
-            'confirmed': ('Sedang menyiapkan produk', 'Mohon tunggu, sistem sedang memproses pengiriman produk Anda.'),
-            'pending_stock': ('Menunggu penanganan stok', 'Pembayaran sudah diterima. Pesanan Anda sedang ditangani; tidak perlu membayar ulang.'),
-            'send_failed': ('Pengiriman sedang ditangani', 'Pembayaran sudah diterima. Data akun tetap dialokasikan untuk pesanan Anda; tidak perlu membayar ulang.'),
+            'confirmed': ('Sedang menyiapkan produk', 'Data akun dikirim otomatis. Mohon tunggu.'),
+            'pending_stock': ('Menunggu stok', 'Owner diberi tahu. Tidak perlu membayar ulang.'),
+            'send_failed': ('Pengiriman sedang ditangani', 'Data akun tetap disimpan. Tidak perlu membayar ulang.'),
         }[stage]
-        return ('✅ <b>PEMBAYARAN TERKONFIRMASI</b>\n\n⚡ <b>QRIS OTOMATIS MABOYY DIGITAL</b>\n\n'
+        return ('✅ <b>PEMBAYARAN TERKONFIRMASI</b>\n⚡ <b>QRIS OTOMATIS MABOYY DIGITAL</b>\n'
                 '🧾 Invoice: <b>' + reference + '</b>\n💰 Status: <b>LUNAS</b>\n'
                 '💵 Total pembayaran: <b>' + amount + '</b>\n📦 Status pesanan: <b>' + status + '</b>\n\n' + note)
 
@@ -3248,7 +3315,7 @@ class Gateway:
             [InlineKeyboardButton(text=label, callback_data=PREFIX + 'a:' + action + (':' + str(value) if value is not None else ''))
              for label, action, value in line] for line in rows])
 
-    async def owner_panel(self, call, *, note=''):
+    async def owner_panel(self, call, *, note='', diagnostics=False):
         self.require_owner(call.from_user.id)
         proof = self.proof()
         try:
@@ -3363,7 +3430,26 @@ class Gateway:
                 hidden += 1
         if hidden:
             text += '\nSebagian diagnosis tetap tersimpan. Detail transaksi tersedia di Riwayat.\n'
-        controls = []
+        if not diagnostics:
+            status = self.setting('diagnostic.status', {})
+            text = ('👑 <b>QRIS OTOMATIS • PAYINAJA</b>\n'
+                    f'Versi bot: {html.escape(self.host.BOT_VERSION)} • Gateway: {ADAPTER_VERSION}\n\n'
+                    f'Izin invoice: {"AKTIF" if self.enabled() else "NONAKTIF"}\n'
+                    f'API Key: {"Tersedia" if self.config.key else "Belum diisi"} • Merchant: {"approved" if proof.get("approved") else "belum terverifikasi"}\n'
+                    f'Server: {server or "CONFIG"} • Sumber: {"database owner (mengalahkan ENV)" if self.setting("server", None) is not None else "ENV/default"}\n'
+                    f'Polling: {"Berjalan" if polling else "Belum berjalan"} • Antrean: {active_count}\n'
+                    f'Settlement: {settlement_jobs} task aktif\n')
+            if last:
+                text += '\nCreate: ' + html.escape(str(last.get('code', '-'))) + ' • HTTP: ' + str(last.get('http_status') or '-') + '\n'
+            if (isinstance(status, dict) and status.get('fingerprint') == self.fingerprint()
+                    and status.get('checked_at', 0) >= self.started_at):
+                text += 'Status: ' + html.escape(str(status.get('code', '-'))) + ' • HTTP: ' + str(status.get('http_status') or '-') + '\n'
+                if status.get('checked_at'):
+                    text += self.host.payment_receipts.format_wib(status['checked_at'], compact=True) + '\n'
+            text += '\nStok pending = ditahan; SOLD hanya setelah akun terkirim.\nRincian API tersedia pada Detail Teknis.'
+            if note:
+                text += '\n' + html.escape(note[:250])
+        controls = [[('⬅️ Ringkasan', 'menu', None)]] if diagnostics else [[('🔎 Detail Teknis', 'diagnostics', None)]]
         if checking:
             controls += [[('⏳ Memeriksa akses…', 'menu', None)], [('🔴 Batalkan Aktivasi', 'toggle', 'off')]]
         else:
@@ -3417,6 +3503,18 @@ class Gateway:
                 'Tidak ada invoice dibuat atau pengaturan pembayaran diubah.')
         return await self.host.safe_edit_or_answer(call, text, parse_mode='HTML', reply_markup=controls)
 
+    def stock_summary(self, row):
+        if row['purpose'] != 'order':
+            return ''
+        with self.connection() as conn:
+            native = conn.execute('SELECT qty,stock_reserved,status FROM orders WHERE id=? AND user_id=?',
+                                  (row['entity_id'], row['user_id'])).fetchone()
+            counts = dict(conn.execute('SELECT status,COUNT(*) FROM inventory_items WHERE order_id=? GROUP BY status',
+                                       (row['entity_id'],)).fetchall())
+        held = (int(native['qty']) if native and native['stock_reserved'] == 1
+                and native['status'] not in {'cancelled', 'expired', 'completed', 'rejected'} else 0)
+        return f"Stok: {held} ditahan • {counts.get('allocated', 0)} dialokasikan • {counts.get('sold', 0)} SOLD"
+
     async def owner_list(self, call, *, pending=False, page=0):
         self.require_owner(call.from_user.id)
         with self.connection() as conn:
@@ -3432,10 +3530,15 @@ class Gateway:
         text, controls = '📊 <b>TRANSAKSI QRIS OTOMATIS</b>\nProvider: Payinaja\n\n', []
         for ident in keys[page * 6:page * 6 + 6]:
             row = self.transaction(ident)
-            text += html.escape(row['reference']) + ' • ' + self.host.rupiah(row['total_amount'] or row['amount']) + ' • ' + row['state'] + '\n'
-            controls.append([('🔎 ' + row['reference'], 'detail', ident)])
+            label = self.host.invoice(row['entity_id']) if row['purpose'] == 'order' else self.host.topup_invoice(row['entity_id'])
+            text += html.escape(label) + ' • ' + self.host.rupiah(row['total_amount'] or row['amount']) + ' • ' + row['state'] + '\n'
+            if pending and row['purpose'] == 'order':
+                text += self.stock_summary(row) + '\n'
+            controls.append([('🔎 ' + label, 'detail', ident)])
         if not keys:
             text += 'Belum ada transaksi.\n'
+        elif pending:
+            text += '\nDitahan belum berarti terkirim. Status provider terus diperiksa.'
         nav = []
         action = 'pending' if pending else 'history'
         if page:
@@ -3459,6 +3562,7 @@ class Gateway:
                      + '\nPengiriman akun: ' + html.escape(str(native['fulfillment_status']))
                      + '\nStatus pesanan: ' + html.escape(str(native['status']))
                      + '\nSETTLED adalah pencatatan pembayaran, bukan bukti akun sudah terkirim.')
+            text += '\n' + self.stock_summary(row)
             try:
                 attempt = self.host.payinaja_delivery_attempt(row['entity_id'])
             except self.host.PayinajaDeliveryUncertain:
@@ -3470,6 +3574,11 @@ class Gateway:
             text += '\nStatus kredit saldo lokal: ' + html.escape(str(native['status']))
         text += '\nServer invoice: ' + str(row['server'])
         text += '\nID provider: ' + html.escape(row['provider_id'] or '-') + '\nKode: ' + html.escape(row['error'] or '-')
+        checked = row.get('status_diagnostic')
+        if isinstance(checked, dict) and checked.get('checked_at'):
+            text += ('\nPemeriksaan status: ' + html.escape(str(checked.get('code', '-')))
+                     + ' • HTTP: ' + str(checked.get('http_status') or '-')
+                     + '\n' + self.host.payment_receipts.format_wib(checked['checked_at'], compact=True))
         settlement = row.get('settlement_diagnostic')
         if isinstance(settlement, dict):
             text += ('\nTahap settlement: ' + html.escape(str(settlement.get('code', '-')))
@@ -3709,6 +3818,8 @@ def register(router, gateway):
                 else:
                     raise GatewayError('INPUT')
                 await gateway.owner_panel(call)
+            elif action == 'diagnostics':
+                await gateway.owner_panel(call, diagnostics=True)
             elif action == 'hosting_ip':
                 await gateway.owner_hosting_ip(call)
             elif action in {'history', 'pending'}:
