@@ -17,7 +17,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from klikqris_gateway import GatewayError, buyer_error, environment_value
 
 METHODS = frozenset({'KLIKQRIS_AUTO', 'PAYINAJA_AUTO'})
-ADAPTER_VERSION = '17.68'
+ADAPTER_VERSION = '17.69'
 
 
 async def poll_batch(items, operation, *, concurrency=3):
@@ -103,6 +103,8 @@ async def payment_verified_progress(host, gateway, ident, bot):
     """Update a known QR only after strict provider proof AND native payment."""
     if bot is None:
         return False
+    if gateway is host.PAYINAJA_GATEWAY and gateway.transaction(ident)['purpose'] == 'order':
+        return await gateway.update_order_message(bot, ident)
     if gateway is host.PAYINAJA_GATEWAY:
         locks = getattr(gateway, '_payment_view_locks', None)
         lock = locks.get(ident) if locks is not None else None

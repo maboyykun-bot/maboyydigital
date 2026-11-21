@@ -238,7 +238,7 @@ STOCK_CHANNEL_ID = os.getenv("STOCK_CHANNEL_ID", "").strip()
 # Release policy: increment published releases; synchronize source, launcher and ZIP.
 # Deploy-ready releases include all runtime modules, tests and safe documentation.
 # Runtime data and credentials belong in encrypted full backups, not GitHub.
-BOT_VERSION = "17.68"
+BOT_VERSION = "17.69"
 SCHEMA_VERSION = 207
 
 CHECKOUT_TERMS_SHORT = (
@@ -2762,6 +2762,8 @@ def reconcile_all_inventory_stock(conn):
 
 
 async def notify_fulfillment_pending(bot: Bot, order, missing: int):
+    if order['payment_method']=='PAYINAJA_AUTO':
+        return await payinaja_order_notice(bot,order['id'],'pending_stock',issue='STOCK_EMPTY',missing=missing)
     try:
         await bot.send_message(
             order["user_id"],
@@ -2789,6 +2791,60 @@ async def notify_fulfillment_pending(bot: Bot, order, missing: int):
             )
         except Exception:
             pass
+
+
+async def payinaja_order_notice(bot, order_id, stage, *, issue=None, missing=0):
+    """Update the bound payment card; owner alerts contain no account payload."""
+    gateway=automatic_qris.for_native(_otp_sys.modules[__name__],'order',order_id)
+    if gateway is not PAYINAJA_GATEWAY:return False
+    row=gateway.linked('order',order_id)
+    if not row:return False
+    with db() as conn:
+        native=conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
+        if (not native or native['payment_status']!='paid'
+                or native['status'] in {'cancelled','rejected'}
+                or not gateway.payment_authorized(conn,'order',order_id,settled=True)):
+            return False
+    try:
+        await gateway.update_order_message(bot,row['id'],stage=stage)
+    except asyncio.CancelledError:raise
+    except Exception as exc:
+        logging.warning('Payinaja order view deferred order=%s type=%s',order_id,type(exc).__name__)
+    if not ADMIN_ID or issue not in {'STOCK_EMPTY','ALLOCATION_MISMATCH','DELIVERY_FAILED','DELIVERY_UNCERTAIN'}:
+        return True
+    key='payinaja.owner_delivery_notice.'+str(order_id)+'.'+issue
+    token=secrets.token_hex(8)
+    with db() as conn:
+        begin_immediate_retry(conn)
+        saved=conn.execute('SELECT value FROM settings WHERE key=?',(key,)).fetchone()
+        old=json.loads(saved[0]) if saved else {}
+        if (old.get('state') in {'REQUESTING','SENT','UNKNOWN'}
+                or old.get('retry_at',0)>time.time()):return True
+        conn.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',
+                     (key,json.dumps(dict(state='REQUESTING',token=token,created_at=time.time()))))
+    note={'STOCK_EMPTY':'Stok akun belum mencukupi. Tambahkan stok pada varian pesanan.',
+          'ALLOCATION_MISMATCH':'Allocation atau payload tidak cocok dengan varian/jumlah pesanan. Pengiriman ditahan.',
+          'DELIVERY_FAILED':'Telegram menolak pengiriman. Akun tetap dialokasikan dan recovery akan mencoba kembali.',
+          'DELIVERY_UNCERTAIN':'Hasil pengiriman belum pasti. Periksa detail QRIS Otomatis dan rekonsiliasi bagian akun sebelum mengirim ulang.'}[issue]
+    value=dict(state='UNKNOWN',token=token,created_at=time.time())
+    try:
+        sent=await asyncio.wait_for(bot.send_message(ADMIN_ID,
+            '⚠️ <b>PESANAN LUNAS PERLU PENANGANAN</b>\n\n🧾 '+html.escape(invoice(order_id))
+            +'\n📦 Varian: '+str(native['variant_id'])+' • Qty: '+str(native['qty'])
+            +('\nKekurangan akun: '+str(max(0,int(missing))) if issue=='STOCK_EMPTY' else '')
+            +'\n'+note+'\nPelanggan tidak perlu membayar ulang.',parse_mode='HTML'),timeout=2)
+        message_id=getattr(sent,'message_id',None)
+        if type(message_id) is int and message_id>0:value.update(state='SENT',message_id=message_id)
+    except asyncio.CancelledError:raise
+    except (TelegramBadRequest,TelegramForbiddenError,TelegramRetryAfter) as exc:
+        value.update(state='RETRY',retry_at=time.time()+max(30,float(getattr(exc,'retry_after',0) or 0)))
+    except Exception:pass  # Unknown delivery is never blindly replayed.
+    finally:
+        with db() as conn:
+            current=conn.execute('SELECT value FROM settings WHERE key=?',(key,)).fetchone()
+            if current and json.loads(current[0]).get('token')==token:
+                conn.execute('UPDATE settings SET value=? WHERE key=?',(json.dumps(value),key))
+    return True
 
 
 def split_delivery_text(delivery_text: str, max_chars: int = 3200):
@@ -2963,11 +3019,17 @@ async def send_delivery_payload(bot: Bot, user_id: int, order_id: int, delivery_
             continue
         attempt=claim_payinaja_delivery_attempt(order_id,index) if order['payment_method']=='PAYINAJA_AUTO' else None
         try:
-            await bot.send_message(
+            sent=await bot.send_message(
                 user_id,
                 f"<pre>{html.escape(chunk)}</pre>",
                 parse_mode="HTML"
             )
+            if attempt:
+                message_id=getattr(sent,'message_id',None)
+                sent_chat=getattr(sent,'chat',None)
+                if (type(message_id) is not int or message_id<=0
+                        or (sent_chat is not None and getattr(sent_chat,'id',None)!=user_id)):
+                    raise PayinajaDeliveryUncertain('DELIVERY_UNCERTAIN: Telegram acknowledgement requires review')
         except (TelegramBadRequest,TelegramForbiddenError,TelegramRetryAfter):
             if attempt:update_payinaja_delivery_attempt(order_id,attempt['attempt_id'],rejected=True)
             raise
@@ -3718,7 +3780,12 @@ async def prepare_preorder_paid_order(order_id: int, bot: Bot) -> bool:
 
 async def fulfill_order(order_id: int, bot: Bot) -> bool:
     gateway=automatic_qris.for_native(_otp_sys.modules[__name__],'order',order_id) or KLIKQRIS_GATEWAY
-    return await gateway.fulfill_once(order_id,bot,_fulfill_order_impl)
+    if gateway is PAYINAJA_GATEWAY:
+        await payinaja_order_notice(bot,order_id,'confirmed')
+    result=await gateway.fulfill_once(order_id,bot,_fulfill_order_impl)
+    if gateway is PAYINAJA_GATEWAY and result:
+        await payinaja_order_notice(bot,order_id,'completed')
+    return result
 
 
 async def _fulfill_order_impl(order_id: int, bot: Bot) -> bool:
@@ -3757,6 +3824,17 @@ async def _fulfill_order_impl(order_id: int, bot: Bot) -> bool:
         conn.close()
         return False
 
+    if order['payment_method']=='PAYINAJA_AUTO':
+        variant_binding=conn.execute('SELECT product_id FROM product_variants WHERE id=?',
+                                     (order['variant_id'],)).fetchone()
+        if (order['status'] in {'cancelled','rejected'} or int(order['qty'] or 0)<=0
+                or not variant_binding or variant_binding['product_id']!=order['product_id']):
+            conn.execute("UPDATE orders SET status='paid_pending_delivery',fulfillment_status='send_failed',"
+                         "last_delivery_error='ALLOCATION_MISMATCH' WHERE id=? AND status NOT IN ('cancelled','rejected')",(order_id,))
+            conn.commit();conn.close()
+            await payinaja_order_notice(bot,order_id,'send_failed',issue='ALLOCATION_MISMATCH')
+            return False
+
     product_mode=conn.execute(
         "SELECT COALESCE(fulfillment_mode,'ready') AS mode,product_type FROM products WHERE id=?",
         (int(order["product_id"]),)
@@ -3777,6 +3855,17 @@ async def _fulfill_order_impl(order_id: int, bot: Bot) -> bool:
     ).fetchall()
 
     if allocated:
+        if order['payment_method']=='PAYINAJA_AUTO':
+            expected_payload='\n'.join(f"{idx}. {item['content']}" for idx,item in enumerate(allocated,start=1))
+            if (len(allocated)!=qty or any(item['variant_id']!=order['variant_id']
+                    or item['inventory_mode'] not in {'unique','sharing'} or not str(item['content'] or '').strip()
+                    for item in allocated)
+                    or (order['delivery_text'] and order['delivery_text']!=expected_payload)):
+                conn.execute("UPDATE orders SET status='paid_pending_delivery',fulfillment_status='send_failed',"
+                             "last_delivery_error='ALLOCATION_MISMATCH' WHERE id=?",(order_id,))
+                conn.commit();conn.close()
+                await payinaja_order_notice(bot,order_id,'send_failed',issue='ALLOCATION_MISMATCH')
+                return False
         items = allocated
         # Retry already allocated credentials without holding the write lock
         # across Telegram I/O and the payload's separate database updates.
@@ -3802,6 +3891,8 @@ async def _fulfill_order_impl(order_id: int, bot: Bot) -> bool:
                     conn.commit()
                 else:conn.rollback()
                 conn.close()
+                if order['payment_method']=='PAYINAJA_AUTO':
+                    await notify_fulfillment_pending(bot,order,qty)
                 return False
             conn.execute("UPDATE orders SET stock_reserved=1,reserved_until='' WHERE id=?",(order_id,))
             order=conn.execute('SELECT * FROM orders WHERE id=?',(order_id,)).fetchone()
@@ -3843,7 +3934,7 @@ async def _fulfill_order_impl(order_id: int, bot: Bot) -> bool:
             )
             conn.commit()
             conn.close()
-            if not was_pending:
+            if not was_pending or order['payment_method']=='PAYINAJA_AUTO':
                 await notify_fulfillment_pending(bot, order, missing)
             return False
 
@@ -3947,7 +4038,10 @@ async def _fulfill_order_impl(order_id: int, bot: Bot) -> bool:
         else:
             logging.exception("Delivery send failed for order %s: %s", order_id, exc)
 
-        if ADMIN_ID:
+        if order['payment_method']=='PAYINAJA_AUTO':
+            await payinaja_order_notice(bot,order_id,'send_failed',
+                issue='DELIVERY_UNCERTAIN' if delivery_uncertain else 'DELIVERY_FAILED')
+        elif ADMIN_ID:
             try:
                 await bot.send_message(
                     ADMIN_ID,
@@ -37228,7 +37322,7 @@ async def silent_recovery_loop(bot: Bot):
 
 
 
-EXPECTED_SOURCE_VERSION = "17.68"
+EXPECTED_SOURCE_VERSION = "17.69"
 
 
 def source_integrity_self_test():

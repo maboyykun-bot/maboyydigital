@@ -42,7 +42,7 @@ PREFIX = 'payi:'
 LABEL = '⚡ QRIS Otomatis'
 FINAL = {'SETTLED', 'SETTLED_BALANCE', 'FAILED', 'CANCELLED'}
 TX_PREFIX = 'payinaja.tx.'
-ADAPTER_VERSION = '17.68'
+ADAPTER_VERSION = '17.69'
 QR_BLOCKING_ERRORS = frozenset({'SCHEMA', 'MISMATCH', 'AUTH', 'ACCOUNT_CHANGED', 'DUPLICATE_REFERENCE'})
 DENIAL_LIMIT = 16384
 UPSTREAM_LIMIT = 16384
@@ -2420,6 +2420,269 @@ class Gateway:
         except Exception:
             pass
 
+    def order_message_text(self, row, native, stage):
+        """Payment and fulfillment are reported independently from native facts."""
+        reference = html.escape(self.host.invoice(row['entity_id']))
+        amount = html.escape(self.host.rupiah(row['total_amount']))
+        if stage == 'completed':
+            return ('✅ <b>PEMBAYARAN BERHASIL</b>\n\n📦 <b>PRODUK BERHASIL DIKIRIM</b>\n\n'
+                    '🧾 Invoice: <b>' + reference + '</b>\n💰 Pembayaran: <b>LUNAS</b>\n'
+                    '💵 Total pembayaran: <b>' + amount + '</b>\n📦 Status pesanan: <b>COMPLETED</b>\n\n'
+                    'Terima kasih telah berbelanja di Maboyy Digital.')
+        status, note = {
+            'confirmed': ('Sedang menyiapkan produk', 'Mohon tunggu, sistem sedang memproses pengiriman produk Anda.'),
+            'pending_stock': ('Menunggu penanganan stok', 'Pembayaran sudah diterima. Pesanan Anda sedang ditangani; tidak perlu membayar ulang.'),
+            'send_failed': ('Pengiriman sedang ditangani', 'Pembayaran sudah diterima. Data akun tetap dialokasikan untuk pesanan Anda; tidak perlu membayar ulang.'),
+        }[stage]
+        return ('✅ <b>PEMBAYARAN TERKONFIRMASI</b>\n\n⚡ <b>QRIS OTOMATIS MABOYY DIGITAL</b>\n\n'
+                '🧾 Invoice: <b>' + reference + '</b>\n💰 Status: <b>LUNAS</b>\n'
+                '💵 Total pembayaran: <b>' + amount + '</b>\n📦 Status pesanan: <b>' + status + '</b>\n\n' + note)
+
+    def _order_notice_snapshot(self, ident, stage, conn):
+        row = self.transaction(ident, conn=conn)
+        if (row['purpose'] != 'order' or row['state'] not in {'PAID_VERIFIED', 'SETTLED'}
+                or row['cancel_requested']
+                or not self.payment_authorized(conn, 'order', row['entity_id'], settled=True)):
+            return None
+        native = conn.execute('SELECT * FROM orders WHERE id=? AND user_id=?',
+                              (row['entity_id'], row['user_id'])).fetchone()
+        if not native or native['payment_status'] != 'paid' or native['status'] in {'cancelled', 'rejected'}:
+            return None
+        receipt = conn.execute('SELECT status FROM payment_receipts WHERE source=\'order\' AND entity_id=?',
+                               (str(row['entity_id']),)).fetchone()
+        retired = row.get('retention_done') or bool(receipt and receipt['status'] in {'ARCHIVING', 'ARCHIVED'})
+        completed = (native['status'] == 'completed' and native['fulfillment_status'] == 'delivered'
+                     and native['account_sent'] == 1)
+        if completed:
+            stage = 'completed'
+        elif stage == 'completed':
+            return None
+        notice = row.get('order_notice', {})
+        if retired and ((not notice and stage != 'completed') or notice.get('stage') == 'completed'):
+            return None  # No old-history replay; an unfinished persisted watch may still complete.
+        if notice.get('stage') == 'completed' and not completed:
+            return None  # Never downgrade a confirmed final result after inconsistent edits.
+        ranks = {'confirmed': 0, 'pending_stock': 1, 'send_failed': 2, 'completed': 3}
+        requested = notice.get('requested_stage')
+        if not completed and requested in ranks and requested != 'completed' and ranks[requested] > ranks[stage]:
+            stage = requested
+        return row, native, stage
+
+    async def _edit_order_notice(self, bot, user, message_id, kind, text):
+        controls = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]])
+        for _ in range(2):
+            try:
+                if kind == 'photo':
+                    await asyncio.wait_for(bot.edit_message_caption(chat_id=user, message_id=message_id,
+                        caption=text, parse_mode='HTML', reply_markup=controls), timeout=2)
+                else:
+                    await asyncio.wait_for(bot.edit_message_text(chat_id=user, message_id=message_id,
+                        text=text, parse_mode='HTML', reply_markup=controls), timeout=2)
+                return kind
+            except TelegramBadRequest as exc:
+                message = str(exc).lower()
+                if 'message is not modified' in message:
+                    return kind
+                switch = (kind == 'photo' and any(value in message for value in (
+                    'there is no caption', 'message has no caption', 'message is not a media message')))
+                switch = switch or (kind == 'text' and any(value in message for value in (
+                    'there is no text', 'message has no text')))
+                if not switch:
+                    raise
+                kind = 'text' if kind == 'photo' else 'photo'
+        raise GatewayError('TELEGRAM')
+
+    async def update_order_message(self, bot, ident, *, stage='confirmed'):
+        """Edit one bound order card, with a durable, deduplicated fallback."""
+        if bot is None or stage not in {'confirmed', 'pending_stock', 'send_failed', 'completed'}:
+            return False
+        key = 'payinaja.notices.' + ident
+        with self.connection(True) as conn:
+            snapshot = self._order_notice_snapshot(ident, stage, conn)
+            if snapshot is None:
+                conn.execute('DELETE FROM settings WHERE key=?', (key,))
+                return False
+            row, native, stage = snapshot
+            notice = row.setdefault('order_notice', {})
+            notice.update(version=1, chat_id=row['user_id'], requested_stage=stage)
+            retry_at = notice.get('retry_at', 0)
+            conn.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',
+                         (key, f'{max(time.time(), retry_at):020.3f}'))
+            self.save(conn, row)
+            if retry_at > time.time():
+                return False
+        locks = getattr(self, '_payment_view_locks', None)
+        existing = locks.get(ident) if locks is not None else None
+        if existing is not None and existing.locked():
+            return False  # Fulfillment must not wait for a slow Telegram edit.
+        token = secrets.token_hex(12)
+        async with self.host.automatic_qris.payment_view_guard(self, ident):
+            with self.connection(True) as conn:
+                snapshot = self._order_notice_snapshot(ident, stage, conn)
+                if snapshot is None:
+                    conn.execute('DELETE FROM settings WHERE key=?', (key,))
+                    return False
+                row, native, stage = snapshot
+                notice = row.setdefault('order_notice', {})
+                if notice.get('lease_until', 0) > time.time():
+                    return False
+                notice.update(lease_owner=token, lease_until=time.time()+10)
+                self.save(conn, row)
+            try:
+                for _ in range(2):  # Catch completion while an earlier caption was in flight.
+                    with self.connection() as conn:
+                        snapshot = self._order_notice_snapshot(ident, stage, conn)
+                    if snapshot is None:
+                        return False
+                    row, native, stage = snapshot
+                    notice = row['order_notice']
+                    text = self.order_message_text(row, native, stage)
+                    digest = hashlib.sha256(text.encode()).hexdigest()
+                    target, kind = notice.get('message_id'), notice.get('kind', 'text')
+                    if notice.get('chat_id') != row['user_id'] or type(target) is not int or target <= 0:
+                        target = None
+                    if target is None:
+                        photos = [item['id'] for item in row['qr_messages'] if item['kind'] in {'QR', 'INVOICE'}
+                                  and type(item['id']) is int and 0 < item['id'] <= 9223372036854775807]
+                        if photos:
+                            target, kind = photos[-1], 'photo'
+                        else:
+                            target = self.payment_view_message(row)
+                            kind = 'text'
+                    if target and self.setting('qr_view.'+str(row['user_id'])+'.'+str(target), None) not in (None, ident):
+                        target = None
+                    if target and notice.get('stage') == stage and notice.get('digest') == digest:
+                        with self.connection(True) as conn:
+                            self._schedule_order_notice(conn, ident, stage)
+                        return True
+                    if target:
+                        try:
+                            kind = await self._edit_order_notice(bot, row['user_id'], target, kind, text)
+                        except TelegramBadRequest as exc:
+                            if not self.uneditable_payment_message(exc):
+                                raise
+                            target = None
+                    if target is None:
+                        # Recheck proof/native state after an edit proved impossible.
+                        with self.connection(True) as conn:
+                            snapshot = self._order_notice_snapshot(ident, stage, conn)
+                            if snapshot is None:
+                                return False
+                            row, native, stage = snapshot
+                            text = self.order_message_text(row, native, stage)
+                            digest = hashlib.sha256(text.encode()).hexdigest()
+                            notice = row['order_notice']
+                            attempts = notice.setdefault('fallbacks', {})
+                            if attempts.get(stage) in {'REQUESTING', 'UNKNOWN'}:
+                                self._schedule_order_notice(conn, ident, stage, unknown=True)
+                                return False
+                            attempts[stage] = 'REQUESTING'
+                            notice.update(message_id=None, kind='text', requested_stage=stage)
+                            self.save(conn, row)
+                        try:
+                            sent = await asyncio.wait_for(bot.send_message(row['user_id'], text, parse_mode='HTML',
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                    [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]])), timeout=2)
+                            target = getattr(sent, 'message_id', None)
+                            if type(target) is not int or target <= 0:
+                                raise GatewayError('TELEGRAM')
+                            kind = 'text'
+                        except BaseException as exc:
+                            with self.connection(True) as conn:
+                                current = self.transaction(ident, conn=conn)
+                                state = current['order_notice']
+                                if isinstance(exc, (TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter)):
+                                    state.setdefault('fallbacks', {}).pop(stage, None)
+                                else:
+                                    state.setdefault('fallbacks', {})[stage] = 'UNKNOWN'
+                                self.save(conn, current)
+                            raise
+                    with self.connection(True) as conn:
+                        current = self.transaction(ident, conn=conn)
+                        state = current['order_notice']
+                        state.update(chat_id=row['user_id'], message_id=target, kind=kind, stage=stage,
+                                     digest=digest, retry_at=0)
+                        if state.get('fallbacks', {}).get(stage) == 'REQUESTING':
+                            state['fallbacks'][stage] = 'SENT'
+                        self.save(conn, current)
+                        latest = self._order_notice_snapshot(ident, stage, conn)
+                        if latest and latest[2] != stage:
+                            stage = latest[2]
+                            state['requested_stage'] = stage
+                            self.save(conn, current)
+                            continue
+                        self._schedule_order_notice(conn, ident, stage)
+                    return True
+                return False
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                with self.connection(True) as conn:
+                    current = self.transaction(ident, conn=conn)
+                    notice = current['order_notice']
+                    notice['retry_at'] = time.time()+max(5, min(3600, float(getattr(exc, 'retry_after', 0) or 0)))
+                    self.save(conn, current)
+                    conn.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',
+                                 (key, f"{notice['retry_at']:020.3f}"))
+                logging.warning('Payinaja order notice deferred invoice=%s type=%s',ident,type(exc).__name__)
+                return False
+            finally:
+                with self.connection(True) as conn:
+                    current = self.transaction(ident, conn=conn)
+                    notice = current.get('order_notice', {})
+                    if notice.get('lease_owner') == token:
+                        notice.update(lease_owner=None, lease_until=0)
+                        self.save(conn, current)
+
+    @staticmethod
+    def _schedule_order_notice(conn, ident, stage, *, unknown=False):
+        key = 'payinaja.notices.' + ident
+        if stage == 'completed' and not unknown:
+            conn.execute('DELETE FROM settings WHERE key=?', (key,))
+        else:
+            conn.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',
+                         (key, f'{time.time()+30:020.3f}'))
+
+    def remember_order_message(self, ident, user, message_id, kind, stage):
+        """Record the caption actually acknowledged, then watch for a newer state."""
+        if (type(message_id) is not int or message_id <= 0 or kind not in {'photo', 'text'}
+                or stage not in {'confirmed', 'pending_stock', 'send_failed', 'completed'}):
+            raise GatewayError('INPUT')
+        rendered_stage = stage
+        with self.connection(True) as conn:
+            snapshot = self._order_notice_snapshot(ident, stage, conn)
+            if snapshot is None or snapshot[0]['user_id'] != user:
+                return False
+            row, native, requested_stage = snapshot
+            notice = row.setdefault('order_notice', {})
+            text = self.order_message_text(row, native, rendered_stage)
+            notice.update(version=1, chat_id=user, message_id=message_id, kind=kind, stage=rendered_stage,
+                          requested_stage=requested_stage, digest=hashlib.sha256(text.encode()).hexdigest(), retry_at=0)
+            self.save(conn, row)
+            if requested_stage != rendered_stage:
+                conn.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',
+                             ('payinaja.notices.' + ident, f'{time.time():020.3f}'))
+            else:
+                self._schedule_order_notice(conn, ident, rendered_stage)
+        return True
+
+    async def retry_order_messages(self, bot):
+        for ident in self.due_ids('notices'):
+            try:
+                row = self.transaction(ident)
+                await self.update_order_message(bot, ident, stage=row.get('order_notice', {}).get('requested_stage', 'confirmed'))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logging.warning('Payinaja notice retry deferred invoice=%s type=%s', ident, type(exc).__name__)
+                try:
+                    with self.connection(True) as conn:
+                        conn.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',
+                                     ('payinaja.notices.'+ident, f'{time.time()+30:020.3f}'))
+                except sqlite3.Error:
+                    pass  # Preserve payment data even when diagnostics storage is unavailable.
+
     def can_auto_deliver(self, row):
         return not self.is_prior_session(row) or (row['purpose'] == 'order' and row['id'] in self.requested_qr_ids)
 
@@ -2544,13 +2807,28 @@ class Gateway:
         if not row:
             raise GatewayError('NOT_READY')
         async with self.host.automatic_qris.payment_view_guard(self, row['id']):
-            return await self._deliver_receipt_photo(bot, receipt, photo, caption)
+            message = await self._deliver_receipt_photo(bot, receipt, photo, caption)
+        if row['purpose'] == 'order':
+            await self.update_order_message(bot, row['id'])
+        return message
 
     async def _deliver_receipt_photo(self, bot, receipt, photo, caption):
         row = self.receipt_transaction(receipt['source'], receipt['entity_id'])
         if not row or not self.receipt_payment_confirmed(row):
             raise GatewayError('NOT_READY')
+        order_stage = None
+        if row['purpose'] == 'order':
+            with self.connection() as conn:
+                snapshot = self._order_notice_snapshot(row['id'], 'confirmed', conn)
+            if snapshot is None:
+                raise GatewayError('NOT_READY')
+            row, native, order_stage = snapshot
+            caption = self.order_message_text(row, native, order_stage)
         anchor = receipt['message_id'] if receipt['error_code'] == 'QRIS_EDIT' else None
+        notice = row.get('order_notice', {})
+        if (not anchor and row['purpose'] == 'order' and notice.get('chat_id') == row['user_id']
+                and type(notice.get('message_id')) is int and notice['message_id'] > 0):
+            anchor = notice['message_id']
         if not anchor:
             messages = [item for item in row['qr_messages'] if item['kind'] == 'QR']
             anchor = messages[-1]['id'] if messages else None
@@ -2584,6 +2862,8 @@ class Gateway:
                         if item['id'] == anchor:
                             item['kind'] = 'INVOICE'
                     self.save(conn, current)
+                if order_stage is not None:
+                    self.remember_order_message(row['id'], row['user_id'], anchor, 'photo', order_stage)
                 return SimpleNamespace(message_id=anchor)
         with self.connection(True) as conn:
             changed = conn.execute("""UPDATE payment_receipts SET status='UNKNOWN',message_id=NULL,error_code='QRIS_SEND_STARTED'
@@ -2592,7 +2872,10 @@ class Gateway:
             if changed != 1:
                 raise GatewayError('STORAGE')
         try:
-            return await bot.send_photo(row['user_id'], photo, caption=caption, parse_mode='HTML')
+            message = await bot.send_photo(row['user_id'], photo, caption=caption, parse_mode='HTML')
+            if order_stage is not None:
+                self.remember_order_message(row['id'], row['user_id'], message.message_id, 'photo', order_stage)
+            return message
         except (TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter):
             with self.connection(True) as conn:
                 conn.execute("UPDATE payment_receipts SET status='SENDING' WHERE source=? AND entity_id=? AND lease_token=?",
@@ -2936,6 +3219,7 @@ class Gateway:
         async def cleanup():
             while True:
                 try:
+                    await self.retry_order_messages(bot)
                     await self.cleanup_success_receipts(bot)
                 except asyncio.CancelledError:
                     raise
