@@ -44,7 +44,7 @@ NAVIGATION_ACTIONS = {"check", "read_sms", "confirm_cancel", "home", "shop", "ma
                       "admin_orders", "admin_prices_menu", "admin_prices", "admin_modes", "topup",
                       "topup_set", "topup_custom", "topup_confirm", "topup_pay", "topup_history",
                       "topup_status", "topup_back", "topup_noop"}
-TEXT_MENU_ACTIONS = {"🛍️ Belanja", "🏷️ List Produk", "🔥 Produk Populer", "⚡ Flash Sale", "🏠 Menu Utama", "🎁 Voucher",
+TEXT_MENU_ACTIONS = {"🏷️ List Produk", "🔥 Produk Populer", "⚡ Flash Sale", "🏠 Menu Utama", "🎁 Voucher",
                      "📁 Laporan Stok", "💰 Isi Saldo", "❓ Cara Order", "💬 Hubungi Owner"}
 DEFINITIVE = {"UNAUTHORIZED", "FORBIDDEN", "VALIDATION_ERROR", "NO_OFFER_AVAILABLE",
               "INSUFFICIENT_BALANCE", "PROVIDER_ERROR", "NOT_FOUND"}
@@ -1787,7 +1787,7 @@ class TopupBridge:
                 elif cancel:
                     action, payload = "topup_cancel", {"id": cancel[1]}
                 if action:
-                    label = "🏠 Menu Utama" if action == "home" else "⬅️ Kembali" if button.text.startswith("⬅️") else button.text
+                    label = "🏠 Menu Awal" if action == "home" else "⬅️ Kembali" if button.text.startswith("⬅️") else button.text
                     # Proof/cancel buttons must remain usable throughout a deposit
                     # invoice, just like the host's original ownership-checked buttons.
                     token = (self.store.token(user, action, payload, ttl=86400) if action in {"topup_proof", "topup_cancel"}
@@ -1800,8 +1800,8 @@ class TopupBridge:
             return keyboard  # In particular, never change owner proof-review buttons.
         if not any(button.text == "⬅️ Kembali" for row in rows for button in row):
             rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data=self.store.ui.callback(user, "balance"))])
-        if not any(button.text == "🏠 Menu Utama" for row in rows for button in row):
-            rows.append([InlineKeyboardButton(text="🏠 Menu Utama", callback_data=self.store.ui.callback(user, "home"))])
+        if not any(button.text == "🏠 Menu Awal" for row in rows for button in row):
+            rows.append([InlineKeyboardButton(text="🏠 Menu Awal", callback_data=self.store.ui.callback(user, "home"))])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     async def exit(self, user, state):
@@ -1892,7 +1892,7 @@ class UIBuilder:
         return keyboard
 
     def navigation(self, user, back="home", payload=None):
-        return self.keyboard(user, [[("⬅️ Kembali", back, payload or {}), ("🏠 Menu Utama", "home", {})]])
+        return self.keyboard(user, [[("⬅️ Kembali", back, payload or {}), ("🏠 Menu Awal", "home", {})]])
 
     async def balance(self, message, user):
         rows = [[("➕ Isi Saldo", "topup", {}), ("📑 Riwayat Saldo", "topup_history", {})]]
@@ -1904,7 +1904,7 @@ class UIBuilder:
             ORDER BY t.id DESC LIMIT 5""", (user,))
         for row in invoices:
             rows.append([(f"🧾 Isi Saldo #{row['id']} • {money(row['amount'])}", "topup_status", {"id": row["id"]})])
-        rows.append([("⬅️ Kembali", "shop" if self.store.host.is_owner(user) else "home", {}), ("🏠 Menu Utama", "home", {})])
+        rows.append([("⬅️ Kembali", "shop" if self.store.host.is_owner(user) else "home", {}), ("🏠 Menu Awal", "home", {})])
         await self.send(message, f"💰 <b>SALDO SAYA</b>\n\nSaldo kamu: <b>{money(self.store.host.get_balance(user))}</b>\n\n"
                         "Pilih Isi Saldo untuk menambah saldo melalui pembayaran bot. Saldo bertambah setelah pembayaran terkonfirmasi.", self.keyboard(user, rows))
 
@@ -1932,7 +1932,7 @@ class UIBuilder:
                 rows.append([("✅ SELESAI", "confirm_finish", oid)])
         elif caps.get("can_reactivate"):
             rows.append([("♻️ AKTIFKAN LAGI", "reactivate", oid)])
-        rows.append([("⬅️ Kembali", "orders", {}), ("🏠 Menu Utama", "home", {})])
+        rows.append([("⬅️ Kembali", "orders", {}), ("🏠 Menu Awal", "home", {})])
         keyboard = self.keyboard(user, rows)
         copies = []
         phone = str(order.get("phone_number") or "").strip()
@@ -2082,7 +2082,7 @@ class UIBuilder:
                 nav.append(("➡️", kind, {**payload, "page": page+1}))
             if nav:
                 keyboard_rows.append(nav)
-            keyboard_rows.append([("⬅️ Kembali", "operators", {**payload, "page": 0}), ("🏠 Menu Utama", "home", {})])
+            keyboard_rows.append([("⬅️ Kembali", "operators", {**payload, "page": 0}), ("🏠 Menu Awal", "home", {})])
             return await self.send(message, title+f"\nHalaman {page+1}\n\n"+("Pilih harga nomor:" if buttons else "Belum ada stok pada halaman ini."), self.keyboard(user, keyboard_rows))
         subset = buttons[page*8:(page+1)*8]
         keyboard_rows = [[button] for button in subset]
@@ -2096,7 +2096,7 @@ class UIBuilder:
         if kind in {"countries", "services"}:
             keyboard_rows.append([("🔎 CARI", "search", {"kind": kind, "context": {**payload, "page": 0}})])
         back = {"countries": "home", "services": "countries", "operators": "services"}[kind]
-        keyboard_rows.append([("⬅️ Kembali", back, {**payload, "page": 0, "query": ""}), ("🏠 Menu Utama", "home", {})])
+        keyboard_rows.append([("⬅️ Kembali", back, {**payload, "page": 0, "query": ""}), ("🏠 Menu Awal", "home", {})])
         await self.send(message, title+f"\nHalaman {page+1} • {len(buttons)} pilihan\n"+("Pilih menu:" if subset else "Tidak ada hasil."), self.keyboard(user, keyboard_rows))
 
     async def quote(self, message, user, quote):
@@ -2117,7 +2117,7 @@ class UIBuilder:
                                  [("⬅️ Kembali", "products", {"country": product['country_id'], "platform": product['platform_id'],
                                      "country_name": product['country_name'], "platform_name": product['platform_name'],
                                      "operator": product.get('operator_id'), "operator_name": product.get('operator_name')})] if not quote["parent_order_id"] else [("⬅️ Kembali", "check", {"id": quote["parent_order_id"]})],
-                                 [("🏠 Menu Utama", "home", {})]]))
+                                 [("🏠 Menu Awal", "home", {})]]))
 
     async def manual_payment_photo(self, message, user, payment, caption, keyboard):
         """One owned manual invoice = one photo with its caption and buttons.
@@ -2256,7 +2256,7 @@ class UIBuilder:
         if active:
             rows.append([InlineKeyboardButton(text="❌ BATALKAN INVOICE", callback_data=token("payment_cancel"))])
         rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data=callback("orders")),
-                     InlineKeyboardButton(text="🏠 Menu Utama", callback_data=callback("home"))])
+                     InlineKeyboardButton(text="🏠 Menu Awal", callback_data=callback("home"))])
         text = (f"🛍️ <b>{brand}</b>\n💳 <b>QRIS {'MANUAL' if payment['method']=='QRIS_MANUAL' else 'OTOMATIS'}</b>\n\n"
                 f"🧾 Invoice: <b>{escape(payment['partner_reference'])}</b>\n"
                 f"💰 Harga {subject}: {money(payment['amount_idr'])}\n"
@@ -2320,7 +2320,7 @@ class UIBuilder:
             nav.append(("➡️", action, {"page": page+1}))
         if nav:
             buttons.append(nav)
-        buttons.append([("⬅️ Kembali", "home", {}), ("🏠 Menu Utama", "home", {})])
+        buttons.append([("⬅️ Kembali", "home", {}), ("🏠 Menu Awal", "home", {})])
         await self.send(message, "\n\n".join(text), self.admin_keyboard(user, buttons) if admin else self.keyboard(user, buttons))
 
     async def check(self, message, user, order_id, *, full_sms=False):
@@ -2427,7 +2427,7 @@ class AdminHandler:
                 navigation.append(("Berikutnya ▶️", "admin_prices", {**context, "page": page+1}))
             if navigation:
                 buttons.append(navigation)
-        buttons.append([("⬅️ Kembali", "admin_prices", {"kind": "both", "country": country, "platform": platform}), ("🏠 Menu Utama", "home", {})])
+        buttons.append([("⬅️ Kembali", "admin_prices", {"kind": "both", "country": country, "platform": platform}), ("🏠 Menu Awal", "home", {})])
         return await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, buttons))
 
     async def prices(self, message, user, kind=None, *, page=1, country=None, platform=None, view="products", services_page=1):
@@ -2527,7 +2527,7 @@ class AdminHandler:
         buttons.append([("📱 Pilih Layanan" if platform is None else "📱 Ganti Layanan", "admin_prices", {"kind": "both", "view": "services", "country": country, "platform": platform, "page": services_page})])
         if platform is not None:
             buttons.append([("🌐 Semua Layanan", "admin_prices", {"kind": "both", "country": country})])
-        buttons.append([("⬅️ Kembali", "admin_prices_menu", {}), ("🏠 Menu Utama", "home", {})])
+        buttons.append([("⬅️ Kembali", "admin_prices_menu", {}), ("🏠 Menu Awal", "home", {})])
         return await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, buttons))
 
     async def handle(self, message, user, args):
@@ -2661,7 +2661,7 @@ class AdminHandler:
                     f"Nonaktif otomatis: {'ya' if data.get('webhook_disabled_at') else 'tidak'}\n"
                     f"Gagal beruntun: {data.get('webhook_consecutive_failures',0)}\n"
                     "Tombol Hubungkan hanya mengatur URL ini jika webhook kosong atau sudah memakai URL bot. Secret tidak ditampilkan.")
-            return await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, [[("🔗 HUBUNGKAN WEBHOOK", "admin_webhook_connect", {})], [("🧪 TEST WEBHOOK", "admin_webhook_test", {})], [("⬅️ Kembali", "admin", {}), ("🏠 Menu Utama", "home", {})]]))
+            return await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, [[("🔗 HUBUNGKAN WEBHOOK", "admin_webhook_connect", {})], [("🧪 TEST WEBHOOK", "admin_webhook_test", {})], [("⬅️ Kembali", "admin", {}), ("🏠 Menu Awal", "home", {})]]))
         if section == "harga":
             example = {"id": -1, "price": 8000}
             sale, _ = self.store.pricing.calculate(example)
@@ -2671,7 +2671,7 @@ class AdminHandler:
                 "Prioritas: produk → negara+layanan → layanan → negara → global.")
             return await self.store.ui.send(message, text, self.store.ui.admin_keyboard(user, [
                 [("📈 ATUR PERSENTASE", "admin_input", {"setting": "percent"}), ("💵 ATUR NOMINAL", "admin_input", {"setting": "fixed"})],
-                [("⚙️ PILIH MODE", "admin_modes", {})], [("📋 HARGA PROVIDER & JUAL", "admin_prices", {"kind": "both"})], [("⬅️ Kembali", "admin", {}), ("🏠 Menu Utama", "home", {})]]))
+                [("⚙️ PILIH MODE", "admin_modes", {})], [("📋 HARGA PROVIDER & JUAL", "admin_prices", {"kind": "both"})], [("⬅️ Kembali", "admin", {}), ("🏠 Menu Awal", "home", {})]]))
         stats = self.store.repo.one("""SELECT count(*) total,COALESCE(sum(selling_price_idr-refund_idr),0) revenue,
             COALESCE(sum(selling_price_idr-refund_idr-provider_cost_idr+provider_refund_idr),0) profit,
             COALESCE(sum(status='COMPLETED'),0) completed,COALESCE(sum(status IN ('ACTIVE','OTP_RECEIVED')),0) pending,
@@ -2697,9 +2697,9 @@ class AdminHandler:
             details=section == "status")
         rows = OwnerFormatter.dashboard_rows()
         if section == "status":
-            rows = [[("🔄 RETRY NOTIFIKASI GAGAL", "admin_retry", {})], [("⬅️ Kembali", "admin", {}), ("🏠 Menu Utama", "home", {})]]
+            rows = [[("🔄 RETRY NOTIFIKASI GAGAL", "admin_retry", {})], [("⬅️ Kembali", "admin", {}), ("🏠 Menu Awal", "home", {})]]
         elif section != "dashboard":
-            rows = [[("⬅️ Kembali", "admin", {}), ("🏠 Menu Utama", "home", {})]]
+            rows = [[("⬅️ Kembali", "admin", {}), ("🏠 Menu Awal", "home", {})]]
         keyboard = self.store.ui.admin_keyboard(user, rows)
         if section == "dashboard":
             keyboard.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data=self.store.ui.callback(user, "main_menu"))])
@@ -2767,9 +2767,9 @@ def register(router, store):
         elif action == "shop":
             await store.ui.home(message, user)
         elif action == "help":
-            await store.ui.send(message, HELP, store.ui.keyboard(user, [[("📋 DAFTAR COMMAND", "help_commands", {})], [("⬅️ Kembali", "home", {}), ("🏠 Menu Utama", "home", {})]]))
+            await store.ui.send(message, HELP, store.ui.keyboard(user, [[("📋 DAFTAR COMMAND", "help_commands", {})], [("⬅️ Kembali", "home", {}), ("🏠 Menu Awal", "home", {})]]))
         elif action == "help_commands":
-            await store.ui.send(message, COMMAND_HELP, store.ui.keyboard(user, [[("⬅️ Kembali", "help", {})], [("🏠 Menu Utama", "home", {})]]))
+            await store.ui.send(message, COMMAND_HELP, store.ui.keyboard(user, [[("⬅️ Kembali", "help", {})], [("🏠 Menu Awal", "home", {})]]))
         elif action == "balance":
             await store.ui.balance(message, user)
         elif action in {"countries", "services", "operators", "products"}:
@@ -2824,10 +2824,10 @@ def register(router, store):
                     return await store.ui.send(message,'Pembatalan tidak tersedia: SMS sudah diterima atau pesanan sudah selesai.',store.ui.navigation(user,'check',{'id':order['id']}))
                 if caps.get('can_cancel') is not True:
                     when=payment_receipts.format_wib(caps.get('cancel_available_at'))
-                    return await store.ui.send(message,'⏳ Pembatalan belum diizinkan untuk nomor ini.'+(f'\nDapat diperiksa lagi: {when}.' if when!='-' else '\nPeriksa status terbaru sebelum mencoba lagi.'),store.ui.keyboard(user,[[('🔄 Periksa Pembatalan','confirm_cancel',{'id':order['id']})],[('⬅️ Kembali','check',{'id':order['id']}),('🏠 Menu Utama','home',{})]]))
+                    return await store.ui.send(message,'⏳ Pembatalan belum diizinkan untuk nomor ini.'+(f'\nDapat diperiksa lagi: {when}.' if when!='-' else '\nPeriksa status terbaru sebelum mencoba lagi.'),store.ui.keyboard(user,[[('🔄 Periksa Pembatalan','confirm_cancel',{'id':order['id']})],[('⬅️ Kembali','check',{'id':order['id']}),('🏠 Menu Awal','home',{})]]))
             await store.ui.send(message, "Konfirmasi "+("pembatalan" if kind == "cancel" else "penyelesaian")+f" order #{order['id']}?\n"
                 + ("Refund diproses setelah pembatalan dan pengembalian dana terkonfirmasi." if kind == "cancel" else "Order selesai tidak mendapat refund."),
-                store.ui.keyboard(user, [[("✅ KONFIRMASI", kind, {"id": order["id"]})], [("⬅️ Kembali", "check", {"id": order["id"]}), ("🏠 Menu Utama", "home", {})]]))
+                store.ui.keyboard(user, [[("✅ KONFIRMASI", kind, {"id": order["id"]})], [("⬅️ Kembali", "check", {"id": order["id"]}), ("🏠 Menu Awal", "home", {})]]))
         elif action in {"cancel", "finish", "resend"}:
             current=store.repo.owned(user,payload['id'])
             if (action=='cancel' and current['status']=='CANCELED') or (action=='finish' and current['status']=='COMPLETED'):
@@ -2854,7 +2854,7 @@ def register(router, store):
                 await admin.handle(message, user, ["off" if store.settings()["enabled"] else "on"])
             elif action == "admin_modes":
                 rows = [[(name, "admin_set_mode", {"mode": mode})] for name, mode in [("Persentase", "persen"), ("Nominal", "nominal"), ("Kombinasi", "kombinasi")]]
-                rows.append([("⬅️ Kembali", "admin_prices_menu", {}), ("🏠 Menu Utama", "home", {})])
+                rows.append([("⬅️ Kembali", "admin_prices_menu", {}), ("🏠 Menu Awal", "home", {})])
                 await store.ui.send(message, "Pilih mode harga:", store.ui.admin_keyboard(user, rows))
             elif action == "admin_set_mode":
                 await admin.handle(message, user, ["markup", "mode", payload["mode"]])

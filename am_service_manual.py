@@ -28,7 +28,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from am_service_client import (BASE_URL, AMServiceClient, AMServiceConfig,
                                AMServiceError, _email, _magic_link)
 
-ADAPTER_VERSION = '17.72'
+ADAPTER_VERSION = '17.70'
 JOB_PREFIX = 'ammanual.flow.'
 FSM_KEY = 'ammanual_job_id'
 FORM_SECONDS = 15 * 60
@@ -350,7 +350,7 @@ class GatewayManual:
         return 'amman:' + action + ':' + job['id'] + ':' + job['nonce']
 
     def _back(self, actor):
-        return ('⬅️ am-api-service.vercel.app', 'amnew:menu') if self.host.is_owner(actor) else ('⬅️ /tools', 'utools:home')
+        return ('⬅️ Owner Tools', 'tools:home') if self.host.is_owner(actor) else ('⬅️ /tools', 'utools:home')
 
     def _title(self, actor):
         return 'AM MANUAL • API BARU' if self.host.is_owner(actor) else 'AKTIVASI AM PRO'
