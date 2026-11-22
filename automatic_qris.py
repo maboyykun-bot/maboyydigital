@@ -17,7 +17,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from klikqris_gateway import GatewayError, buyer_error, environment_value
 
 METHODS = frozenset({'KLIKQRIS_AUTO', 'PAYINAJA_AUTO'})
-ADAPTER_VERSION = '17.71'
+ADAPTER_VERSION = '17.72'
 
 
 async def poll_batch(items, operation, *, concurrency=3):
@@ -169,7 +169,7 @@ async def payment_verified_progress(host, gateway, ident, bot):
                         + ('\nPesanan sedang diproses.' if purpose == 'order' else '\nSaldo sudah ditambahkan.')
                         + ' Tidak perlu membayar lagi.',
                     parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text='🏠 Menu Utama', callback_data='home')]])), timeout=2)
+                        [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]])), timeout=2)
                 delivered = True
             except asyncio.CancelledError:
                 raise
@@ -424,7 +424,7 @@ async def checkout(host, call, bot, state, variant, qty, *, request_id=None):
         if gateway is not host.PAYINAJA_GATEWAY:
             await host.safe_edit_or_answer(call, '⏳ <b>Menyiapkan QRIS Otomatis</b>\n\nMohon tunggu, bot sedang menyiapkan pembayaran.',
                 parse_mode='HTML', reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text='🏠 Menu Utama', callback_data='home')]]))
+                    [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]]))
     gateway = None
     try:
         if request_id is not None:
@@ -485,7 +485,7 @@ async def checkout(host, call, bot, state, variant, qty, *, request_id=None):
         else:
             await host.safe_edit_or_answer(call, checkout_error_text(exc), parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text='🏠 Menu Utama', callback_data='home')]]))
+                    [InlineKeyboardButton(text='🏠 Menu Awal', callback_data='home')]]))
         raise
 
 

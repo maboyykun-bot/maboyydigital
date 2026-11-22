@@ -38,7 +38,7 @@ from types import SimpleNamespace
 from otp_smscode import TEXT_MENU_ACTIONS
 
 LABEL = '⚡ QRIS Otomatis'
-ADAPTER_VERSION = '17.71'
+ADAPTER_VERSION = '17.72'
 METHOD = 'KLIKQRIS_AUTO'
 PREFIX = 'aqris:'
 MAX_AMOUNT = 10**12
@@ -1582,7 +1582,7 @@ class Gateway:
         rows=[] if row['purpose']=='order' else [[InlineKeyboardButton(text='🔄 Cek Status',callback_data=PREFIX+'u:check:'+row['id'])]]
         if row['state'] in {'NEW','REQUESTING','CREATE_UNKNOWN','PENDING'}:
             rows.append([InlineKeyboardButton(text='❌ Batalkan',callback_data=PREFIX+'u:cancel:'+row['id'])])
-        rows.append([InlineKeyboardButton(text='🏠 Menu Utama',callback_data='home')])
+        rows.append([InlineKeyboardButton(text='🏠 Menu Awal',callback_data='home')])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     def status_text(self,row):
